@@ -1,7 +1,8 @@
 # HomPub site
 
 Static site for HomPub (independent Android/iOS app studio) — app
-showcase + privacy policy, meant for free hosting on GitHub Pages.
+showcase + privacy policy. Plain landing page, no dashboard, no
+backend: just HTML/CSS, free to host forever.
 
 ## Deploy (one-time)
 
@@ -27,9 +28,23 @@ git push
 ```
 GitHub Pages redeploys automatically within a minute.
 
-## Custom domain (optional)
+## Custom domain (hompub.com or similar) — ~$10–11/year, the only cost
 
-Buy a domain (e.g. from Namecheap, Google Domains successor, Cloudflare
-Registrar), add a `CNAME` file here containing just the domain name,
-and point its DNS at GitHub Pages per
-https://docs.github.com/pages/configuring-a-custom-domain-for-your-github-pages-site
+1. **Buy the domain.** Porkbun (~$10.99/yr, no renewal markup games) or
+   Cloudflare Registrar (~$10.44/yr, sold at their literal cost) are
+   the cheapest honest options. Avoid registrars with a cheap first
+   year that jumps on renewal.
+2. **Add a `CNAME` file** to this repo containing just the domain
+   name (e.g. `hompub.com`), commit, and push.
+3. **At the registrar's DNS settings**, add:
+   - Four `A` records for the apex (`@`) pointing to:
+     `185.199.108.153`, `185.199.109.153`,
+     `185.199.110.153`, `185.199.111.153`
+   - One `CNAME` record for `www` pointing to
+     `<your-username>.github.io`
+4. **In GitHub → Settings → Pages**, enter the domain under "Custom
+   domain" and save. GitHub auto-provisions a free TLS certificate
+   once DNS resolves (minutes to a few hours) — then tick
+   "Enforce HTTPS".
+
+Total ongoing cost: the domain only (~$10-11/yr). Hosting stays free.
