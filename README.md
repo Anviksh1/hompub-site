@@ -4,6 +4,20 @@ Static site for HomPub (independent Android/iOS app studio) — app
 showcase + privacy policy. Plain landing page, no dashboard, no
 backend: just HTML/CSS, free to host forever.
 
+## HomPub Routine (web app)
+
+`apps/hompub-routine/` is a working web app, not just a landing page:
+a daily routine + schedule with reminders. Plain HTML/CSS/JS, no build
+step, no backend — data lives in the browser's localStorage. It is an
+installable PWA (`manifest.webmanifest` + `sw.js` for offline use and
+notification clicks). Reminders fire while the page is open (a
+background tab or installed app is fine); there's no push server.
+
+Run it locally with any static server from the repo root, e.g.
+`python3 -m http.server` → http://localhost:8000/apps/hompub-routine/
+(service workers and notifications need http://localhost or https,
+not `file://`).
+
 ## Deploy (one-time)
 
 1. Create a new **public** repo on GitHub, e.g. `hompub-site`

@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>HomPub Routine</title>
+<meta name="description" content="HomPub Routine: build a daily routine, keep your schedule, and get reminded — all stored on your device. No accounts, no tracking.">
+<meta name="theme-color" content="#1c1730">
+
+<link rel="icon" href="../../favicon.ico" sizes="any">
+<link rel="icon" type="image/png" sizes="32x32" href="../../favicon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="../../apple-touch-icon.png">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Routine">
+
+<meta property="og:type" content="website">
+<meta property="og:title" content="HomPub Routine">
+<meta property="og:description" content="Your daily routine and schedule, with reminders. Stored on your device only.">
+<meta property="og:image" content="../../og-image.png">
+
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="top-inner">
+    <a class="wordmark" href="../../index.html" title="HomPub home">
+      <span class="badge" aria-hidden="true">
+        <svg viewBox="0 0 108 108" xmlns="http://www.w3.org/2000/svg">
+          <defs><linearGradient id="g" x1="0" y1="0" x2="108" y2="108" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#7a63c2"/><stop offset="1" stop-color="#4a3580"/>
+          </linearGradient></defs>
+          <rect width="108" height="108" rx="24" fill="url(#g)"/>
+          <rect x="34" y="39" width="40" height="10" rx="5" fill="#ffffff"/>
+          <rect x="34" y="59" width="40" height="10" rx="5" fill="#ffffff"/>
+        </svg>
+      </span>
+      <span>Routine</span>
+    </a>
+    <nav class="tabs" aria-label="Sections">
+      <button class="tab" data-view="today" aria-current="page">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>
+        <span>Today</span>
+      </button>
+      <button class="tab" data-view="routine">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 0113.7-5.6L20 8.5"/><path d="M20 4v4.5h-4.5"/><path d="M20 12a8 8 0 01-13.7 5.6L4 15.5"/><path d="M4 20v-4.5h4.5"/></svg>
+        <span>Routine</span>
+      </button>
+      <button class="tab" data-view="schedule">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15" rx="2.5"/><path d="M3.5 10h17M8 3v4M16 3v4"/></svg>
+        <span>Schedule</span>
+      </button>
+      <button class="tab" data-view="settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 8a6 6 0 0112 0c0 7 3 8.5 3 8.5H3S6 15 6 8"/><path d="M10 20a2 2 0 004 0"/></svg>
+        <span>Reminders</span>
+      </button>
+    </nav>
+  </div>
+</header>
+
+<main id="main" class="main" tabindex="-1"></main>
+
+<button class="fab" id="fab" type="button" aria-label="Add">
+  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+</button>
+
+<dialog id="editor" aria-labelledby="editor-title">
+  <form id="editor-form" method="dialog" novalidate>
+    <h2 id="editor-title">New routine step</h2>
+
+    <label class="field">
+      <span>What</span>
+      <input name="title" required maxlength="80" autocomplete="off" placeholder="e.g. Morning walk">
+    </label>
+
+    <div class="field-row">
+      <label class="field">
+        <span>Starts at</span>
+        <input name="time" type="time" required value="07:00">
+      </label>
+      <label class="field">
+        <span>Lasts</span>
+        <select name="duration">
+          <option value="5">5 min</option>
+          <option value="10">10 min</option>
+          <option value="15">15 min</option>
+          <option value="20">20 min</option>
+          <option value="30" selected>30 min</option>
+          <option value="45">45 min</option>
+          <option value="60">1 hour</option>
+          <option value="90">1½ hours</option>
+          <option value="120">2 hours</option>
+          <option value="180">3 hours</option>
+          <option value="240">4 hours</option>
+          <option value="480">8 hours</option>
+        </select>
+      </label>
+    </div>
+
+    <fieldset class="field days-field" data-for="routine">
+      <legend>Repeats on</legend>
+      <div class="day-picker" id="day-picker"></div>
+      <div class="day-presets">
+        <button type="button" class="link-btn" data-preset="all">Every day</button>
+        <button type="button" class="link-btn" data-preset="weekdays">Weekdays</button>
+        <button type="button" class="link-btn" data-preset="weekends">Weekends</button>
+      </div>
+    </fieldset>
+
+    <label class="field" data-for="event">
+      <span>On</span>
+      <input name="date" type="date">
+    </label>
+
+    <label class="field">
+      <span>Remind me</span>
+      <select name="lead">
+        <option value="-1">No reminder</option>
+        <option value="0">When it starts</option>
+        <option value="5" selected>5 min before</option>
+        <option value="10">10 min before</option>
+        <option value="15">15 min before</option>
+        <option value="30">30 min before</option>
+        <option value="60">1 hour before</option>
+      </select>
+    </label>
+
+    <label class="field">
+      <span>Note <em>(optional)</em></span>
+      <input name="note" maxlength="140" autocomplete="off" placeholder="Shown in the reminder">
+    </label>
+
+    <p class="form-error" id="form-error" role="alert" hidden></p>
+
+    <div class="dialog-actions">
+      <button type="button" class="btn danger" id="delete-btn" hidden>Delete</button>
+      <span class="spacer"></span>
+      <button type="button" class="btn" id="cancel-btn">Cancel</button>
+      <button type="submit" class="btn primary" id="save-btn">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
