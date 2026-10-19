@@ -30,6 +30,9 @@ const NO_RETRY = new Set([4001, 4003, 4004, 4009, 4010]); // PROTOCOL §4: never
 const INTRO_MS = 3000;
 const GRACE_MS = 1000;
 const WIPE_CLOSE_WAIT_MS = 15000;
+const RESYNC_WAIT_MS = 5000;      // a reconnect (?token=) must be answered with sync within this (§5)
+const HOST_SYNC_WAIT_MS = 10000;  // the host socket must deliver its first sync within this
+const CLOCK_TOL_MS = 50;          // slack for clock-offset jitter when the harness reasons on the server clock
 
 const DEFAULTS = {
   url: 'http://localhost:8787',
@@ -163,6 +166,12 @@ const fmtBytes = (n) => (n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).t
 const letter = (i) => String.fromCharCode(65 + i);
 const sumCounts = (counts) => (Array.isArray(counts) ? counts.reduce((a, b) => a + b, 0) : NaN);
 
+/** PROTOCOL §3, mode "speed" (the harness creates rooms with default settings): points for a correct answer. */
+function expectedPoints(elapsed, T, P) {
+  const e = Math.min(Math.max(elapsed, 0), T);   // grace answers are scored as elapsed = T
+  return e < 500 ? P : Math.round(P * (1 - (e / T) / 2));
+}
+
 // ------------------------------------------------------------------ quiz
 
 const OPTION_WORDS = ['Alpha', 'Bravo', 'Charlie', 'Delta'];
@@ -220,6 +229,7 @@ function warn(msg) {
 const stats = {
   framesSent: 0, framesRecv: 0, bytesSent: 0, bytesRecv: 0, pings: 0, pongs: 0,
   reconnects: 0, reconnectsAfterDrop: 0, deliberateDrops: 0, unexpectedCloses: 0,
+  unexpectedCloseLog: [],   // first 20, for the report: a violation in the same question may be their consequence
   closeCodes: new Map(),
   joinMs: [], ackMs: [], resyncMs: [],
 };
@@ -231,7 +241,9 @@ const game = {
   // per question (index q)
   introAt: [], introWall: [], openAt: [], revealAt: [], reveals: [],
   answersSent: [], acceptedAcks: [], uncertain: [], dropped: [], expectedResult: [],
-  tallies: 0, dupsSent: 0, dupsRejected: 0,
+  tallies: 0, dupsSent: 0, dupsRejected: 0, dupsLate: 0, dupsLost: 0,
+  expectEnded: [],    // players with an open, synced socket when the host sent "end": each must get an "ended" frame
+  resyncAudit: null,  // { resyncs, afterDrop, pending } snapshot taken when the host sent "end"
   over: false,        // host has sent "end": phones stop reconnecting, 4004 closes are expected
   aborted: null,      // reason string when the run was cut short
   csv: null, csvName: null,
@@ -255,6 +267,29 @@ function send(ws, frame) {
 
 function noteClose(code) {
   stats.closeCodes.set(code, (stats.closeCodes.get(code) || 0) + 1);
+}
+
+/** A close the harness neither caused nor expects (1006 and friends): a warning, listed in the report next to the violations. */
+function noteUnexpectedClose(what) {
+  stats.unexpectedCloses += 1;
+  if (stats.unexpectedCloseLog.length < 20) stats.unexpectedCloseLog.push(what);
+  warn(`unexpected close: ${what}; reconnecting`);
+}
+
+/**
+ * §3 (mode "speed"): a correct answer's points must match the formula for an elapsed between the
+ * moment the harness sent it (server clock) and that moment plus the ack round trip (see onAck).
+ * Without an acked answer record (ack lost in a drop) only the P/2 floor (elapsed clamped to T) holds.
+ */
+function checkPoints(points, a, key, label) {
+  if (a && a.expectedLo !== null && a.accepted === true && !a.uncertain) {
+    if (points < a.expectedLo || points > a.expectedHi) {
+      const range = a.expectedLo === a.expectedHi ? String(a.expectedLo) : `${a.expectedLo}..${a.expectedHi}`;
+      violate(`${label}: correct answer scored ${points}, expected ${range} from the speed formula (sent ${Math.round(a.sentServerAt - a.opensAt)} ms after opensAt, ack RTT ${Math.round(a.ackAt - a.sentAt)} ms)`);
+    }
+  } else if (points < key.points / 2) {
+    violate(`${label}: correct answer scored ${points} < ${key.points / 2}`);
+  }
 }
 
 /** Paths of every key named `key` inside `obj` (used to catch an answer key leaking to a phone). */
@@ -284,7 +319,8 @@ class Player {
     this.joinedSyncAt = 0;            // Date.now() of the very first sync (0 = not joined yet)
     this.lastDisconnectAt = 0;        // Date.now() of the last close
     this.connectStartedAt = 0;        // performance.now() when the current socket was opened
-    this.offset = 0;                  // serverNow - Date.now(), refreshed by every timed frame
+    this.offset = 0;                  // serverNow - Date.now(): see noteOffset
+    this.hasOffset = false;
     this.phase = 'lobby'; this.q = -1; this.deadline = 0;
     this.runningScore = 0; this.runningQ = -1;   // score confirmed through question runningQ
     this.results = new Map();         // q -> recorded result
@@ -294,7 +330,7 @@ class Player {
     this.dead = false;                // closed with a no-retry code: stays offline
     this.deliberateClose = false;     // the harness itself closed the socket (simulated drop)
     this.reconnectDelay = 0;
-    this.timers = { answer: 0, drop: 0, reconnect: 0, ping: 0 };
+    this.timers = { answer: 0, drop: 0, reconnect: 0, ping: 0, sync: 0 };
   }
 
   get tag() { return `player ${this.i}${this.nick ? ` (${this.nick})` : ''}`; }
@@ -320,8 +356,24 @@ class Player {
     this.connectStartedAt = performance.now();
     ws.addEventListener('open', () => this.onOpen(ws));
     ws.addEventListener('message', (ev) => this.onMessage(ws, ev.data));
-    ws.addEventListener('error', () => { /* a close event always follows */ });
+    // Node's WebSocket fires only "error" (no "close") when the connection is refused: treat that as a 1006 close.
+    ws.addEventListener('error', () => { if (ws === this.ws && ws.readyState === WebSocket.CONNECTING) this.onClose(ws, 1006, 'connect failed'); });
     ws.addEventListener('close', (ev) => this.onClose(ws, ev.code, ev.reason));
+    if (reconnecting) {
+      // §5: the server answers a token reconnect with sync. Nothing else proves the reconnect worked.
+      this.clear('sync');
+      this.timers.sync = setTimeout(() => {
+        this.timers.sync = 0;
+        if (game.over || ws !== this.ws) return;
+        if (ws.readyState === WebSocket.CONNECTING) {
+          violate(`${this.tag}: reconnect did not complete within ${RESYNC_WAIT_MS} ms`);
+          try { ws.close(); } catch { /* ignore */ }
+          this.onClose(ws, 1006, 'connect timed out');   // retry with backoff; a later real close is ignored (ws !== this.ws)
+        } else {
+          violate(`${this.tag}: reconnected but received no sync within ${RESYNC_WAIT_MS} ms`);
+        }
+      }, RESYNC_WAIT_MS);
+    }
     vlog(`${this.tag}: ${reconnecting ? 'reconnecting' : 'connecting'}`);
   }
 
@@ -336,15 +388,22 @@ class Player {
   onClose(ws, code, reason) {
     if (ws !== this.ws) return;
     this.clear('ping');
+    this.clear('sync');
+    this.clear('answer');   // a phone that lost its connection cannot answer
     this.ws = null;
     this.synced = false;
     this.lastDisconnectAt = Date.now();
+    // An answer (or deliberate duplicate) still in flight loses its ack whatever closed the socket:
+    // sync.me.answered or, failing that, the CSV decides whether it landed.
+    const a = game.over ? null : this.answers.get(this.q);
+    if (a && !a.ackAt && !a.uncertain) { a.uncertain = true; game.uncertain[this.q] += 1; }
+    if (a && a.dupSentServerAt && !a.dupAcked) { a.dupAcked = true; a.dupLost = true; game.dupsLost += 1; }
     noteClose(code);
     if (game.wipedAt) game.lastCloseAt = performance.now();
     vlog(`${this.tag}: socket closed ${code} "${reason}"${this.deliberateClose ? ' (simulated drop)' : ''}`);
     const deliberate = this.deliberateClose;
     this.deliberateClose = false;
-    const serverError = (code >= 4000 && code <= 4010) || code === 1009;
+    const serverError = (code >= 4000 && code <= 4010) || code === 1009 || code === 1011;   // 1011: Room.webSocketError
     if (game.over) {
       if (serverError && code !== 4004) violate(`${this.tag}: closed with ${code} "${reason}" after the game ended (only 4004 is expected)`);
       return;
@@ -352,17 +411,13 @@ class Player {
     if (serverError) violate(`${this.tag}: closed by the server with ${code} "${reason}" during ${game.phase}`);
     if (deliberate) { this.scheduleReconnect(this.reconnectDelay, true); return; }
     if (NO_RETRY.has(code)) { this.dead = true; return; }   // §4: show the message, never retry
-    stats.unexpectedCloses += 1;
-    warn(`${this.tag}: unexpected close ${code} "${reason}" during ${game.phase}; reconnecting`);
+    noteUnexpectedClose(`${this.tag}: ${code} "${reason}" during ${game.phase} (question ${game.q + 1})`);
     this.scheduleReconnect(this.nextBackoff(), false);
   }
 
-  /** Simulated network drop: close now, reconnect with the token after `reconnectAfterMs`. */
+  /** Simulated network drop: close now, reconnect with the token after `reconnectAfterMs` (onClose does the bookkeeping). */
   drop(reconnectAfterMs) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.synced) return false;
-    this.clear('answer');   // a phone that lost its connection cannot answer
-    const a = this.answers.get(this.q);
-    if (a && !a.ackAt) { a.uncertain = true; game.uncertain[this.q] += 1; } // answer in flight: sync or the CSV decides
     this.deliberateClose = true;
     this.reconnectDelay = reconnectAfterMs;
     stats.deliberateDrops += 1;
@@ -402,7 +457,7 @@ class Player {
     let f;
     try { f = JSON.parse(data); } catch { violate(`${this.tag}: non-JSON frame: ${String(data).slice(0, 80)}`); return; }
     if (!f || typeof f.t !== 'string') { violate(`${this.tag}: frame without a string field t`); return; }
-    if (typeof f.serverNow === 'number') this.offset = f.serverNow - Date.now();
+    if (typeof f.serverNow === 'number') this.noteOffset(f.serverNow);
     this.checkNoAnswerKey(f);
     switch (f.t) {
       case 'welcome': return this.onWelcome(f);
@@ -416,11 +471,18 @@ class Player {
         this.clear('answer');
         return undefined;
       case 'open':
+        if (!Number.isInteger(f.q) || !game.quiz.questions[f.q]) { violate(`${this.tag}: open for question index ${f.q}, outside 0..${game.N - 1}`); return undefined; }
+        if (typeof f.deadline !== 'number') violate(`${this.tag}: open for question ${f.q + 1} without a numeric deadline`);
         this.phase = 'open'; this.q = f.q; this.deadline = f.deadline;
         this.scheduleAnswer(f.q);
         return undefined;
       case 'ack': return this.onAck(f);
       case 'result':
+        // The harness never sends "close" and earlyClose is off, so a result (it carries the answer key)
+        // before the deadline on the shared clock means the question was closed early.
+        if (this.phase === 'open' && this.q === f.q && this.deadline && Date.now() + this.offset < this.deadline) {
+          violate(`${this.tag}: result (answer key) for question ${f.q + 1} received ${this.deadline - (Date.now() + this.offset)} ms before the deadline`);
+        }
         this.phase = 'closed';
         return this.recordResult(f, 'result frame');
       case 'podium':
@@ -433,10 +495,30 @@ class Player {
         this.phase = 'ended'; this.gotEnded = true;
         return undefined;
       case 'kicked': violate(`${this.tag}: kicked although the harness never kicks`); return undefined;
-      case 'settings': return undefined;
+      case 'settings':
+        // Sent when the host toggles showOnDevices (the harness never does): settings plus, in
+        // intro/open/closed, the same question object as in sync. Not a sync: no me, no phase.
+        if (!f.settings || typeof f.settings !== 'object') { violate(`${this.tag}: settings frame without a settings object`); return undefined; }
+        if (f.question) {
+          if (!f.settings.showOnDevices && ('text' in f.question || 'options' in f.question)) violate(`${this.tag}: settings.question carries text/options although showOnDevices is off`);
+          if (f.question.q === this.q && typeof f.question.deadline === 'number') this.deadline = f.question.deadline;
+        }
+        return undefined;
       case 'error': violate(`${this.tag}: error frame ${f.code}: ${f.message}`); return undefined;
       default: violate(`${this.tag}: unknown frame type "${f.t}"`); return undefined;
     }
+  }
+
+  /**
+   * Every serverNow sample is serverNow - Date.now() = true offset - one-way downlink latency, so the
+   * largest sample seen is the best estimate (reconnects stay on the same Room, so the clock is the same).
+   * Everything the harness derives from it (sentServerAt, deadline comparisons) therefore errs towards
+   * "earlier than the server saw it", which the checks allow for.
+   */
+  noteOffset(serverNow) {
+    const sample = serverNow - Date.now();
+    this.offset = this.hasOffset ? Math.max(this.offset, sample) : sample;
+    this.hasOffset = true;
   }
 
   /** §4.3: players never see "correct" before closed. Only result.correct (frame or sync in closed) may carry it. */
@@ -461,9 +543,10 @@ class Player {
   }
 
   onSync(s) {
+    this.clear('sync');
     if (s.role !== 'player') violate(`${this.tag}: sync.role is "${s.role}"`);
     if (s.pin !== game.pin) violate(`${this.tag}: sync.pin ${s.pin} != ${game.pin}`);
-    const me = s.me;
+    const me = s.me;   // me.spins (name spins used so far, 0..3) is informational and not checked
     if (!me || typeof me.score !== 'number') { violate(`${this.tag}: sync without me.score`); return; }
     if (s.question && !s.settings?.showOnDevices && ('text' in s.question || 'options' in s.question)) violate(`${this.tag}: sync.question carries text/options although showOnDevices is off`);
     if (me.nick !== this.nick) violate(`${this.tag}: sync.me.nick "${me.nick}" differs from welcome nick`);
@@ -526,6 +609,7 @@ class Player {
   scheduleAnswer(q) {
     if (this.answers.has(q)) return;
     const key = game.quiz.questions[q];
+    if (!key) { violate(`${this.tag}: cannot answer question index ${q}: not in the quiz`); return; }
     const rng = mulberry32(mix(opts.seed, this.i, q + 1));
     const delay = Math.floor(rng() * (opts.answerWindow + 1));
     const correct = rng() < 0.7;
@@ -536,10 +620,17 @@ class Player {
   }
 
   sendAnswer(q, choice) {
+    if (this.phase === 'closed' && this.q === q && this.deadline && Date.now() + this.offset < this.deadline - 500) {
+      violate(`${this.tag}: question ${q + 1} was already closed ${this.deadline - (Date.now() + this.offset)} ms before its deadline, so the phone could not answer`);
+    }
     if (this.phase !== 'open' || this.q !== q || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const key = game.quiz.questions[q];
     const a = {
       choice, sentAt: performance.now(), sentServerAt: Date.now() + this.offset,
-      ackAt: 0, accepted: null, reason: null, uncertain: false, dupSentServerAt: 0, dupAcked: false,
+      opensAt: this.deadline - key.timeLimit * 1000,   // §2: deadline = opensAt + timeLimit * 1000
+      ackAt: 0, accepted: null, reason: null, uncertain: false,
+      expectedLo: null, expectedHi: null,              // §3 points bounds, fixed by the ack (needs the RTT)
+      dupSentServerAt: 0, dupAcked: false, dupLost: false,
     };
     this.answers.set(q, a);
     game.answersSent[q] += 1;   // counted before the send, so a tally can never be ahead of it
@@ -557,6 +648,16 @@ class Player {
       stats.ackMs.push(a.ackAt - a.sentAt);
       if (a.accepted) {
         game.acceptedAcks[f.q] += 1;
+        // §3 speed formula: the server's elapsed is at least the elapsed at send (sentServerAt errs early,
+        // see noteOffset) and at most that plus the ack round trip; CLOCK_TOL_MS covers offset jitter.
+        // The result frame and the CSV cell are checked against these bounds (checkPoints).
+        if (key.points > 0 && Number.isFinite(a.opensAt) && a.opensAt > 0) {
+          const T = key.timeLimit * 1000;
+          const atSend = a.sentServerAt - a.opensAt;
+          const rtt = a.ackAt - a.sentAt;
+          a.expectedLo = expectedPoints(atSend + rtt + CLOCK_TOL_MS, T, key.points);
+          a.expectedHi = expectedPoints(atSend - CLOCK_TOL_MS, T, key.points);
+        }
         if (this.isDup) {
           // Deliberately answer again (with another choice): the server must refuse it as a duplicate (§3).
           a.dupSentServerAt = Date.now() + this.offset;
@@ -574,6 +675,7 @@ class Player {
       a.dupAcked = true;
       if (f.accepted === false && f.reason === 'duplicate') { game.dupsRejected += 1; return; }
       if (f.accepted === false && (f.reason === 'late' || f.reason === 'closed') && a.dupSentServerAt >= this.deadline) {
+        game.dupsLate += 1;
         warn(`${this.tag}: duplicate for question ${f.q + 1} was refused as "${f.reason}" because the question had closed`);
         return;
       }
@@ -609,7 +711,7 @@ class Player {
       else if (a.choice !== r.choice) violate(`${label}: result.choice ${r.choice} != sent ${a.choice}`);
       else if (a.accepted === false && !a.uncertain) violate(`${label}: a refused answer (${a.reason}) appears in the result`);
       if (r.choice !== key.correct && r.points !== 0) violate(`${label}: wrong answer scored ${r.points}`);
-      if (r.choice === key.correct && key.points > 0 && r.points < key.points / 2) violate(`${label}: accepted correct answer scored ${r.points} < ${key.points / 2}`);
+      if (r.choice === key.correct && key.points > 0) checkPoints(r.points, a, key, label);
     }
     if (this.runningQ === q - 1 && r.score !== this.runningScore + r.points) violate(`${label}: result.score ${r.score} != running total ${this.runningScore} + ${r.points}`);
     else if (this.runningQ === q && r.score !== this.runningScore) violate(`${label}: result.score ${r.score} != score ${this.runningScore} reported by sync after answering`);
@@ -627,14 +729,32 @@ class Host {
     this.opensAt = 0; this.deadline = 0;
     this.readyResolve = null; this.readyReject = null;
     this.startSent = false; this.nextSentFor = -1; this.endSent = false; this.ackSent = false;
+    this.resumedInEnded = false;      // reconnected while the room was already "ended": results_csv comes again (§5)
     this.backoff = 500;
     this.timers = { ping: 0, watchdog: 0, next: 0, endPoll: 0, reconnect: 0, expect: 0 };
   }
 
-  /** Resolves on the first sync, rejects if the socket closes before it. */
+  /**
+   * Resolves on the first sync. Rejects if the socket closes before it (error.closeCode) or if nothing
+   * arrives within HOST_SYNC_WAIT_MS (error.timedOut, error.opened = the upgrade had completed).
+   */
   connect() {
     return new Promise((resolve, reject) => {
       this.readyResolve = resolve; this.readyReject = reject;
+      this.clear('expect');
+      this.timers.expect = setTimeout(() => {
+        this.timers.expect = 0;
+        const r = this.readyReject;
+        if (!r) return;
+        this.readyResolve = this.readyReject = null;
+        const ws = this.ws;
+        const opened = !!ws && ws.readyState === WebSocket.OPEN;
+        this.clear('ping');
+        this.ws = null;
+        if (ws) { try { ws.close(1000, 'harness: no sync'); } catch { /* ignore */ } }
+        const what = opened ? `host socket open but no sync within ${HOST_SYNC_WAIT_MS} ms` : `host socket did not connect within ${HOST_SYNC_WAIT_MS} ms`;
+        r(Object.assign(new Error(what), { timedOut: true, opened }));
+      }, HOST_SYNC_WAIT_MS);
       this.open();
     });
   }
@@ -647,7 +767,8 @@ class Host {
       this.timers.ping = setInterval(() => { if (send(this.ws, 'ping')) stats.pings += 1; }, 25000);
     });
     ws.addEventListener('message', (ev) => this.onMessage(ws, ev.data));
-    ws.addEventListener('error', () => { /* close follows */ });
+    // Node's WebSocket fires only "error" (no "close") when the connection is refused: treat that as a 1006 close.
+    ws.addEventListener('error', () => { if (ws === this.ws && ws.readyState === WebSocket.CONNECTING) this.onClose(ws, 1006, 'connect failed'); });
     ws.addEventListener('close', (ev) => this.onClose(ws, ev.code, ev.reason));
   }
 
@@ -665,13 +786,13 @@ class Host {
     if (this.readyReject) {
       const r = this.readyReject;
       this.readyResolve = this.readyReject = null;
-      r(new Error(`host socket closed before sync: ${code} "${reason}"`));
+      this.clear('expect');
+      r(Object.assign(new Error(`host socket closed before sync: ${code} "${reason}"`), { closeCode: code }));
       return;
     }
-    if ((code >= 4000 && code <= 4010) || code === 1009) violate(`host: closed by the server with ${code} "${reason}" during ${game.phase}`);
+    if ((code >= 4000 && code <= 4010) || code === 1009 || code === 1011) violate(`host: closed by the server with ${code} "${reason}" during ${game.phase}`);
     if (NO_RETRY.has(code)) { abort(`host socket closed with ${code} "${reason}"`); return; }
-    stats.unexpectedCloses += 1;
-    warn(`host: unexpected close ${code} "${reason}" during ${game.phase}; reconnecting`);
+    noteUnexpectedClose(`host: ${code} "${reason}" during ${game.phase} (question ${game.q + 1})`);
     const base = this.backoff;
     this.backoff = Math.min(8000, base * 2);
     this.timers.reconnect = setTimeout(() => {
@@ -717,11 +838,13 @@ class Host {
     if (!Array.isArray(s.roster)) violate('host: sync without roster');
     if (s.total !== game.N) violate(`host: sync.total ${s.total} != ${game.N} questions`);
     this.phase = s.phase; this.q = s.q; game.phase = s.phase; game.q = s.q;
+    if (s.question && typeof s.question.deadline === 'number') { this.opensAt = s.question.opensAt; this.deadline = s.question.deadline; }
     game.showOnDevices = !!(s.settings && s.settings.showOnDevices);
     this.backoff = 500;
     if (this.readyResolve) {
       const r = this.readyResolve;
       this.readyResolve = this.readyReject = null;
+      this.clear('expect');
       r();
       return;
     }
@@ -731,8 +854,11 @@ class Host {
     else if (s.phase === 'closed' && this.nextSentFor < s.q) this.scheduleNext(s.q);
     else if (s.phase === 'podium') this.maybeEnd();
     else if (s.phase === 'ended') {
-      violate('host: reconnected during "ended": the CSV is sent once (results_csv) and sync does not carry it');
-      this.sendAckResults();
+      // §5: a host that connects during "ended" receives sync and then results_csv again; ack only after that.
+      // An ack_results sent just before the close was evidently lost, or the room would be wiped (4004) by now.
+      this.resumedInEnded = true;
+      this.ackSent = false;
+      this.expectWithin('results_csv', 5000);
     }
   }
 
@@ -751,10 +877,11 @@ class Host {
     if (!qv || !Number.isInteger(qv.q)) { violate('host: intro without question.q'); return; }
     const q = qv.q;
     if (q !== this.q + 1) violate(`host: intro for question ${q + 1} but the previous question was ${this.q + 1}`);
+    const key = game.quiz.questions[q];
+    if (!key) { violate(`host: intro for question index ${q}, outside 0..${game.N - 1}; ignored`); return; }
     this.phase = 'intro'; this.q = q; game.phase = 'intro'; game.q = q;
     game.introAt[q] = performance.now();
     game.introWall[q] = Date.now();
-    const key = game.quiz.questions[q];
     if (qv.text !== key.text) violate(`host: intro text for question ${q + 1} differs from the quiz`);
     if (!Array.isArray(qv.options) || qv.options.join('\u0000') !== key.options.join('\u0000')) violate(`host: intro options for question ${q + 1} differ from the quiz`);
     if (qv.total !== game.N || qv.optionCount !== key.options.length || qv.timeLimit !== key.timeLimit || qv.points !== key.points) violate(`host: intro metadata for question ${q + 1} differs from the quiz`);
@@ -775,6 +902,7 @@ class Host {
   onTally(f) {
     if (f.q !== this.q) { violate(`host: tally.q ${f.q} != current question ${this.q}`); return; }
     const key = game.quiz.questions[f.q];
+    if (!key) { violate(`host: tally for question index ${f.q}, not in the quiz`); return; }
     const sum = sumCounts(f.counts);
     if (!Array.isArray(f.counts) || f.counts.length !== key.options.length) violate(`host: tally.counts has ${f.counts?.length} entries, expected ${key.options.length}`);
     if (sum !== f.answered) violate(`host: tally counts sum ${sum} != answered ${f.answered}`);
@@ -787,10 +915,16 @@ class Host {
     const q = f.q;
     if (q !== this.q) { violate(`host: reveal.q ${q} != current question ${this.q}`); return; }
     if (game.reveals[q]) { violate(`host: second reveal for question ${q + 1}`); return; }
+    const key = game.quiz.questions[q];
+    if (!key) { violate(`host: reveal for question index ${q}, not in the quiz`); return; }
+    // The harness never sends "close" and earlyClose is off: the only legitimate close is the server timer
+    // at deadline + grace, so a reveal before the deadline on the shared clock means an early close.
+    const at = Date.now() + this.offset;
+    if (this.deadline && at < this.deadline) violate(`host: reveal for question ${q + 1} arrived ${this.deadline - at} ms before the deadline (question closed early)`);
+    else if (this.deadline && at > this.deadline + GRACE_MS + 2000) warn(`host: reveal for question ${q + 1} arrived ${at - this.deadline - GRACE_MS} ms after deadline + grace`);
     this.phase = 'closed'; game.phase = 'closed';
     game.revealAt[q] = performance.now();
     game.reveals[q] = f;
-    const key = game.quiz.questions[q];
     const sum = sumCounts(f.counts);
     if (f.correct !== key.correct) violate(`host: reveal.correct ${f.correct} != key ${key.correct} for question ${q + 1}`);
     if (!Array.isArray(f.counts) || f.counts.length !== key.options.length) violate(`host: reveal.counts has ${f.counts?.length} entries, expected ${key.options.length}`);
@@ -861,17 +995,28 @@ class Host {
     this.endSent = true;
     game.over = true;   // phones stop reconnecting; 4004 closes are expected from here on
     game.endAt = performance.now();
+    // Every phone with a live, synced socket right now must receive the "ended" broadcast (§4.3).
+    game.expectEnded = players.filter((p) => p.ws && p.ws.readyState === WebSocket.OPEN && p.synced && !p.dead);
+    // Reconnects after simulated drops must each have produced a sync, except those still in flight.
+    game.resyncAudit = {
+      resyncs: stats.resyncMs.length, afterDrop: stats.reconnectsAfterDrop,
+      pending: players.filter((p) => p.token && !p.synced && !p.dead).length,
+    };
     send(this.ws, { t: 'end' });
     this.expectWithin('results_csv', 5000);
   }
 
   onCsv(f) {
     this.clear('expect');
-    if (this.phase !== 'podium') violate(`host: results_csv arrived during ${this.phase}`);
+    const resent = this.resumedInEnded && this.phase === 'ended';   // §5: sent again to a host that connects during "ended"
+    this.resumedInEnded = false;
+    if (this.phase !== 'podium' && !resent) violate(`host: results_csv arrived during ${this.phase}`);
     this.phase = 'ended'; game.phase = 'ended';
     if (typeof f.csv !== 'string' || typeof f.filename !== 'string') violate('host: results_csv must carry csv and filename strings');
-    game.csv = typeof f.csv === 'string' ? f.csv : '';
-    game.csvName = typeof f.filename === 'string' ? f.filename : '';
+    const csv = typeof f.csv === 'string' ? f.csv : '';
+    const csvName = typeof f.filename === 'string' ? f.filename : '';
+    if (game.csv !== null && (csv !== game.csv || csvName !== game.csvName)) violate('host: the results_csv re-sent after a reconnect differs from the first one');
+    game.csv = csv; game.csvName = csvName;
     if (!new RegExp(`^hompub-quiz-${game.pin}-\\d{8}\\.csv$`).test(game.csvName)) violate(`host: CSV filename "${game.csvName}" does not match hompub-quiz-<pin>-<YYYYMMDD>.csv`);
     this.sendAckResults();
   }
@@ -980,8 +1125,41 @@ function finalChecks() {
       if (sum !== p.finalScore) violate(`${p.tag}: final score ${p.finalScore} != sum of result.points ${sum}`);
     }
   }
+  // §4.3: everyone connected when the host pressed End must have been told the game is over.
+  for (const p of game.expectEnded) if (!p.gotEnded) violate(`${p.tag}: connected when the host sent "end" but never received the "ended" frame`);
+  // §5: reconnects are answered with sync (per-socket timer in Player.connect; coarse count here).
+  const ra = game.resyncAudit;
+  if (ra && ra.afterDrop > 0 && ra.resyncs === 0) violate(`${ra.afterDrop} reconnects after simulated drops but no resync (sync after a ?token= reconnect) was ever observed`);
+  else if (ra && ra.resyncs < ra.afterDrop - ra.pending) violate(`${ra.afterDrop} reconnects after simulated drops but only ${ra.resyncs} resyncs (${ra.pending} still pending when the game ended)`);
+  // Every answer sent on a socket that stayed open was acknowledged, and every deliberate duplicate was answered (§3).
+  for (const p of joined) {
+    for (const [q, a] of p.answers) {
+      if (!a.ackAt && !a.uncertain) violate(`${p.tag}: answer for question ${q + 1} was sent on an open socket but never acknowledged`);
+      if (a.dupSentServerAt && !a.dupAcked) violate(`${p.tag}: duplicate answer for question ${q + 1} was never acknowledged (expected accepted=false, reason "duplicate")`);
+    }
+  }
   if (game.dupsSent === 0) warn('no duplicate answer was ever sent, so the "duplicate" ack path was not exercised');
   checkCsv(joined);
+  checkFastest();
+}
+
+/** reveal.fastest.ms is the server's elapsed for the fastest correct answer; the harness knows bounds for each one it sent. */
+function checkFastest() {
+  for (let q = 0; q < game.N; q++) {
+    const rv = game.reveals[q];
+    const key = game.quiz.questions[q];
+    if (!rv || !rv.fastest || typeof rv.fastest.ms !== 'number') continue;
+    const T = key.timeLimit * 1000;
+    let lo = Infinity; let hi = Infinity;   // fastest >= the earliest send; fastest <= the earliest (send + RTT) among acked answers
+    for (const p of players) {
+      const a = p.answers.get(q);
+      if (!a || a.choice !== key.correct || a.accepted !== true) continue;
+      lo = Math.min(lo, Math.min(T, Math.max(0, a.sentServerAt - a.opensAt - CLOCK_TOL_MS)));
+      if (a.ackAt) hi = Math.min(hi, Math.min(T, a.sentServerAt - a.opensAt + (a.ackAt - a.sentAt) + CLOCK_TOL_MS));
+    }
+    if (lo === Infinity) continue;
+    if (rv.fastest.ms < lo || rv.fastest.ms > hi) violate(`question ${q + 1}: reveal.fastest.ms ${rv.fastest.ms} is outside ${Math.round(lo)}..${Math.round(hi)} ms, the bounds of the fastest correct answer the harness sent`);
+  }
 }
 
 function parseCsvLine(line) {
@@ -1033,6 +1211,13 @@ function checkCsv(joined) {
       const key = game.quiz.questions[q];
       const r = p.results.get(q);
       const a = p.answers.get(q);
+      // An answer whose ack was lost in a drop and that no sync resolved: the CSV is the server's final word.
+      if (a && a.uncertain) {
+        a.uncertain = false;
+        a.accepted = cell !== '';
+        game.uncertain[q] -= 1;
+        if (a.accepted) game.acceptedAcks[q] += 1;
+      }
       if (cell === '') {
         if (r && r.choice !== null) violate(`${p.tag}: CSV q${q + 1} is empty but the result had choice ${r.choice}`);
         if (a && a.accepted === true) violate(`${p.tag}: answer for q${q + 1} was accepted but the CSV cell is empty`);
@@ -1045,7 +1230,7 @@ function checkCsv(joined) {
       if (choice === key.correct) nCorrect += 1;
       if (pts > key.points) violate(`${p.tag}: CSV q${q + 1} has ${pts} points > ${key.points}`);
       if (choice !== key.correct && pts !== 0) violate(`${p.tag}: CSV q${q + 1} wrong answer scored ${pts}`);
-      if (choice === key.correct && key.points > 0 && pts < key.points / 2) violate(`${p.tag}: CSV q${q + 1} correct answer scored ${pts} < ${key.points / 2}`);
+      if (choice === key.correct && key.points > 0) checkPoints(pts, a && a.choice === choice ? a : null, key, `${p.tag}: CSV q${q + 1}`);
       if (r && (r.choice !== choice || r.points !== pts)) violate(`${p.tag}: CSV q${q + 1} "${cell}" disagrees with the result (choice ${r.choice}, ${r.points} pts)`);
       if (!a) violate(`${p.tag}: CSV q${q + 1} shows an answer the harness never sent`);
       else if (a.choice !== choice) violate(`${p.tag}: CSV q${q + 1} choice ${m[1]} != sent ${letter(a.choice)}`);
@@ -1089,7 +1274,8 @@ function printReport() {
   out.push(`frames sent ${stats.framesSent}   frames received ${stats.framesRecv}   bytes received ${fmtBytes(stats.bytesRecv)}   bytes sent ${fmtBytes(stats.bytesSent)}`);
   out.push(`pings ${stats.pings}   pongs ${stats.pongs}   host tally frames ${game.tallies}`);
   out.push(`reconnects performed ${stats.reconnects} (after simulated drops ${stats.reconnectsAfterDrop}, after unexpected closes ${stats.reconnects - stats.reconnectsAfterDrop})   drops ${stats.deliberateDrops}   unexpected closes ${stats.unexpectedCloses}`);
-  out.push(`players joined ${joined}/${opts.players}   in lobby at start ${game.readyAtStart}   duplicate answers sent ${game.dupsSent}, refused as duplicate ${game.dupsRejected}   ended frames ${players.filter((p) => p.gotEnded).length}`);
+  const dupNote = game.dupsLate || game.dupsLost ? ` (refused as late ${game.dupsLate}, ack lost in a drop ${game.dupsLost})` : '';
+  out.push(`players joined ${joined}/${opts.players}   in lobby at start ${game.readyAtStart}   duplicate answers sent ${game.dupsSent}, refused as duplicate ${game.dupsRejected}${dupNote}   ended frames ${players.filter((p) => p.gotEnded).length}/${game.expectEnded.length} expected`);
   const t = (a, b) => (a && b ? `${Math.round(b - a)} ms` : '-');
   out.push(`lobby ${t(game.t0, game.startedAt)}   game (start -> podium) ${t(game.startedAt, game.podiumAt)}   podium -> wiped ${t(game.podiumAt, game.wipedAt)}   wiped -> last socket closed ${t(game.wipedAt, game.lastCloseAt)}   total ${t(game.t0, performance.now())}`);
   out.push(`close codes: ${[...stats.closeCodes.entries()].sort((a, b) => a[0] - b[0]).map(([c, n]) => `${c} x${n}`).join('   ') || '-'}`);
@@ -1117,6 +1303,12 @@ function printReport() {
     if (warnings.length > 20) out.push(`  ... and ${warnings.length - 20} more (run with --verbose to see them as they happen)`);
     out.push('');
   }
+  if (stats.unexpectedCloseLog.length) {
+    out.push(`unexpected closes (${stats.unexpectedCloses}; a violation about an answer, resync or result in the same question may be their consequence):`);
+    for (const c of stats.unexpectedCloseLog) out.push(`  - ${c}`);
+    if (stats.unexpectedCloses > stats.unexpectedCloseLog.length) out.push(`  ... and ${stats.unexpectedCloses - stats.unexpectedCloseLog.length} more`);
+    out.push('');
+  }
   if (violations.length) {
     out.push(`violations (${violations.length}):`);
     for (const v of violations.slice(0, 200)) out.push(`  - ${v}`);
@@ -1140,7 +1332,7 @@ async function main() {
     health = await res.json();
     if (!res.ok || health.ok !== true) throw new Error(`HTTP ${res.status} ${JSON.stringify(health).slice(0, 100)}`);
   } catch (err) {
-    die(`cannot reach ${opts.url}/api/health (${err.cause?.code || err.name === 'TimeoutError' ? 'timeout' : err.message}).\n  Start the server with "npm run dev" in quiz/ (it serves http://localhost:8787) or pass --url.`);
+    die(`cannot reach ${opts.url}/api/health (${err.name === 'TimeoutError' ? 'timeout' : (err.cause?.code || err.message)}).\n  Start the server with "npm run dev" in quiz/ (it serves http://localhost:8787) or pass --url.`);
   }
   log(`server ${opts.url} is up (clock skew ${health.now - Date.now()} ms)`);
 
@@ -1180,7 +1372,12 @@ async function main() {
 
   // 4. Host socket.
   host = new Host();
-  try { await host.connect(); } catch (err) { die(`host socket: ${err.message}`); }
+  try { await host.connect(); } catch (err) {
+    // The server answered and refused (4000-4010) or upgraded but never synced: a server defect, exit 1.
+    // A connection that failed or hung: unreachable, exit 2.
+    const serverAnswered = (err.closeCode >= 4000 && err.closeCode <= 4010) || err.closeCode === 1009 || err.closeCode === 1011 || (err.timedOut && err.opened);
+    die(`host socket: ${err.message}`, serverAnswered ? 1 : 2);
+  }
   log(`host synced; spawning ${opts.players} players over ${opts.joinBurst} ms`);
   host.armWatchdog();
 
@@ -1213,5 +1410,20 @@ process.on('SIGINT', () => {
   log('interrupted; closing sockets');
   abort('interrupted (SIGINT)');
 });
+
+// A bug in the harness, or a frame shape it did not expect, must still end in a report and exit 1
+// rather than a bare stack trace from inside a WebSocket event handler.
+for (const event of ['uncaughtException', 'unhandledRejection']) {
+  process.on(event, (err) => {
+    violations.push(`harness crashed (${event}): ${err && err.stack ? err.stack : String(err)}`);
+    try {
+      if (game.quiz) printReport();
+      else process.stderr.write(`load.mjs: ${violations[violations.length - 1]}\n`);
+    } catch (reportErr) {
+      process.stderr.write(`load.mjs: ${reportErr && reportErr.stack ? reportErr.stack : String(reportErr)}\n`);
+    }
+    process.exit(1);
+  });
+}
 
 main().catch((err) => die(`unexpected error: ${err.stack || err}`, 1));

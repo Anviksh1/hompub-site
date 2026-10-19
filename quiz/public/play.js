@@ -620,7 +620,8 @@ function announceScreen(screen) {
   const el = $('announcer');
   clearTimeout(announceTimer);
   el.textContent = '';                         // empty first so an identical headline is still spoken
-  announceTimer = setTimeout(() => { el.textContent = parts.join('. '); }, 50);
+  const sentence = parts.map((t) => (/[.!?…]$/.test(t) ? t : t + '.')).join(' ');
+  announceTimer = setTimeout(() => { el.textContent = sentence; }, 50);
 }
 
 function questionLabel() {

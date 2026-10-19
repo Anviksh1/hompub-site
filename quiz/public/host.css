@@ -324,10 +324,17 @@ body[data-mode="stage"] .check .check-text small { color: var(--stage-ink-soft);
 }
 .stage-head {
   display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px;
-  font-family: 'IBM Plex Mono', monospace; font-size: 0.9rem; color: var(--stage-ink-soft);
+  font-family: 'IBM Plex Mono', monospace; font-size: clamp(0.9rem, 1.3vw, 1.15rem); color: var(--stage-ink-soft);
   border-bottom: 1px solid var(--stage-rule); padding-bottom: 8px;
 }
 .stage-head b { color: var(--stage-ink); font-weight: 500; letter-spacing: 0.08em; }
+/* The PIN stays readable from the back row while a question is up, for late joiners. */
+.stage-head .pin b { font-size: clamp(1.4rem, 2vw, 1.9rem); line-height: 1; color: #ffffff; }
+/* DOM order may put the controls before the body (lobby: Lock / Show on phones / Start come before
+   up to 250 player chips for keyboard and screen-reader users); flex `order` keeps them at the bottom. */
+.stage > .stage-head { order: 0; }
+.stage > .stage-body { order: 1; }
+.stage > .controls { order: 2; }
 .stage-head .grow { flex: 1; }
 .stage-menu { position: relative; }
 .stage-menu summary {
@@ -365,7 +372,7 @@ body[data-mode="stage"] .check .check-text small { color: var(--stage-ink-soft);
 .players-grid { display: flex; flex-wrap: wrap; gap: 8px; align-content: flex-start; }
 .player-chip {
   min-height: 44px; padding: 8px 16px; border-radius: 999px; border: 1px solid var(--stage-rule);
-  background: var(--stage-panel); color: var(--stage-ink); font-size: clamp(0.95rem, 1.6vw, 1.25rem);
+  background: var(--stage-panel); color: var(--stage-ink); font-size: clamp(0.95rem, 1.6vw, 1.5rem);
   max-width: 100%; overflow-wrap: anywhere; text-align: left;
 }
 .player-chip:hover { background: var(--stage-panel-strong); border-color: #fff; }
@@ -373,7 +380,7 @@ body[data-mode="stage"] .check .check-text small { color: var(--stage-ink-soft);
 .lobby-empty { color: var(--stage-ink-soft); font-size: 1.1rem; }
 
 /* Question / reveal */
-.q-counter { display: flex; flex-wrap: wrap; gap: 6px 18px; font-family: 'IBM Plex Mono', monospace; font-size: clamp(0.85rem, 1.6vw, 1.1rem); color: var(--stage-ink-soft); }
+.q-counter { display: flex; flex-wrap: wrap; gap: 6px 18px; font-family: 'IBM Plex Mono', monospace; font-size: clamp(0.9rem, 1.8vw, 1.4rem); color: var(--stage-ink-soft); }
 .q-text {
   font-size: clamp(1.5rem, 4.6vw, 3.6rem); font-weight: 600; line-height: 1.15; color: #ffffff;
   overflow-wrap: anywhere;
@@ -398,42 +405,49 @@ body[data-mode="stage"] .check .check-text small { color: var(--stage-ink-soft);
 .opt-tile {
   position: relative; display: flex; align-items: center; gap: 16px; min-height: 92px; padding: 16px 20px;
   border-radius: var(--tile-radius, 16px); background: var(--opt-color); color: var(--opt-ink);
-  font-size: clamp(1.1rem, 2.6vw, 2rem); font-weight: 600; line-height: 1.2; overflow: hidden;
+  font-size: clamp(1.1rem, 2.6vw, 2.6rem); font-weight: 600; line-height: 1.2; overflow: hidden;
   border: var(--border-w) solid rgba(255,255,255,0.25);
 }
 .opt-tile .shape { width: clamp(36px, 5vw, 56px); height: clamp(36px, 5vw, 56px); flex: none; display: flex; }
 .opt-tile .shape svg { width: 100%; height: 100%; fill: currentColor; }
 .opt-tile .label { flex: 1; overflow-wrap: anywhere; }
-.opt-tile .count { font-family: 'IBM Plex Mono', monospace; font-size: clamp(1.3rem, 3vw, 2.4rem); font-weight: 500; flex: none; }
+.opt-tile .count { font-family: 'IBM Plex Mono', monospace; font-size: clamp(1.3rem, 3vw, 2.8rem); font-weight: 500; flex: none; }
 .opt-tile .tick { flex: none; width: 1.2em; height: 1.2em; }
 .opt-tile .bar { position: absolute; left: 0; bottom: 0; height: 8px; background: rgba(255,255,255,0.85); border-radius: 0 4px 4px 0; }
 .slot-2 .bar { background: rgba(28,23,48,0.75); }
-.opt-tile.is-dim { opacity: 0.38; }
+/* Reveal: wrong options dim their BACKGROUND only (a dark layer over the slot colour); the count and
+   bar — the teaching signal — stay at full opacity, in white ink so they read on every darkened slot. */
+.opt-tile.is-dim {
+  background: linear-gradient(rgba(28,23,48,0.6), rgba(28,23,48,0.6)), var(--opt-color);
+  color: #ffffff; border-color: rgba(255,255,255,0.12);
+}
+.opt-tile.is-dim .bar { background: rgba(255,255,255,0.85); }
 .opt-tile.is-correct { border-color: #ffffff; box-shadow: 0 0 0 4px #ffffff, 0 10px 30px rgba(0,0,0,0.35); }
-:root[data-contrast="high"] .opt-tile.is-dim { opacity: 0.6; text-decoration: line-through; }
+:root[data-contrast="high"] .opt-tile.is-dim { background: linear-gradient(rgba(0,0,0,0.7), rgba(0,0,0,0.7)), var(--opt-color); }
+:root[data-contrast="high"] .opt-tile.is-dim .label { text-decoration: line-through; }
 
 .reveal-row { display: grid; grid-template-columns: 1fr; gap: 18px; }
-.fastest { font-size: clamp(1.1rem, 2.2vw, 1.6rem); color: var(--stage-ink); }
+.fastest { font-size: clamp(1.1rem, 2.2vw, 2rem); color: var(--stage-ink); }
 .fastest b { color: #ffffff; }
 
 /* Leaderboard */
 .board { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .board li {
   display: grid; grid-template-columns: 2.2em 1fr auto auto; gap: 10px; align-items: center;
-  padding: 8px 14px; border-radius: 10px; background: var(--stage-panel); font-size: clamp(1rem, 1.9vw, 1.35rem);
+  padding: 8px 14px; border-radius: 10px; background: var(--stage-panel); font-size: clamp(1rem, 2.2vw, 1.8rem);
 }
 .board .rank { font-family: 'IBM Plex Mono', monospace; color: var(--stage-ink-soft); }
 .board .nick { overflow-wrap: anywhere; color: var(--stage-ink); }
 .board .score { font-family: 'IBM Plex Mono', monospace; font-weight: 500; color: #ffffff; }
 .board .delta { font-family: 'IBM Plex Mono', monospace; font-size: 0.8em; color: #a8f0b8; min-width: 4.5ch; text-align: right; }
 .board .delta.zero { color: var(--stage-ink-soft); }
-.board-title { font-size: clamp(1.1rem, 2vw, 1.5rem); font-weight: 600; color: var(--stage-ink); }
+.board-title { font-size: clamp(1.1rem, 2.2vw, 1.8rem); font-weight: 600; color: var(--stage-ink); }
 
 /* Podium: 1st in the middle and tallest */
 .podium { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; align-items: end; margin-top: 12px; }
 .place { display: flex; flex-direction: column; align-items: center; gap: 10px; text-align: center; }
-.place .nick { font-size: clamp(1rem, 2.4vw, 1.7rem); font-weight: 600; color: #ffffff; overflow-wrap: anywhere; }
-.place .score { font-family: 'IBM Plex Mono', monospace; color: var(--stage-ink-soft); font-size: clamp(0.85rem, 1.6vw, 1.15rem); }
+.place .nick { font-size: clamp(1rem, 3vw, 2.4rem); font-weight: 600; color: #ffffff; overflow-wrap: anywhere; }
+.place .score { font-family: 'IBM Plex Mono', monospace; color: var(--stage-ink-soft); font-size: clamp(0.9rem, 1.8vw, 1.5rem); }
 .place .block {
   width: 100%; border-radius: 12px 12px 0 0; display: flex; align-items: flex-start; justify-content: center; padding-top: 12px;
   font-family: 'Fraunces', serif; font-size: clamp(1.6rem, 4vw, 3rem); font-weight: 650; color: #1c1730;

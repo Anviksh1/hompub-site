@@ -28,6 +28,7 @@ budget). Only `/api/*` invokes the Worker.
 | `GET /api/room/:pin/ws?role=player[&token=<playerToken>]` | Player WebSocket. `token` present = reconnect attempt. |
 
 `:pin` must match `^[1-9][0-9]{5}$`. Any other `/api/*` path → `404 {"error":"not_found"}`.
+The join page treats a summary whose `phase` is `podium` or `ended` as too late to join, matching the Room, which refuses new players in both phases with `4004`.
 Non-upgrade requests to a `/ws` URL → `426`.
 
 **Origin check (Worker, all `/api/*`):** if an `Origin` header is present it
@@ -187,7 +188,7 @@ Every frame has `t`. Frames with times carry `serverNow` (ms since epoch, server
 
 | Frame | Fields |
 |---|---|
-| `welcome` | `pid, token, nick, pin` — store `{pin, token, pid, nick}` in localStorage key `hompub-quiz:player:<pin>` |
+| `welcome` | `pid, token, nick, pin` — store `{pin, token, pid, nick, savedAt}` in localStorage key `hompub-quiz:player:<pin>`; entries older than 6 h are swept on page load |
 | `lobby` | `playerCount, locked` (coalesced, ≤ 2/s) |
 | `intro` | `question` (same object as in `sync`), `serverNow` |
 | `open` | `q, deadline, serverNow` |

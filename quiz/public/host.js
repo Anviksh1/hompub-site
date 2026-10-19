@@ -57,6 +57,8 @@ const BLOCKED_MSG = 'WebSockets are blocked on this network. Try the guest Wi-Fi
 const STAGE_PHASES = new Set(['connecting', 'lobby', 'intro', 'open', 'closed', 'podium', 'ended', 'wiped', 'disconnected']);
 const RING_R = 54;
 const RING_C = 2 * Math.PI * RING_R;
+const SHORTCUT_MUTE_MS = 500;   // Space/Enter stay quiet this long after a rebuild dropped focus to <body>
+const NOT_SAVED_MSG = 'Not saved — this browser is blocking storage. Export your quiz to keep it.';
 
 const SAMPLE_QUIZ = {
   title: 'General knowledge warm-up',
@@ -124,14 +126,15 @@ function btn(label, action, opts) {
   if (o.disabled) attrs.disabled = true;
   return h('button', attrs, label);
 }
+// Both carry a stable id (the field name, plus the value for radios) so render() can restore focus.
 function toggle(field, checked, label, desc) {
   return h('label', { class: 'check' },
-    h('input', { type: 'checkbox', 'data-field': field, checked: checked || null }),
+    h('input', { type: 'checkbox', id: field, 'data-field': field, checked: checked || null }),
     h('span', { class: 'check-text' }, h('b', null, label), desc ? h('small', null, desc) : null));
 }
 function radio(field, value, checked, label, desc) {
   return h('label', { class: 'check' },
-    h('input', { type: 'radio', name: field, value, 'data-field': field, checked: checked || null }),
+    h('input', { type: 'radio', id: `${field}-${value}`, name: field, value, 'data-field': field, checked: checked || null }),
     h('span', { class: 'check-text' }, h('b', null, label), desc ? h('small', null, desc) : null));
 }
 
@@ -171,8 +174,12 @@ function loadQuizzes() {
   const list = loadJSON(KEYS.quizzes, []);
   return Array.isArray(list) ? list.filter((q) => q && typeof q === 'object' && typeof q.id === 'string' && Array.isArray(q.questions)) : [];
 }
+// Returns whether the write succeeded, so the editor's status line can say "Not saved" honestly.
 function persistQuizzes() {
-  if (!saveJSON(KEYS.quizzes, state.quizzes)) toast('Could not save: this browser is blocking storage. Export your quiz to keep it.');
+  const ok = saveJSON(KEYS.quizzes, state.quizzes);
+  state.storageBlocked = !ok;
+  if (!ok) toast('Could not save: this browser is blocking storage. Export your quiz to keep it.');
+  return ok;
 }
 function findQuiz(id) { return state.quizzes.find((q) => q.id === id) || null; }
 function uid() {
@@ -180,24 +187,34 @@ function uid() {
 }
 function newQuestion() { return { text: '', options: ['', '', '', ''], correct: 0, timeLimit: 20, points: 1000 }; }
 function makeStored(quiz, exported) {
-  return { id: uid(), title: quiz.title, questions: quiz.questions, updatedAt: Date.now(), exportedAt: exported ? Date.now() : null };
+  const now = Date.now();
+  return { id: uid(), title: quiz.title, questions: quiz.questions, updatedAt: now, exportedAt: exported ? now : null };
 }
+// A quiz counts as exported only while no edit is newer than its last export; otherwise the
+// "not exported" marker and the setup-screen notice must come back.
+function isExported(q) { return !!q.exportedAt && !(q.updatedAt > q.exportedAt); }
 
-// Coerce an imported object into the Quiz shape. Returns null when it is not a quiz at all;
-// out-of-range values are kept so the editor can show them as problems.
+// Coerce an imported object into the Quiz shape. Returns null when it is not a quiz at all.
+// Values the editor can flag are kept as problems: an out-of-range or non-integer `correct`
+// becomes -1 (no radio ticked, "tick the correct option"), never silently option A. Options
+// beyond 4 and questions beyond 100 have to be dropped; they are counted in `dropped` so the
+// import toast can say so instead of pretending the file came through whole.
 function normaliseQuiz(raw) {
   if (!raw || typeof raw !== 'object' || !Array.isArray(raw.questions)) return null;
+  const dropped = { questions: Math.max(0, raw.questions.length - LIMITS.questions), options: 0 };
   const questions = raw.questions.slice(0, LIMITS.questions).map((item) => {
     const o = item && typeof item === 'object' ? item : {};
-    const options = Array.isArray(o.options) ? o.options.slice(0, 4).map((x) => String(x == null ? '' : x)) : ['', ''];
+    const rawOptions = Array.isArray(o.options) ? o.options : null;
+    if (rawOptions) dropped.options += Math.max(0, rawOptions.length - 4);
+    const options = rawOptions ? rawOptions.slice(0, 4).map((x) => String(x == null ? '' : x)) : ['', ''];
     while (options.length < 2) options.push('');
-    const correct = Number.isInteger(o.correct) && o.correct >= 0 && o.correct < options.length ? o.correct : 0;
+    const correct = Number.isInteger(o.correct) && o.correct >= 0 && o.correct < options.length ? o.correct : -1;
     const timeLimit = TIME_LIMITS.includes(Number(o.timeLimit)) ? Number(o.timeLimit) : 20;
     const points = POINTS.includes(Number(o.points)) ? Number(o.points) : 1000;
     return { text: String(o.text == null ? '' : o.text), options, correct, timeLimit, points };
   });
   if (!questions.length) questions.push(newQuestion());
-  return { title: String(raw.title == null ? '' : raw.title), questions };
+  return { title: String(raw.title == null ? '' : raw.title), questions, dropped };
 }
 
 // The exact object sent in POST /api/room (PROTOCOL §2): nothing but title + questions, trimmed.
@@ -263,6 +280,8 @@ const state = {
   error: null,             // readable error for the setup screen
   netCheck: { status: 'idle', message: '' },
   conn: { status: 'idle', detail: '' },
+  allTimers: null,         // last value chosen in the editor's "Set all timers to…" select
+  storageBlocked: false,   // the last persistQuizzes() failed (private window, site data blocked)
   prefs: {
     highContrast: !!storedPrefs.highContrast,
     settings: Object.assign({}, DEFAULT_SETTINGS, storedPrefs.settings || {}),
@@ -274,6 +293,7 @@ let wakeLock = null;
 let tickHandle = null;
 let qrCache = null;       // {pin, svg} — the QR is generated once per PIN
 let toastTimer = null;
+let shortcutMuteUntil = 0; // Date.now() before which the Space/Enter primary shortcut is ignored
 
 function savePrefs() { saveJSON(KEYS.prefs, state.prefs); }
 
@@ -298,7 +318,9 @@ function render() {
   const phase = currentPhase();
   const app = $('app');
   // Re-rendering replaces the DOM; keep focus and the options menu where they were.
-  const focusedId = document.activeElement ? document.activeElement.id : '';
+  const active = document.activeElement;
+  const hadFocus = !!(active && active !== document.body && app.contains(active));
+  const focusedId = hadFocus ? active.id : '';
   const menu = $('stage-menu');
   const menuOpen = !!(menu && menu.open);
 
@@ -321,10 +343,17 @@ function render() {
   document.body.dataset.mode = STAGE_PHASES.has(phase) ? 'stage' : 'page';
   app.replaceChildren(view);
 
+  let restored = false;
   if (focusedId) {
     const el = $(focusedId);
-    if (el && el !== document.activeElement) { try { el.focus({ preventScroll: true }); } catch (e) { /* ignore */ } }
+    if (el) {
+      try { el.focus({ preventScroll: true }); } catch (e) { /* ignore */ }
+      restored = document.activeElement === el;
+    }
   }
+  // Focus that could not be handed back falls to <body>; mute the Space/Enter shortcut briefly so a
+  // key meant for the control the teacher had reached does not fire the phase's primary action.
+  if (hadFocus && !restored) shortcutMuteUntil = Date.now() + SHORTCUT_MUTE_MS;
   const menu2 = $('stage-menu');
   if (menu2 && menuOpen) menu2.open = true;
 
@@ -371,7 +400,7 @@ function renderQuizRow(q) {
       h('div', { class: 'meta mono' },
         `${plural(n, 'question')} · about ${fmtDuration(quizDurationSec(q))} · edited ${fmtDate(q.updatedAt)}`,
         problems ? ` · ${plural(problems, 'problem')}` : '',
-        q.exportedAt ? '' : ' · not exported')),
+        isExported(q) ? '' : ' · not exported')),
     h('div', { class: 'btn-row' },
       btn('Host', 'setup', { cls: 'primary', attrs: { 'data-id': q.id } }),
       btn('Edit', 'edit', { attrs: { 'data-id': q.id } }),
@@ -396,6 +425,7 @@ function renderEditor() {
   const q = findQuiz(state.editorId);
   if (!q) { state.screen = 'home'; return renderHome(); }
   const total = q.questions.length;
+  const allTimers = TIME_LIMITS.includes(state.allTimers) ? state.allTimers : ((q.questions[0] && q.questions[0].timeLimit) || 20);
   return h('div', { class: 'wrap page' },
     h('div', null, h('button', { type: 'button', class: 'link-btn', 'data-action': 'home' }, '← All quizzes')),
     h('div', { class: 'page-head' },
@@ -410,11 +440,11 @@ function renderEditor() {
       h('div', { class: 'field' },
         h('span', { class: 'field-label' }, 'Set all timers to…'),
         h('div', { class: 'btn-row' },
-          h('select', { class: 'input', id: 'all-timers', 'aria-label': 'Time limit for every question', style: 'width:auto;flex:1 1 140px' },
-            TIME_LIMITS.map((t) => h('option', { value: t, selected: t === 20 || null }, `${t} seconds`))),
+          h('select', { class: 'input', id: 'all-timers', 'data-field': 'all-timers', 'aria-label': 'Time limit for every question', style: 'width:auto;flex:1 1 140px' },
+            TIME_LIMITS.map((t) => h('option', { value: t, selected: t === allTimers || null }, `${t} seconds`))),
           btn('Apply to all', 'all-timers'))),
       h('div', { id: 'problems-box' }, renderProblems(validateQuiz(q))),
-      h('p', { class: 'autosave', id: 'autosave' }, 'Saved automatically in this browser.')),
+      h('p', { class: 'autosave', id: 'autosave' }, state.storageBlocked ? NOT_SAVED_MSG : 'Saved automatically in this browser.')),
     h('div', { class: 'quiz-list' }, q.questions.map((qq, i) => renderQuestionCard(qq, i, total))),
     h('div', { class: 'btn-row' },
       btn('+ Add question', 'add-question', { cls: 'primary', disabled: total >= LIMITS.questions }),
@@ -460,11 +490,11 @@ function renderQuestionCard(qq, i, total) {
 }
 
 // Typing must not rebuild the form (it would steal the caret), so text edits only refresh these two bits.
-function refreshEditorStatus(q) {
+function refreshEditorStatus(q, saved) {
   const box = $('problems-box');
   if (box) box.replaceChildren(renderProblems(validateQuiz(q)));
   const auto = $('autosave');
-  if (auto) auto.textContent = 'Saved ' + new Date().toLocaleTimeString();
+  if (auto) auto.textContent = saved === false ? NOT_SAVED_MSG : 'Saved ' + new Date().toLocaleTimeString();
 }
 
 /* ---------- 4c. SETUP (settings before hosting) ---------- */
@@ -485,9 +515,11 @@ function renderSetup() {
       h('b', null, 'This quiz cannot be hosted yet'),
       h('ul', { class: 'problems' }, problems.map((p) => h('li', null, p))),
       h('div', { class: 'btn-row' }, btn('Fix in editor', 'edit', { attrs: { 'data-id': q.id } }))) : null,
-    !q.exportedAt && h('div', { class: 'notice' },
+    !isExported(q) && h('div', { class: 'notice' },
       h('b', null, 'Export a copy before hosting'),
-      h('p', { class: 'fine' }, 'This quiz exists only in this browser. If the browser clears its storage, it is gone. Save a .json copy first — it takes one click.'),
+      h('p', { class: 'fine' },
+        q.exportedAt ? 'This quiz has changed since it was last exported. ' : 'This quiz exists only in this browser. ',
+        'If the browser clears its storage, the latest version is gone. Save a .json copy first — it takes one click.'),
       h('div', { class: 'btn-row' }, btn('Export .json', 'export', { attrs: { 'data-id': q.id } }))),
     h('section', { class: 'card' },
       h('h2', null, 'Scoring'),
@@ -513,37 +545,49 @@ function renderSetup() {
 
 /* ---------- 4d. STAGE scaffolding (shared by lobby / question / reveal / podium / ended) ---------- */
 
-function stageFrame(body, controls, hint) {
+// opts.controlsFirst puts the controls BEFORE the body in DOM order (host.css keeps them at the
+// bottom visually with flex `order`), so keyboard and screen-reader users reach Lock / Show on
+// phones / Start without passing every player chip first.
+function stageFrame(body, controls, hint, opts) {
   const g = state.game || {};
+  const o = opts || {};
+  const ctl = controls && controls.length
+    ? h('div', { class: 'controls' }, hint ? h('span', { class: 'hint' }, hint) : null, controls.map(stableControlId))
+    : null;
   return h('div', { class: 'stage' },
     renderStageHead(g),
+    o.controlsFirst ? ctl : null,
     h('section', { class: 'stage-body' }, body),
-    controls && controls.length
-      ? h('div', { class: 'controls' }, hint ? h('span', { class: 'hint' }, hint) : null, controls)
-      : null);
+    o.controlsFirst ? null : ctl);
+}
+// Stage controls get a stable id (ctl-<action>) so render() can hand focus back after a rebuild.
+function stableControlId(el) {
+  if (el instanceof Element && !el.id && el.dataset && el.dataset.action) el.id = 'ctl-' + el.dataset.action;
+  return el;
 }
 
 function renderStageHead(g) {
   const count = g.playerCount | 0;
   return h('header', { class: 'stage-head' },
-    h('span', null, 'PIN ', h('b', null, g.pin || '')),
+    h('span', { class: 'pin' }, 'PIN ', h('b', null, g.pin || '')),
     h('span', null, location.host + '/play'),
     h('span', { class: 'grow' }, plural(count, 'player'), g.locked ? ' · locked' : ''),
-    g.phase && g.phase !== 'ended' ? renderStageMenu(g) : null);
+    g.phase && g.phase !== 'ended' && isLive() ? renderStageMenu(g) : null);
 }
 
 // Live options: showOnDevices and lateJoin may change in any phase (PROTOCOL §2); lock too (§4.2).
 function renderStageMenu(g) {
   const s = g.settings || DEFAULT_SETTINGS;
   return h('details', { class: 'stage-menu', id: 'stage-menu' },
-    h('summary', null, 'Options'),
+    h('summary', { id: 'stage-menu-summary' }, 'Options'),
     h('div', { class: 'menu-body' },
       toggle('g-showOnDevices', !!s.showOnDevices, 'Show question on phones', 'Off: phones show only the four shapes.'),
       toggle('g-lateJoin', !!s.lateJoin, 'Allow late joiners', null),
       toggle('g-lock', !!g.locked, 'Lock room', 'No new players; reconnects still work.'),
       h('hr'),
-      btn(g.phase === 'lobby' ? 'Cancel game' : 'End game now', 'abort', { cls: 'danger' }),
-      h('p', { class: 'fine', style: 'color:var(--stage-ink-soft);font-size:0.8rem' }, 'Ends the game at once and downloads the results so far.')));
+      btn(g.phase === 'lobby' ? 'Cancel game' : 'End game now', 'abort', { cls: 'danger', attrs: { id: 'menu-abort' } }),
+      h('p', { class: 'fine', style: 'color:var(--stage-ink-soft);font-size:0.8rem' },
+        g.phase === 'lobby' ? 'Ends the game at once. Nothing has been played, so no results file is made.' : 'Ends the game at once and downloads the results so far.')));
 }
 
 function abortOnlyControls() { return [btn('End game', 'abort', { cls: 'danger' })]; }
@@ -584,8 +628,10 @@ function renderLobby() {
         h('div', { class: 'players-grid' }, roster.map((p) =>
           h('button', {
             type: 'button',
+            id: 'chip-' + p.pid,
             class: 'player-chip' + (p.connected === false ? ' offline' : ''),
             'data-action': 'kick', 'data-pid': p.pid, 'data-nick': p.nick,
+            'aria-label': `Remove ${p.nick}${p.connected === false ? ' (offline)' : ''} from the game`,
             title: 'Remove this player',
           }, p.nick, p.connected === false ? ' (offline)' : ''))))),
     [
@@ -593,7 +639,8 @@ function renderLobby() {
       btn('Show on phones', 'toggle-show', { attrs: { 'aria-pressed': s.showOnDevices ? 'true' : 'false' } }),
       btn('Start ▸', 'start', { cls: 'primary big' }),
     ],
-    'Space / Enter: start · F: fullscreen');
+    'Space / Enter: start · F: fullscreen',
+    { controlsFirst: true });
 }
 
 // The QR is built locally from location.origin + a regex-checked PIN, then parsed as SVG (no innerHTML).
@@ -742,16 +789,42 @@ function renderPodium() {
 
 /* ---------- 4j. ENDED / WIPED / DISCONNECTED ---------- */
 
+// The results we hold for THIS game (state.results survives reconnects and later syncs).
+function heldResults(g) {
+  return g && state.results && state.results.pin === g.pin ? state.results : null;
+}
+// `end` sent from the lobby (q is still -1) or before anyone answered the first question: nothing
+// worth a results file exists, so the host page neither downloads one nor asks the teacher to
+// confirm they have it. From q >= 1 on, a question has been closed and the file matters.
+function gameWasCancelled(g) {
+  if (!g || typeof g.q !== 'number') return false;           // no sync yet: never hide a held results file
+  const q = g.q;
+  if (q < 0) return true;
+  if (q > 0) return false;
+  if (g.reveal) return false;
+  if (g.tally && (g.tally.answered | 0) > 0) return false;
+  const roster = Array.isArray(g.roster) ? g.roster : [];
+  return !roster.some((p) => p && (p.answered || (p.score | 0) > 0));
+}
+// "Download started", never "downloaded": the page cannot see whether the browser saved the file.
+function resultsStatus(r) {
+  return r.downloaded ? ' — download started. Check your Downloads folder before wiping.' : ' is ready to download.';
+}
+function downloadButton(r) {
+  return btn(r.downloaded ? 'Download again' : 'Download the results', 'download');
+}
+
 function renderEnded() {
   const g = state.game;
-  const r = state.results && state.results.pin === g.pin ? state.results : null;
+  const r = heldResults(g);
+  if (gameWasCancelled(g)) return renderCancelled(r);
   return stageFrame(
     h('div', { class: 'center-card' },
       h('h1', null, 'Game over'),
       r ? [
-        h('p', null, 'The results file ', h('b', { class: 'mono' }, r.filename), r.downloaded ? ' has been downloaded.' : ' is ready.'),
+        h('p', null, 'The results file ', h('b', { class: 'mono' }, r.filename), resultsStatus(r)),
         h('p', { class: 'fine' }, 'It is the only copy. Once you confirm below, nothing about this game remains on the server. The phones already show “Game over”.'),
-        h('div', { class: 'btn-row' }, btn('Download again', 'download')),
+        h('div', { class: 'btn-row' }, downloadButton(r)),
         h('div', { class: 'btn-row' }, btn('I have the results — wipe the game', 'ack', { cls: 'primary big' })),
       ] : [
         h('p', null, 'Waiting for the results file from the server…'),
@@ -761,12 +834,41 @@ function renderEnded() {
     []);
 }
 
+// A game aborted before anyone answered: one button, no results file, no "make sure the CSV is saved".
+function renderCancelled(r) {
+  return stageFrame(
+    h('div', { class: 'center-card' },
+      h('h1', null, 'Game cancelled'),
+      h('p', null, 'The game ended before anyone answered a question, so there are no results to keep. The phones already show “Game over”.'),
+      r ? [
+        h('p', { class: 'fine' }, 'Wiping deletes the room and the player list from the server at once. Otherwise the server does it by itself later.'),
+        h('div', { class: 'btn-row' }, btn('Wipe the game', 'ack-cancelled', { cls: 'primary big' })),
+      ] : [
+        h('p', { class: 'fine' }, 'Waiting for the server to confirm… If this takes more than a few seconds, check the connection pill at the top.'),
+      ]),
+    []);
+}
+
+// A results file we still hold is offered on every final screen: the server may have sent it just
+// before a TTL wipe (podium → results_csv → wiped / 4004), and the Blob is gone once the page is left.
+function finalScreenResults(g) {
+  const r = heldResults(g);
+  if (!r || gameWasCancelled(g)) return null;
+  return [
+    h('p', null, 'Results file ', h('b', { class: 'mono' }, r.filename),
+      r.downloaded ? ' — download started. Check your Downloads folder.' : ' is still held by this page — download it before leaving.'),
+    h('div', { class: 'btn-row' }, downloadButton(r)),
+  ];
+}
+
 function renderWiped() {
+  const extra = finalScreenResults(state.game);
   return stageFrame(
     h('div', { class: 'center-card' },
       h('div', { class: 'big-check', 'aria-hidden': 'true' }, '✓'),
       h('h1', null, 'Nothing about this game remains.'),
-      h('p', { class: 'fine' }, 'The room, the players, the scores — all deleted. Your CSV is the only copy.'),
+      h('p', { class: 'fine' }, 'The room, the players, the scores — all deleted.', extra ? ' Your CSV is the only copy.' : ''),
+      extra,
       h('div', { class: 'btn-row' }, btn('Back to my quizzes', 'leave', { cls: 'primary' }))),
     []);
 }
@@ -779,6 +881,7 @@ function renderDisconnected() {
       h('h1', null, 'Connection closed'),
       h('p', null, msg),
       h('p', { class: 'fine' }, `Close code ${ci.code}.`),
+      finalScreenResults(state.game),
       h('div', { class: 'btn-row' }, btn('Back to my quizzes', 'leave', { cls: 'primary' }))),
     []);
 }
@@ -820,8 +923,8 @@ function editQuiz(mutate, structural) {
   if (!q) return;
   mutate(q);
   q.updatedAt = Date.now();
-  persistQuizzes();
-  if (structural) render(); else refreshEditorStatus(q);
+  const saved = persistQuizzes();
+  if (structural) render(); else refreshEditorStatus(q, saved);
 }
 
 const actions = {
@@ -875,13 +978,16 @@ const actions = {
       const qq = q.questions[+d.q]; const i = +d.i;
       if (!qq || qq.options.length <= 2) return;
       qq.options.splice(i, 1);
-      if (qq.correct >= qq.options.length) qq.correct = qq.options.length - 1;
+      // Removing the ticked option clears the tick (-1): validateQuiz then says "tick the correct
+      // option" instead of the tick silently landing on whichever option slid into that slot.
+      if (qq.correct === i) qq.correct = -1;
       else if (qq.correct > i) qq.correct -= 1;
     }, true);
   },
   'all-timers'() {
     const sel = $('all-timers'); const t = sel ? +sel.value : NaN;
     if (!TIME_LIMITS.includes(t)) return;
+    state.allTimers = t;                                       // the rebuilt select keeps showing this value
     editQuiz((q) => { q.questions.forEach((qq) => { qq.timeLimit = t; }); }, true);
     toast(`All timers set to ${t} seconds.`);
   },
@@ -923,6 +1029,7 @@ const actions = {
     if (!window.confirm('No results file was received. Wipe the game anyway? The scores will be lost for good.')) return;
     send({ t: 'ack_results' });
   },
+  'ack-cancelled'() { send({ t: 'ack_results' }); },          // nothing was played, so nothing to confirm
   leave() { leaveGame(); },
   'toggle-contrast'() { toggleContrast(); },
   'toggle-fullscreen'() { toggleFullscreen(); },
@@ -957,6 +1064,7 @@ document.addEventListener('change', (e) => {
     case 'correct': editQuiz((q) => { const qq = q.questions[qi]; if (qq) qq.correct = +el.value; }); break;
     case 'timeLimit': editQuiz((q) => { const qq = q.questions[qi]; const t = +el.value; if (qq && TIME_LIMITS.includes(t)) qq.timeLimit = t; }); break;
     case 'points': editQuiz((q) => { const qq = q.questions[qi]; const p = +el.value; if (qq && POINTS.includes(p)) qq.points = p; }); break;
+    case 'all-timers': { const t = +el.value; if (TIME_LIMITS.includes(t)) state.allTimers = t; break; }
     case 's-mode': if (MODES.some((m) => m.id === el.value)) { state.prefs.settings.mode = el.value; savePrefs(); } break;
     case 's-showOnDevices': state.prefs.settings.showOnDevices = !!el.checked; savePrefs(); break;
     case 's-lateJoin': state.prefs.settings.lateJoin = !!el.checked; savePrefs(); break;
@@ -978,15 +1086,23 @@ $('import-file').addEventListener('change', async () => {
   try { data = JSON.parse(await file.text()); } catch (e) { toast('That file is not valid JSON.'); return; }
   const items = Array.isArray(data) ? data : [data];
   const added = [];
+  const dropped = { questions: 0, options: 0 };
   for (const item of items) {
     const n = normaliseQuiz(item);
-    if (n) added.push(makeStored(n, true));          // a file exists outside the browser, so it counts as exported
+    if (!n) continue;
+    dropped.questions += n.dropped.questions;
+    dropped.options += n.dropped.options;
+    added.push(makeStored(n, true));                 // a file exists outside the browser, so it counts as exported
   }
   if (!added.length) { toast('No quiz found in that file. Expected {"title": "…", "questions": [ … ]}.'); return; }
   state.quizzes.push(...added);
   persistQuizzes();
   const problems = added.reduce((n, q) => n + validateQuiz(q).length, 0);
-  toast(`Imported ${added.length === 1 ? '1 quiz' : added.length + ' quizzes'}` + (problems ? ` — ${plural(problems, 'thing')} to fix.` : '.'));
+  let msg = `Imported ${added.length === 1 ? '1 quiz' : added.length + ' quizzes'}` + (problems ? ` — ${plural(problems, 'thing')} to fix.` : '.');
+  if (dropped.options || dropped.questions) {
+    msg += ` ${plural(dropped.options, 'option')} and ${plural(dropped.questions, 'question')} over the limits (4 per question, 100 per quiz) were dropped — re-check the ticked answers.`;
+  }
+  toast(msg, 9000);
   if (added.length === 1) openEditor(added[0].id); else { state.screen = 'home'; render(); }
 });
 
@@ -1149,13 +1265,21 @@ function applyFrame(f) {
       if (Array.isArray(f.leaderboard)) g.leaderboard = f.leaderboard;
       if (typeof f.playerCount === 'number') g.playerCount = f.playerCount;
       break;
-    case 'results_csv':
+    case 'results_csv': {
+      // Arrives on `end`, again on every host connection while `ended`, and once before a TTL wipe
+      // of a `podium` room (then `wiped` / 4004 follow). Keep what we hold; download only when the
+      // file is new or has changed, so a Wi-Fi blip on the Game over screen does not drop another
+      // "… (1).csv". A cancelled game (nothing answered) gets no file at all.
       g.phase = 'ended';
       if (typeof f.csv === 'string') {
-        state.results = { pin: g.pin, csv: f.csv, filename: safeFilename(f.filename, g.pin), downloaded: false };
-        downloadResults();                                   // auto-download; "Download again" stays available
+        const held = heldResults(g);
+        if (!held || held.csv !== f.csv) {
+          state.results = { pin: g.pin, csv: f.csv, filename: safeFilename(f.filename, g.pin), downloaded: false };
+          if (!gameWasCancelled(g)) downloadResults();       // "Download the results" stays available either way
+        }
       }
       break;
+    }
     case 'wiped':
       finishWipe();
       return;                                                // finishWipe() renders
@@ -1207,8 +1331,7 @@ function downloadResults() {
   const r = state.results; if (!r) return;
   // A UTF-8 BOM makes Excel open accented nicknames correctly; it changes nothing for other tools.
   const csv = r.csv.charCodeAt(0) === 0xFEFF ? r.csv : '﻿' + r.csv;
-  downloadText(csv, r.filename, 'text/csv;charset=utf-8');
-  r.downloaded = true;
+  if (downloadText(csv, r.filename, 'text/csv;charset=utf-8')) r.downloaded = true;   // "started", the page cannot see more
   render();
 }
 
@@ -1375,14 +1498,15 @@ function applyContrast() {
 }
 function toggleContrast() { state.prefs.highContrast = !state.prefs.highContrast; savePrefs(); applyContrast(); }
 
-function toast(message) {
+function toast(message, ms) {
   const el = $('toast'); if (!el) return;
   el.textContent = message;
   el.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), 4500);
+  toastTimer = setTimeout(() => el.classList.remove('show'), ms || 4500);
 }
 
+// Returns true when the download was handed to the browser; whether it saved the file is invisible here.
 function downloadText(text, filename, type) {
   try {
     const blob = new Blob([text], { type });
@@ -1392,7 +1516,8 @@ function downloadText(text, filename, type) {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 30000);
-  } catch (e) { toast('The download could not start. Use “Download again”.'); }
+    return true;
+  } catch (e) { toast('The download could not start. Use the download button.'); return false; }
 }
 
 // Space / Enter = the primary action of the current phase; F = fullscreen. Only while hosting, never while typing.
@@ -1407,14 +1532,16 @@ function primaryAction(phase) {
 }
 document.addEventListener('keydown', (e) => {
   if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
-  const t = e.target;
-  const tag = t && t.tagName;
-  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
+  const t = e.target && typeof e.target.closest === 'function' ? e.target : null;
+  if (t && (t.closest('input, textarea, select') || t.isContentEditable)) return;   // typing
   const phase = currentPhase();
   if (!STAGE_PHASES.has(phase)) return;
   if (e.key === 'f' || e.key === 'F') { e.preventDefault(); toggleFullscreen(); return; }
   if (e.key === ' ' || e.key === 'Enter') {
-    if (tag === 'BUTTON' || tag === 'A' || tag === 'SUMMARY' || tag === 'LABEL') return;   // the focused control acts itself
+    // Focus inside any control: that control acts itself. And right after a rebuild dropped focus to
+    // <body> (see render()), a key meant for the control the teacher had reached must do nothing.
+    if (t && t.closest('button, a, summary, label, input, select, textarea')) return;
+    if (Date.now() < shortcutMuteUntil) return;
     const fn = primaryAction(phase);
     if (fn) { e.preventDefault(); fn(); }
   }
