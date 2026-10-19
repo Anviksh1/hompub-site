@@ -579,6 +579,7 @@ class Player {
     const inQuestion = s.phase === 'intro' || s.phase === 'open' || s.phase === 'closed';
     if (a && a.uncertain && inQuestion) {
       a.uncertain = false;
+      a.resolvedBy = 'sync';           // fate settled by the server: no ack is owed any more
       a.accepted = me.answered === true;
       game.uncertain[s.q] -= 1;
       if (a.accepted) {
@@ -635,7 +636,7 @@ class Player {
     const a = {
       choice, sentAt: performance.now(), sentServerAt: Date.now() + this.offset,
       opensAt: this.deadline - key.timeLimit * 1000,   // §2: deadline = opensAt + timeLimit * 1000
-      ackAt: 0, accepted: null, reason: null, uncertain: false,
+      ackAt: 0, accepted: null, reason: null, uncertain: false, resolvedBy: null,
       expectedLo: null, expectedHi: null,              // §3 points bounds, fixed by the ack (needs the RTT)
       dupSentServerAt: 0, dupAcked: false, dupLost: false,
     };
@@ -1141,7 +1142,7 @@ function finalChecks() {
   // Every answer sent on a socket that stayed open was acknowledged, and every deliberate duplicate was answered (§3).
   for (const p of joined) {
     for (const [q, a] of p.answers) {
-      if (!a.ackAt && !a.uncertain) violate(`${p.tag}: answer for question ${q + 1} was sent on an open socket but never acknowledged`);
+      if (!a.ackAt && !a.uncertain && !a.resolvedBy) violate(`${p.tag}: answer for question ${q + 1} was sent on an open socket but never acknowledged`);
       if (a.dupSentServerAt && !a.dupAcked) violate(`${p.tag}: duplicate answer for question ${q + 1} was never acknowledged (expected accepted=false, reason "duplicate")`);
     }
   }
@@ -1221,6 +1222,7 @@ function checkCsv(joined) {
       // An answer whose ack was lost in a drop and that no sync resolved: the CSV is the server's final word.
       if (a && a.uncertain) {
         a.uncertain = false;
+        a.resolvedBy = 'csv';
         a.accepted = cell !== '';
         game.uncertain[q] -= 1;
         if (a.accepted) game.acceptedAcks[q] += 1;
