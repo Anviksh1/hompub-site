@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "hompub-quiz",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-10-01",
+  // Static pages (join, play, host) are served as assets: free and unlimited.
+  // Only /api/* reaches the Worker and counts against the daily request budget.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*"]
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "ROOM", "class_name": "Room" },
+      { "name": "DIRECTORY", "class_name": "Directory" }
+    ]
+  },
+  // SQLite-backed classes are the only kind the Workers Free plan can create.
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Room", "Directory"] }
+  ],
+  "vars": {
+    "ALLOWED_ORIGINS": "",
+    "MAX_PLAYERS": "250",
+    "ROOM_CREATE_PER_IP_PER_DAY": "30",
+    "ROOM_CREATE_PER_DAY": "300"
+  },
+  // Privacy commitment: no request logs, no traces. Keep this off.
+  "observability": { "enabled": false }
+}
