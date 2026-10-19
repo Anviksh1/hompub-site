@@ -48,3 +48,25 @@ GitHub Pages redeploys automatically within a minute.
    "Enforce HTTPS".
 
 Total ongoing cost: the domain only (~$10-11/yr). Hosting stays free.
+
+## HomPub Quiz (pilot)
+
+The one part of this repo that is not a static page. `quiz/` holds
+the referee for HomPub Quiz — a live classroom quiz, one teacher on
+the projector and a room full of phones — as a Cloudflare Worker with
+Durable Objects, plus its host and player pages. GitHub Pages cannot
+run it (a live game needs a server holding open connections), so it
+deploys to a free Cloudflare account instead: from a laptop with
+`npx wrangler deploy`, or automatically from this repo through
+`.github/workflows/deploy-quiz.yml` on every push to `main` that
+touches `quiz/`.
+
+Everything — running it locally, creating the Cloudflare account,
+deploying through GitHub, what the free plan allows, privacy, notes
+for teachers — is in [quiz/README.md](quiz/README.md). The contract
+the pieces are built against is [quiz/PROTOCOL.md](quiz/PROTOCOL.md).
+
+Cost: hosting stays $0. A subdomain for the referee (e.g.
+`quiz.hompub.com`) rides on the same domain as above. Note that
+GitHub Pages also serves the raw files under `quiz/public/`; there is
+no API behind them there, so the live app is always the Cloudflare URL.

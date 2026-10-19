@@ -278,9 +278,10 @@ function openSocket() {
     },
     frame: handleFrame,
     close(code, reason, willRetry) {
-      if (code === 4000 && ui.saved && state.phase === null) {
-        // The room did not accept our stored token (e.g. the PIN was reused for a new
-        // game). Retrying the same handshake cannot help: forget it and join afresh.
+      if ((code === 4004 || code === 4000) && ui.saved && state.phase === null) {
+        // The room did not accept our stored token (PROTOCOL §5: 4004 "Unknown player
+        // token; join again", e.g. the PIN was reused for a new game). Retrying the same
+        // handshake cannot help: forget it and join afresh (a wiped room then shows 404).
         sock.close();
         sock = null;
         clearSaved();
@@ -324,6 +325,7 @@ function handleFrame(f) {
       break;
 
     case 'intro':
+      if (!f.question) break;                      // malformed; wait for the next sync
       state.phase = 'intro';
       state.question = f.question;
       state.q = f.question.q;

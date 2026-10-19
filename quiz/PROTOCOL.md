@@ -20,10 +20,10 @@ budget). Only `/api/*` invokes the Worker.
 | `GET /` | Join page: enter a 6-digit PIN → navigates to `/play?pin=XXXXXX` |
 | `GET /play?pin=XXXXXX` | Player page (phone). Also the target of the QR code. |
 | `GET /host` | Host page (laptop): quiz editor, lobby, game control, results |
-| `GET /api/health` | `200 {"ok":true,"now":<ms>}` |
+| `GET /api/health` | `200 {"ok":true,"now":<ms>,"version":"0.1.1"}` |
 | `GET /api/echo` | WebSocket echo (handled in the Worker, no Durable Object). Used by the network preflight. Any text frame is echoed back verbatim. Closes after 60 s. |
 | `POST /api/room` | Create a room. Body: `{"quiz": Quiz, "settings"?: Settings}`. Response `200 {"pin":"123456","hostToken":"<32 hex>","joinUrl":"https://<host>/play?pin=123456"}`. Errors: `400 {"error":"..."}` (invalid quiz), `413` (body > 200 KB), `429 {"error":"too_many_rooms"}` (per-IP or global daily cap), `503 {"error":"no_pin_available"}`. |
-| `GET /api/room/:pin` | Room summary for the join page: `200 {"pin","phase","playerCount","locked","lateJoin","title"}` or `404 {"error":"not_found"}`. |
+| `GET /api/room/:pin` | Room summary for the join page: `200 {"pin","phase","playerCount","locked","lateJoin","nicknameMode","title"}` or `404 {"error":"not_found"}`. |
 | `GET /api/room/:pin/ws?role=host&token=<hostToken>` | Host WebSocket |
 | `GET /api/room/:pin/ws?role=player[&token=<playerToken>]` | Player WebSocket. `token` present = reconnect attempt. |
 
@@ -79,7 +79,7 @@ circle, 3 = green square. Letters A–D are used in CSV and text.
 
 - `lobby`: players join. Host presses **Start**.
 - `intro` (3 s, server-timed): "Question 4 of 20, get ready". Everyone learns `opensAt` before the clock starts, so broadcast order cannot favour anyone.
-- `open`: answers accepted from `opensAt` until `deadline = opensAt + timeLimit*1000`, plus a 1,000 ms grace for frames in flight (a grace answer is scored as if `elapsed = timeLimit*1000`). Closes on the server timer, on host **Close**, or (if `earlyClose`) when every eligible player has answered.
+- `open`: answers accepted from `opensAt` until `deadline = opensAt + timeLimit*1000`, plus a 1,000 ms grace for frames in flight (a grace answer is scored as if `elapsed = timeLimit*1000`). Phones switch to the answer buttons at `opensAt` on the shared clock without waiting for the `open` frame; an `answer` that reaches the server at or after `opensAt` while it is still in `intro` opens the question on the spot. Closes on the server timer, on host **Close**, or (if `earlyClose`) when every eligible player has answered.
 - `closed`: correct answer revealed; players see their own result and rank; host sees counts, fastest correct player and the top 10. Host presses **Next** (→ `intro` of the next question, or → `podium` after the last).
 - `podium`: top 3 on the projector, everyone sees their own final rank. Host presses **End game**.
 - `ended`: host receives the results CSV; players see "Game over, nothing about this game is kept". The room is wiped when the host sends `ack_results`, or by TTL.
@@ -131,7 +131,7 @@ reason="duplicate"`).
 |---|---|---|
 | `{"t":"join","nick":"Priya"}` | first connection, no token | nick is trimmed, control chars stripped, max 20 chars; empty → server assigns a spun name; profanity (deny-list) → silently replaced by a spun name; duplicate → numeric suffix (`Priya 2`). If `settings.nicknameMode == "spin"` the nick field is ignored and a spun name is assigned. |
 | `{"t":"join","spin":true}` | first connection | player asked for a random two-word name (adjective + animal, e.g. `Brave Otter`). Up to 3 spins: each further `join` with `spin` before the first `answer` replaces the name. |
-| `{"t":"answer","q":3,"choice":1}` | phase `open` | `q` must equal the current question index; `choice` an integer in `[0, optionCount)`. |
+| `{"t":"answer","q":3,"choice":1}` | phase `open` | `q` must equal the current question index; `choice` an integer in `[0, optionCount)`. Refusal reasons are checked in this order: wrong `q` or not open/closed → `closed`; phase `closed` → `late`; bad `choice` → `invalid`; already answered → `duplicate`. |
 
 A reconnecting player (`?token=`) sends nothing; the server replies with `sync`.
 
@@ -219,7 +219,7 @@ Players never receive `correct` before `closed`. The Room never sends the quiz's
 
 - **Player:** keeps `{pin, token, pid, nick}` in localStorage. On socket close (except the no-retry codes), on `visibilitychange` → visible, and on `online`, reconnect to `/api/room/<pin>/ws?role=player&token=<token>` with backoff 500 ms → 8 s (×2, ±30 % jitter). The server replies `sync`. Older sockets for the same `pid` (a second tab) keep receiving frames; answers are de-duplicated per player, so a second tab cannot answer twice. A student offline for a whole question scores 0 for it. Players also request a Screen Wake Lock after joining (ignored where unsupported).
 - **Unknown or stale player token** (the room was wiped and the PIN reused, or storage is from another deployment): the server accepts the socket and closes it with `4004` and reason `Unknown player token; join again`. The player page clears its stored entry for that PIN and shows the join screen.
-- **Host:** keeps `{pin, hostToken, title}` in localStorage key `hompub-quiz:host`. The host page offers **Resume game** when that key exists. While the host is disconnected the server timers still close questions; phones show "Waiting for the host" only in `closed`. Any browser with the hostToken can take over.
+- **Host:** keeps `{pin, hostToken, title}` in localStorage key `hompub-quiz:host`. The host page offers **Resume game** when that key exists. While the host is disconnected the server timers still close questions; phones show "Waiting for the host" only in `closed`. Any browser with the hostToken can take over; a host that connects while the phase is `ended` receives `sync` and then `results_csv` again, so the results file is never lost to a reload.
 - **Deploys** restart every Durable Object and drop every socket; clients reconnect and resync within seconds. Deploy outside school hours.
 
 ## 6. Timers, hibernation, TTL (Room internals)
@@ -273,3 +273,8 @@ elapsedTotal, streak, answers JSON `{"3":{"c":1,"ms":1834,"p":967}}`).
 Nothing else. No IPs, no user agents, no logs (observability stays off in
 `wrangler.jsonc`). Everything is deleted at `ack_results` or by TTL. The
 only lasting copy is the CSV the host downloads.
+
+The Directory keeps one IP-derived value for abuse limiting: a SHA-256 of
+`<UTC date>|<client IP>`, truncated, with a per-day creation count. It
+cannot be linked across days and rows older than 48 hours are deleted on
+every allocation. Nothing about players is ever hashed or kept.

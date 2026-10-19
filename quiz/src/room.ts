@@ -173,12 +173,12 @@ export class Room extends DurableObject<Env> {
   }
 
   /** Public, answer-key-free summary for the join page. */
-  async summary(): Promise<{ pin: string; phase: Phase; playerCount: number; locked: boolean; lateJoin: boolean; title: string } | null> {
+  async summary(): Promise<{ pin: string; phase: Phase; playerCount: number; locked: boolean; lateJoin: boolean; nicknameMode: string; title: string } | null> {
     const s = this.state;
     if (!s) return null;
     return {
       pin: s.pin, phase: s.phase, playerCount: this.activePlayers().length,
-      locked: s.locked, lateJoin: s.settings.lateJoin, title: s.quiz.title,
+      locked: s.locked, lateJoin: s.settings.lateJoin, nicknameMode: s.settings.nicknameMode, title: s.quiz.title,
     };
   }
 
@@ -209,6 +209,8 @@ export class Room extends DurableObject<Env> {
       this.accept(server, { role: 'host', pid: null });
       this.touch();
       this.send(server, this.buildSync('host', null));
+      // A host taking over after the game ended still needs the results file.
+      if (s.phase === 'ended') this.send(server, this.resultsFrame());
       return respond();
     }
 
@@ -356,6 +358,10 @@ export class Room extends DurableObject<Env> {
     const q = frame.q;
     const choice = frame.choice;
     const ack = (accepted: boolean, reason?: string) => this.send(ws, { t: 'ack', q, accepted, ...(reason ? { reason } : {}) });
+
+    // Phones switch to the answer buttons at opensAt on the shared clock; if a frame
+    // beats our own intro timer by a few milliseconds, open the question now.
+    if (s.phase === 'intro' && s.opensAt != null && Date.now() >= s.opensAt && q === s.q) void this.openQuestion();
 
     if (typeof q !== 'number' || q !== s.q || (s.phase !== 'open' && s.phase !== 'closed')) { ack(false, 'closed'); return; }
     if (s.phase === 'closed') { ack(false, 'late'); return; }
@@ -565,10 +571,15 @@ export class Room extends DurableObject<Env> {
     s.lastActivity = now;
     this.persistRoom();
     this.broadcast('player', { t: 'ended' });
-    const d = new Date(now);
-    const ymd = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
-    this.broadcast('host', { t: 'results_csv', csv: this.csv(), filename: `hompub-quiz-${s.pin}-${ymd}.csv` });
+    this.broadcast('host', this.resultsFrame());
     await this.armAlarm();
+  }
+
+  private resultsFrame(): object {
+    const s = this.state!;
+    const d = new Date(s.phaseAt);
+    const ymd = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
+    return { t: 'results_csv', csv: this.csv(), filename: `hompub-quiz-${s.pin}-${ymd}.csv` };
   }
 
   /** Forget everything. Called on ack_results or by the TTL alarm. */

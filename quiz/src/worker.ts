@@ -10,6 +10,8 @@ import { DEFAULT_SETTINGS, LIMITS, PIN_RE, mergeSettings, sha256Hex, validateQui
 export { Room } from './room';
 export { Directory } from './directory';
 
+const VERSION = '0.1.1'; // not exported: the entry module may only export handlers and Durable Object classes
+
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
 
 function json(body: unknown, status = 200): Response {
@@ -100,7 +102,7 @@ export default {
     if (!url.pathname.startsWith('/api/')) return env.ASSETS.fetch(request);
     if (!originAllowed(request, url, env)) return json({ error: 'forbidden_origin' }, 403);
 
-    if (url.pathname === '/api/health') return json({ ok: true, now: Date.now() });
+    if (url.pathname === '/api/health') return json({ ok: true, now: Date.now(), version: VERSION });
     if (url.pathname === '/api/echo') return echo(request);
     if (url.pathname === '/api/room') {
       if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);

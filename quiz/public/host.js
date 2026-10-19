@@ -574,7 +574,7 @@ function renderLobby() {
         h('p', { class: 'eyebrow' }, 'Join at'),
         h('p', { class: 'join-url mono' }, url),
         h('p', { class: 'eyebrow' }, 'Game PIN'),
-        h('p', { class: 'pin-big mono', 'aria-label': `Game PIN ${g.pin}` }, g.pin),
+        h('p', { class: 'pin-big mono' }, g.pin),
         qrNode(url, g.pin)),
       h('div', { class: 'lobby-players' },
         h('h2', null, plural(count, 'player')),
@@ -627,13 +627,13 @@ function renderCounter(q, g) {
     h('span', null, `${q.timeLimit} s`));
 }
 
-function renderRing(phase) {
+function renderRing() {
   const wrap = h('div', { class: 'ring', id: 'ring', role: 'timer' });
   const svg = svgEl('svg', { viewBox: '0 0 120 120', 'aria-hidden': 'true' });
   svg.appendChild(svgEl('circle', { class: 'track', cx: 60, cy: 60, r: RING_R }));
   svg.appendChild(svgEl('circle', { class: 'progress', id: 'ring-progress', cx: 60, cy: 60, r: RING_R, 'stroke-dasharray': RING_C.toFixed(2), 'stroke-dashoffset': '0' }));
   wrap.appendChild(svg);
-  wrap.appendChild(h('div', { class: 'num', id: 'ring-num' }, phase === 'intro' ? '' : ''));
+  wrap.appendChild(h('div', { class: 'num', id: 'ring-num' }));
   return wrap;
 }
 
@@ -663,7 +663,7 @@ function renderQuestion(phase) {
       renderCounter(q, g),
       h('h1', { class: 'q-text' }, q.text || ''),
       h('div', { class: 'q-meta' },
-        renderRing(phase),
+        renderRing(),
         phase === 'intro'
           ? h('p', { class: 'answered' }, 'Get ready…', h('small', null, 'the clock starts in a moment'))
           : h('p', { class: 'answered', id: 'answered' }, `${tally.answered | 0} of ${tally.expected | 0}`, h('small', null, 'answered'))),

@@ -39,7 +39,7 @@
   --opt-0: #d81b3a; --opt-0-ink: #ffffff;
   --opt-1: #1368ce; --opt-1-ink: #ffffff;
   --opt-2: #e2a500; --opt-2-ink: #1c1730;
-  --opt-3: #26890c; --opt-3-ink: #ffffff;
+  --opt-3: #1f7a0a; --opt-3-ink: #ffffff;
 
   --border-w: 1px;
   --radius: 14px;
@@ -131,7 +131,7 @@ body {
   overflow-x: hidden;
 }
 body[data-mode="stage"] {
-  background: linear-gradient(155deg, var(--hero-bg-1) 20%, var(--hero-bg-2) 100%) fixed;
+  background: linear-gradient(155deg, var(--hero-bg-1) 20%, var(--hero-bg-2) 100%);
   color: var(--stage-ink);
 }
 h1, h2, h3 { font-family: 'Fraunces', Georgia, serif; font-optical-sizing: auto; margin: 0; text-wrap: balance; }
@@ -473,6 +473,11 @@ body[data-mode="stage"] .check .check-text small { color: var(--stage-ink-soft);
 .site-footer .wrap { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
 .site-footer a { color: inherit; }
 body[data-mode="stage"] .site-footer { display: none; }
+
+/* ---------- phones: the options menu becomes a bottom sheet so it cannot overflow the viewport ---------- */
+@media (max-width: 639px) {
+  .stage-menu .menu-body { position: fixed; left: 16px; right: 16px; top: auto; bottom: 16px; min-width: 0; max-width: none; }
+}
 
 /* ---------- wider screens ---------- */
 @media (min-width: 640px) {
