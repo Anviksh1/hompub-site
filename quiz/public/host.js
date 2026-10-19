@@ -59,6 +59,25 @@ const RING_R = 54;
 const RING_C = 2 * Math.PI * RING_R;
 const SHORTCUT_MUTE_MS = 500;   // Space/Enter stay quiet this long after a rebuild dropped focus to <body>
 const NOT_SAVED_MSG = 'Not saved — this browser is blocking storage. Export your quiz to keep it.';
+// "Import Word or text" / "Paste questions" (section 4a-ii). The parsing itself lives in import-text.js
+// (window.HomPubImport); the file is read in this browser and never sent anywhere.
+const IMPORT_MAX_BYTES = 5 * 1024 * 1024;
+const IMPORT_FILE_RE = /\.(docx|txt|md|markdown|text)$/i;
+const IMPORT_HELPER_MISSING = 'The import helper (import-text.js) did not load. Reload the page and try again.';
+const IMPORT_EXAMPLE = [
+  'Cell biology — week 6',
+  '',
+  '1. Which organelle makes ATP?',
+  'A. Ribosome',
+  'B. Mitochondrion *',
+  'C. Golgi body',
+  'D. Nucleus',
+  '',
+  '2. Water boils at 100 °C at sea level. (10s)',
+  '- True',
+  '- False',
+  'Answer: A',
+].join('\n');
 
 const SAMPLE_QUIZ = {
   title: 'General knowledge warm-up',
@@ -282,6 +301,7 @@ const state = {
   conn: { status: 'idle', detail: '' },
   allTimers: null,         // last value chosen in the editor's "Set all timers to…" select
   storageBlocked: false,   // the last persistQuizzes() failed (private window, site data blocked)
+  importer: null,          // Word/text import dialog over the home screen: null | {mode: 'paste'|'preview', source: 'paste'|'file', sourceName, text, preview, error, busy}
   prefs: {
     highContrast: !!storedPrefs.highContrast,
     settings: Object.assign({}, DEFAULT_SETTINGS, storedPrefs.settings || {}),
@@ -294,6 +314,8 @@ let tickHandle = null;
 let qrCache = null;       // {pin, svg} — the QR is generated once per PIN
 let toastTimer = null;
 let shortcutMuteUntil = 0; // Date.now() before which the Space/Enter primary shortcut is ignored
+let lastPasteText = '';   // what was in the paste box when the dialog was closed, so an accidental Escape loses nothing
+let importerOpener = '';  // id of the home-screen button that opened the import dialog; focus goes back there on close
 
 function savePrefs() { saveJSON(KEYS.prefs, state.prefs); }
 
@@ -342,6 +364,10 @@ function render() {
   }
   document.body.dataset.mode = STAGE_PHASES.has(phase) ? 'stage' : 'page';
   app.replaceChildren(view);
+  // The import dialog is rebuilt with the rest of the screen; re-open it as a modal (focus trap, Escape,
+  // inert page behind). Without showModal() it still shows, as an ordinary open <dialog>.
+  const dlg = $('importer');
+  if (dlg && !dlg.open) { try { dlg.showModal(); } catch (e) { dlg.setAttribute('open', ''); } }
 
   let restored = false;
   if (focusedId) {
@@ -383,12 +409,18 @@ function renderHome() {
       h('div', { class: 'toolbar' },
         btn('New quiz', 'new-quiz', { cls: 'primary' }),
         btn('Import .json', 'import'),
+        btn('Import Word or text', 'import-text', { attrs: { id: 'import-text-btn' } }),
+        btn('Paste questions', 'paste-open', { attrs: { id: 'paste-btn' } }),
         btn('Load sample', 'load-sample'))),
+    h('p', { class: 'fine' },
+      'Writing in Word? ', h('a', { href: 'template-questions.docx', download: true }, 'Download the Word template'),
+      ', type your questions into it, then “Import Word or text”. Or paste questions straight from any document. The file is read in this browser; nothing is uploaded.'),
     quizzes.length
       ? h('div', { class: 'quiz-list' }, quizzes.map(renderQuizRow))
-      : h('p', { class: 'empty' }, 'No quizzes yet. Start with “New quiz” or “Load sample”.'),
+      : h('p', { class: 'empty' }, 'No quizzes yet. Start with “New quiz” or “Load sample”, or import questions written in Word.'),
     renderNetCheck(),
-    h('p', { class: 'fine' }, 'Quizzes are saved only in this browser (localStorage). Export a .json copy before a lesson — a cleared browser means a lost quiz.'));
+    h('p', { class: 'fine' }, 'Quizzes are saved only in this browser (localStorage). Export a .json copy before a lesson — a cleared browser means a lost quiz.'),
+    state.importer ? renderImporter() : null);
 }
 
 function renderQuizRow(q) {
@@ -417,6 +449,119 @@ function renderNetCheck() {
     h('div', { class: 'btn-row' }, btn(nc.status === 'running' ? 'Testing…' : 'Check my network', 'net-check', { disabled: nc.status === 'running' })),
     nc.status !== 'idle' && h('div', { class: 'net-result', 'data-status': nc.status, role: 'status' },
       h('span', { class: 'dot', 'aria-hidden': 'true' }), h('span', null, nc.message)));
+}
+
+/* ---------- 4a-ii. IMPORT WORD / TEXT (dialog over the home screen) ---------- */
+
+// One <dialog> for both routes: "Paste questions" (mode 'paste' → 'preview') and "Import Word or text"
+// (mode 'preview' straight away, with busy/error states). Everything shown comes from HomPubImport's
+// result, re-shaped by shapeImportResult(), and is rendered as text nodes through h().
+function renderImporter() {
+  const imp = state.importer;
+  const dlg = h('dialog', { class: 'importer', id: 'importer', 'aria-labelledby': 'importer-heading' });
+  dlg.addEventListener('cancel', (e) => { e.preventDefault(); closeImporter(); });   // Escape inside a modal dialog
+  dlg.addEventListener('close', () => { if (state.importer) closeImporter(); });     // the browser closed it anyway
+  dlg.appendChild(h('div', { class: 'card importer-panel' }, imp.mode === 'paste' ? renderPasteForm(imp) : renderImportPreview(imp)));
+  return dlg;
+}
+
+function importerHead(eyebrow, title) {
+  return h('div', { class: 'importer-head' },
+    h('p', { class: 'eyebrow' }, eyebrow),
+    h('h2', { id: 'importer-heading', tabindex: -1 }, title));
+}
+
+function renderPasteForm(imp) {
+  return [
+    importerHead('Import', 'Paste questions'),
+    h('p', { class: 'fine' }, 'Paste from Word, Google Docs, an email or a web page. One question per block with a blank line between blocks; mark the right answer with a * or an “Answer:” line. You can fix anything in the editor afterwards.'),
+    h('div', { class: 'importer-grid' },
+      h('label', { class: 'field' },
+        h('span', null, 'Questions'),
+        h('textarea', { class: 'input importer-text', id: 'import-text', rows: 12, 'data-field': 'import-text', autofocus: true, spellcheck: 'false', autocomplete: 'off' }, imp.text || '')),
+      h('div', { class: 'field' },
+        h('span', null, 'Format example'),
+        h('pre', { class: 'format-example' }, IMPORT_EXAMPLE),
+        h('p', { class: 'fine' },
+          'Numbers and letters are optional. Timer: “(30s)” at the end of a question. Points: a line “Points: 2000” for double points or “Points: 0” for a survey question. ',
+          h('a', { href: 'template-questions.docx', download: true }, 'Download the Word template'), ' to see it laid out in Word.'))),
+    imp.error && h('div', { class: 'notice bad', role: 'alert' }, imp.error),
+    h('div', { class: 'btn-row end importer-actions' },
+      btn('Cancel', 'import-cancel', { cls: 'ghost', attrs: { id: 'import-cancel' } }),
+      btn('Preview', 'import-preview', { cls: 'primary', attrs: { id: 'import-preview-btn' } })),
+  ];
+}
+
+function renderImportPreview(imp) {
+  const p = imp.preview;
+  const eyebrow = imp.source === 'file' ? `From ${imp.sourceName}` : 'Pasted text';
+  if (imp.busy) {
+    return [
+      importerHead(eyebrow, 'Reading the file…'),
+      h('p', { class: 'fine' }, 'The file is read here in this browser; nothing is uploaded.'),
+      h('div', { class: 'btn-row end importer-actions' }, btn('Cancel', 'import-cancel', { cls: 'ghost', attrs: { id: 'import-cancel' } })),
+    ];
+  }
+  if (imp.error || !p) {
+    return [
+      importerHead(eyebrow, 'Could not import'),
+      h('div', { class: 'notice bad', role: 'alert' }, imp.error || 'Nothing could be read from this.'),
+      h('div', { class: 'btn-row end importer-actions' },
+        btn('Cancel', 'import-cancel', { cls: 'ghost', attrs: { id: 'import-cancel' } }),
+        imp.source === 'paste'
+          ? btn('Edit text', 'import-edit-text', { cls: 'primary', attrs: { id: 'import-edit' } })
+          : btn('Choose another file', 'import-text', { cls: 'primary', attrs: { id: 'import-another' } })),
+    ];
+  }
+  const qs = p.quiz.questions;
+  const n = qs.length;
+  return [
+    importerHead(eyebrow, 'Check the import'),
+    h('label', { class: 'field' },
+      h('span', null, `Quiz title (1–${LIMITS.title} characters)`),
+      h('input', { class: 'input', id: 'import-quiz-title', type: 'text', maxlength: LIMITS.title, value: p.quiz.title, 'data-field': 'import-title', autocomplete: 'off' })),
+    h('p', { class: 'importer-count mono', role: 'status' }, `${plural(n, 'question')} found` + (p.skipped ? ` · ${plural(p.skipped, 'block')} skipped` : '')),
+    renderImportWarnings(p.warnings),
+    n
+      ? h('div', { class: 'quiz-list' }, qs.map((qq, i) => renderPreviewQuestion(qq, i, p.warnings)))
+      : h('p', { class: 'empty' }, 'No questions were recognised. Each question needs at least two option lines under it (A. B. C. D. or a dash), with a blank line between questions.'),
+    h('div', { class: 'btn-row end importer-actions' },
+      btn('Cancel', 'import-cancel', { cls: 'ghost', attrs: { id: 'import-cancel' } }),
+      imp.source === 'paste' ? btn('Edit text', 'import-edit-text', { attrs: { id: 'import-edit' } }) : null,
+      btn('Add to my quizzes', 'import-add', { cls: 'primary', disabled: n === 0, attrs: { id: 'import-add' } })),
+  ];
+}
+
+function importWarningText(w) { return (w.question ? `Question ${w.question}: ` : '') + w.message; }
+
+function renderImportWarnings(warnings) {
+  if (!warnings.length) return h('p', { class: 'fine', style: 'color:var(--ok)' }, '✓ Nothing to fix.');
+  const shown = 30;
+  return h('div', { class: 'notice' },
+    h('b', null, `${plural(warnings.length, 'thing')} to check — the editor opens next so you can fix them`),
+    h('ul', { class: 'problems' }, warnings.slice(0, shown).map((w) => h('li', null, importWarningText(w)))),
+    warnings.length > shown ? h('p', { class: 'fine' }, `…and ${warnings.length - shown} more, shown under the questions below.`) : null);
+}
+
+function renderPreviewQuestion(qq, i, warnings) {
+  const notes = warnings.filter((w) => w.question === i + 1).map((w) => w.message);
+  const unmarked = qq.correct < 0;
+  if (unmarked && !notes.some((m) => /correct/i.test(m))) notes.push('No correct answer marked — tick it in the editor.');
+  return h('section', { class: 'card q-card preview-q' + (unmarked ? ' needs-answer' : ''), 'aria-label': `Question ${i + 1}` },
+    h('div', { class: 'q-head' },
+      h('h3', null, `Question ${i + 1}`),
+      h('div', { class: 'tags' },
+        h('span', { class: 'tag mono' }, `${qq.timeLimit} s`),
+        h('span', { class: 'tag mono' }, qq.points === 0 ? 'survey · 0 pts' : `${fmtInt(qq.points)} pts`))),
+    h('p', { class: 'preview-text' }, qq.text),
+    h('ol', { class: 'preview-opts' }, qq.options.map((o, j) => {
+      const correct = j === qq.correct;
+      return h('li', { class: 'preview-opt' + (correct ? ' is-correct' : '') },
+        swatch(j),
+        h('span', { class: 'text' }, o),
+        correct ? checkIcon() : null);
+    })),
+    notes.length ? h('ul', { class: 'problems' }, notes.map((m) => h('li', null, m))) : null);
 }
 
 /* ---------- 4b. EDITOR ---------- */
@@ -940,6 +1085,12 @@ const actions = {
     toast('Sample quiz loaded. Edit it or host it as is.');
   },
   import() { $('import-file').click(); },
+  'import-text'() { importerOpener = 'import-text-btn'; $('import-text-file').click(); },
+  'paste-open'() { openImporter({ mode: 'paste', source: 'paste', sourceName: '', text: lastPasteText, preview: null, error: null, busy: false }, 'paste-btn'); },
+  'import-preview'() { previewPastedText(); },
+  'import-edit-text'() { const imp = state.importer; if (!imp) return; imp.mode = 'paste'; imp.preview = null; imp.error = null; render(); focusImporter(); },
+  'import-add'() { addImportedQuiz(); },
+  'import-cancel'() { closeImporter(); },
   edit(d) { openEditor(d.id); },
   setup(d) { state.editorId = d.id; state.screen = 'setup'; state.error = null; render(); },
   duplicate(d) {
@@ -1052,6 +1203,9 @@ document.addEventListener('input', (e) => {
   if (f === 'title') editQuiz((q) => { q.title = el.value; });
   else if (f === 'q-text') editQuiz((q) => { const qq = q.questions[+el.dataset.q]; if (qq) qq.text = el.value; });
   else if (f === 'opt') editQuiz((q) => { const qq = q.questions[+el.dataset.q]; if (qq) qq.options[+el.dataset.i] = el.value; });
+  // Import dialog: typing never rebuilds the dialog; the state just follows the fields.
+  else if (f === 'import-text') { if (state.importer) state.importer.text = el.value; }
+  else if (f === 'import-title') { if (state.importer && state.importer.preview) state.importer.preview.quiz.title = el.value; }
 });
 
 // Selects, radios and checkboxes: editor, pre-host settings and live game options.
@@ -1105,6 +1259,146 @@ $('import-file').addEventListener('change', async () => {
   toast(msg, 9000);
   if (added.length === 1) openEditor(added[0].id); else { state.screen = 'home'; render(); }
 });
+
+/* ---------- import from Word / text (import-text.js does the parsing) ---------- */
+
+// "Import Word or text": the file is read in this browser by HomPubImport.textFromFile (a .docx is unzipped
+// locally), parsed by parseQuizText, and shown in the preview dialog for the teacher to check before anything
+// is stored. Nothing here can throw out of the handler: every failure becomes a message in the dialog.
+$('import-text-file').addEventListener('change', async () => {
+  const input = $('import-text-file');
+  const file = input.files && input.files[0];
+  input.value = '';
+  if (!file) return;
+  const name = String(file.name || 'file');
+  const imp = { mode: 'preview', source: 'file', sourceName: name, text: '', preview: null, error: null, busy: false };
+  const problem = importFileProblem(file);
+  if (problem) { openImporter(Object.assign(imp, { error: problem }), 'import-text-btn'); return; }
+  const api = importApi();
+  if (!api || typeof api.textFromFile !== 'function') { openImporter(Object.assign(imp, { error: IMPORT_HELPER_MISSING }), 'import-text-btn'); return; }
+  openImporter(Object.assign(imp, { busy: true }), 'import-text-btn');
+  let text = '';
+  let error = null;
+  try { text = String(await api.textFromFile(file)); } catch (e) { error = importReadError(name, e); }
+  if (state.importer !== imp) return;                        // closed while the file was being read
+  imp.busy = false;
+  if (error) imp.error = error;
+  else Object.assign(imp, runImportParse(text, importTitleFromName(name)));
+  render();
+  focusImporter();
+});
+
+function importApi() {
+  const api = window.HomPubImport;
+  return api && typeof api.parseQuizText === 'function' ? api : null;
+}
+
+// Pure helpers (no DOM), so they can be unit-tested outside the browser.
+function importTitleFromName(name) {
+  const base = String(name || '').replace(/\.[^.]+$/, '').replace(/[_]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return base.slice(0, LIMITS.title) || 'Imported quiz';
+}
+// Why a file is refused before it is read, or null when it may be read. Checks name and size only.
+function importFileProblem(file) {
+  const name = String((file && file.name) || '');
+  const size = Number(file && file.size) || 0;
+  if (/\.doc$/i.test(name)) return 'This is an old-style .doc file. In Word choose File → Save As and pick “Word Document (.docx)”, then import that.';
+  if (!IMPORT_FILE_RE.test(name)) return `“${name || 'This file'}” is not a Word (.docx) or text (.txt) file. Save it as .docx or .txt first, or paste the questions instead.`;
+  if (size > IMPORT_MAX_BYTES) return `This file is ${(size / (1024 * 1024)).toFixed(1)} MB; the limit is 5 MB. A quiz needs only text — remove the pictures, or paste the questions instead.`;
+  return null;
+}
+function importReadError(name, e) {
+  const detail = e && typeof e.message === 'string' && e.message.trim() ? e.message.trim() : 'it could not be read.';
+  // The parser's own messages already say what to do; only add the hint when they do not.
+  const hint = /paste|\.docx/i.test(detail) ? '' : ' If it is a Word file, make sure it is saved as .docx; otherwise paste the questions instead.';
+  return `Could not read “${name}”: ${detail}${hint}`;
+}
+// Runs HomPubImport.parseQuizText. Never throws: a missing script or a parser bug become a readable error.
+function runImportParse(text, fallbackTitle) {
+  const api = importApi();
+  if (!api) return { preview: null, error: IMPORT_HELPER_MISSING };
+  try {
+    return { preview: shapeImportResult(api.parseQuizText(text, { title: fallbackTitle }), fallbackTitle), error: null };
+  } catch (e) {
+    return { preview: null, error: 'The text could not be read: ' + (e && e.message ? e.message : 'unknown error') + '. Try pasting a smaller part of it.' };
+  }
+}
+// Whatever parseQuizText returned, the preview gets the shapes it renders: questions through
+// normaliseQuiz (so correct → -1 and the limits follow the editor's rules), warnings as
+// {question: 1-based | null, message}, skipped as a count. Zero questions stay zero (normaliseQuiz
+// alone would insert a blank question).
+function shapeImportResult(r, fallbackTitle) {
+  const quiz = r && r.quiz && typeof r.quiz === 'object' ? r.quiz : {};
+  const rawQuestions = Array.isArray(quiz.questions) ? quiz.questions : [];
+  const n = rawQuestions.length ? normaliseQuiz({ title: '', questions: rawQuestions }) : null;
+  const title = String(quiz.title == null ? '' : quiz.title).replace(/\s+/g, ' ').trim().slice(0, LIMITS.title) || fallbackTitle;
+  const warnings = (Array.isArray(r && r.warnings) ? r.warnings : [])
+    .map((w) => (w && typeof w === 'object'
+      ? { question: Number.isInteger(w.question) && w.question > 0 ? w.question : null, message: String(w.message == null ? '' : w.message) }
+      : { question: null, message: String(w == null ? '' : w) }))
+    .filter((w) => w.message);
+  const skipped = r && Number.isFinite(r.skipped) ? Math.max(0, Math.floor(r.skipped)) : 0;
+  return { quiz: { title, questions: n ? n.questions : [] }, warnings, skipped };
+}
+function importToastMessage(count, toFix, warningCount) {
+  let msg = `Imported ${plural(count, 'question')}`;
+  if (toFix) msg += ` — ${toFix} to fix. The list above the questions says what.`;
+  else if (warningCount) msg += '. Some text was trimmed to fit the limits — check it in the editor.';
+  else msg += '.';
+  return msg;
+}
+
+function openImporter(imp, openerId) {
+  if (openerId) importerOpener = openerId;
+  state.importer = imp;
+  state.screen = 'home';
+  render();
+  focusImporter();
+}
+function closeImporter() {
+  const imp = state.importer;
+  if (!imp) return;
+  if (imp.source === 'paste') { const ta = $('import-text'); lastPasteText = ta ? ta.value : (imp.text || ''); }
+  state.importer = null;
+  render();
+  const back = importerOpener ? $(importerOpener) : null;
+  if (back) { try { back.focus(); } catch (e) { /* ignore */ } }
+}
+// Paste mode: into the text box. Preview / error: onto the heading, so the count and the warnings are read in order.
+function focusImporter() {
+  const imp = state.importer;
+  if (!imp) return;
+  const el = imp.mode === 'paste' ? $('import-text') : $('importer-heading');
+  if (el) { try { el.focus(); } catch (e) { /* ignore */ } }
+}
+function previewPastedText() {
+  const imp = state.importer;
+  if (!imp) return;
+  const ta = $('import-text');
+  imp.text = ta ? ta.value : (imp.text || '');
+  if (!imp.text.trim()) { imp.error = 'Paste some questions first.'; render(); focusImporter(); return; }
+  Object.assign(imp, runImportParse(imp.text, 'Pasted quiz'), { mode: 'preview' });
+  render();
+  focusImporter();
+}
+// Same path as "Import .json": normaliseQuiz → makeStored → persistQuizzes, then the editor, where any
+// question without a marked answer shows up as "tick the correct option" (normaliseQuiz keeps correct = -1).
+function addImportedQuiz() {
+  const imp = state.importer;
+  const p = imp && imp.preview;
+  if (!p || !p.quiz.questions.length) return;
+  const titleEl = $('import-quiz-title');
+  const typed = String((titleEl ? titleEl.value : p.quiz.title) || '').replace(/\s+/g, ' ').trim().slice(0, LIMITS.title);
+  const n = normaliseQuiz({ title: typed || p.quiz.title, questions: p.quiz.questions });
+  if (!n) return;
+  const stored = makeStored(n, false);                       // no .json copy exists yet, so the "export a copy" notice stays on
+  state.quizzes.push(stored);
+  persistQuizzes();
+  if (imp.source === 'paste') lastPasteText = '';
+  state.importer = null;
+  openEditor(stored.id);
+  toast(importToastMessage(stored.questions.length, validateQuiz(stored).length, p.warnings.length), 9000);
+}
 
 function exportQuiz(id) {
   const q = findQuiz(id); if (!q) return;
@@ -1532,6 +1826,7 @@ function primaryAction(phase) {
 }
 document.addEventListener('keydown', (e) => {
   if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
+  if (e.key === 'Escape' && state.importer) { e.preventDefault(); closeImporter(); return; }
   const t = e.target && typeof e.target.closest === 'function' ? e.target : null;
   if (t && (t.closest('input, textarea, select') || t.isContentEditable)) return;   // typing
   const phase = currentPhase();
