@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>HomPub Quiz — join a game</title>
+<meta name="description" content="Enter the 6-digit game PIN from the big screen to join a HomPub Quiz. No account, just a nickname.">
+<meta name="theme-color" content="#1c1730">
+<meta name="robots" content="noindex">
+<!--
+  HomPub Quiz join page. MIT licence.
+  Self-contained on purpose: system fonts only, no web fonts, no external
+  scripts, so a classroom of phones makes exactly one connection (to this host).
+  Contract: quiz/PROTOCOL.md §1 (GET /api/room/:pin, /play?pin=).
+-->
+<style>
+  :root {
+    --paper: #fbf9fe; --paper-raised: #f3eef9; --ink: #241e33; --ink-soft: #5c5470;
+    --accent: #6650a4; --accent-strong: #4a3580; --on-accent: #ffffff; --rule: #e1d9ec;
+    --hero-bg-1: #1c1730; --hero-bg-2: #4a3580; --hero-glow: rgba(180,150,255,0.30);
+    --hero-ink: #f4f0fb; --hero-ink-soft: #beb2dd; --bad: #b3261e;
+    --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+    --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #171320; --paper-raised: #211a30; --ink: #ede7f6; --ink-soft: #b6acc9;
+      --accent: #c9b6f2; --accent-strong: #9a7fe0; --on-accent: #1c1730; --rule: #372c4c;
+      --hero-bg-1: #0d0a17; --hero-bg-2: #2f2350; --hero-glow: rgba(150,120,230,0.22);
+      --bad: #ff8a80;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; min-height: 100vh; min-height: 100dvh;
+    display: flex; flex-direction: column;
+    background: var(--hero-bg-1);
+    background-image: linear-gradient(155deg, var(--hero-bg-1) 20%, var(--hero-bg-2) 100%);
+    color: var(--hero-ink);
+    font-family: var(--font-ui); font-size: 17px; line-height: 1.5;
+    -webkit-font-smoothing: antialiased; touch-action: manipulation; overflow-x: hidden;
+    position: relative;
+  }
+  /* The site's soft radial glow, top right */
+  body::before {
+    content: ""; position: absolute; top: -30%; right: -15%; width: 60%; height: 90%;
+    background: radial-gradient(circle, var(--hero-glow) 0%, transparent 70%);
+    filter: blur(10px); pointer-events: none;
+  }
+  main {
+    position: relative; flex: 1; width: 100%; max-width: 440px; margin: 0 auto;
+    padding: calc(28px + env(safe-area-inset-top)) 16px 24px;
+    display: flex; flex-direction: column; gap: 22px;
+  }
+  .wordmark { display: flex; align-items: center; gap: 10px; }
+  .wordmark .badge { width: 32px; height: 32px; border-radius: 9px; flex: none; }
+  .wordmark .badge svg { width: 100%; height: 100%; display: block; }
+  .wordmark .name { font-family: var(--font-display); font-weight: 600; font-size: 1.15rem; }
+  .wordmark .product {
+    font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--hero-ink-soft); margin-left: 2px;
+  }
+  .eyebrow {
+    font-family: var(--font-mono); font-size: 0.74rem; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--hero-ink-soft); margin: 18px 0 0; display: inline-flex; align-items: center; gap: 8px;
+  }
+  .eyebrow .dot { width: 6px; height: 6px; border-radius: 50%; background: #8adde1; box-shadow: 0 0 8px #8adde1; }
+  h1 { font-family: var(--font-display); font-weight: 650; font-size: 2.1rem; line-height: 1.1; margin: 6px 0 0; text-wrap: balance; }
+  p.lede { color: var(--hero-ink-soft); margin: 10px 0 0; max-width: 34ch; }
+
+  .card {
+    background: var(--paper); color: var(--ink);
+    border-radius: 20px; padding: 22px 18px 18px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.2), 0 12px 32px rgba(0,0,0,0.25);
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  label {
+    font-family: var(--font-mono); font-size: 0.74rem; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--ink-soft);
+  }
+  #pin {
+    width: 100%; min-height: 64px; margin: 0;
+    font-family: var(--font-mono); font-size: 2rem; letter-spacing: 0.22em; text-align: center;
+    font-variant-numeric: tabular-nums;
+    border: 1px solid var(--rule); border-radius: 14px; background: var(--paper-raised); color: var(--ink);
+    padding: 10px 12px; -webkit-appearance: none; appearance: none;
+  }
+  #pin::placeholder { color: var(--ink-soft); opacity: 0.55; letter-spacing: 0.22em; }
+  #pin:focus-visible { outline: 3px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
+  #join {
+    width: 100%; min-height: 52px; border-radius: 12px; border: 1px solid var(--accent);
+    background: var(--accent); color: var(--on-accent); font: inherit; font-weight: 600; font-size: 1.1rem;
+    cursor: pointer; touch-action: manipulation;
+  }
+  #join:active { background: var(--accent-strong); border-color: var(--accent-strong); }
+  #join:disabled { opacity: 0.6; cursor: default; }
+  #join:focus-visible { outline: 3px solid var(--ink); outline-offset: 2px; }
+  .msg { min-height: 1.5em; margin: 0; color: var(--bad); font-weight: 600; font-size: 0.95rem; }
+  .privacy { margin: 0; color: var(--ink-soft); font-size: 0.88rem; }
+
+  .host { margin: 0; }
+  .host a { color: var(--hero-ink); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+  .host a:focus-visible { outline: 2px solid var(--hero-ink); outline-offset: 3px; border-radius: 4px; }
+  .host a, .host a:hover { display: inline-block; min-height: 44px; line-height: 44px; }
+  footer {
+    position: relative; text-align: center; color: var(--hero-ink-soft);
+    font-family: var(--font-mono); font-size: 0.74rem; letter-spacing: 0.04em;
+    padding: 8px 16px calc(20px + env(safe-area-inset-bottom));
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+  }
+</style>
+</head>
+<body>
+
+<main>
+  <div class="wordmark" aria-label="HomPub Quiz">
+    <span class="badge" aria-hidden="true">
+      <svg viewBox="0 0 108 108" xmlns="http://www.w3.org/2000/svg">
+        <defs><linearGradient id="g" x1="0" y1="0" x2="108" y2="108" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stop-color="#7a63c2"/><stop offset="1" stop-color="#4a3580"/>
+        </linearGradient></defs>
+        <rect width="108" height="108" rx="24" fill="url(#g)"/>
+        <rect x="34" y="39" width="40" height="10" rx="5" fill="#ffffff"/>
+        <rect x="34" y="59" width="40" height="10" rx="5" fill="#ffffff"/>
+      </svg>
+    </span>
+    <span class="name">HomPub</span>
+    <span class="product">Quiz</span>
+  </div>
+
+  <div>
+    <span class="eyebrow"><span class="dot" aria-hidden="true"></span>Live classroom quiz</span>
+    <h1>Join a game</h1>
+    <p class="lede">Type the 6-digit PIN shown on the big screen.</p>
+  </div>
+
+  <form id="join-form" class="card" novalidate autocomplete="off">
+    <label for="pin">Game PIN</label>
+    <input id="pin" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="6"
+           autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+           placeholder="000000" enterkeyhint="go" aria-describedby="msg" autofocus>
+    <button id="join" type="submit">Join</button>
+    <p id="msg" class="msg" role="alert"></p>
+    <p class="privacy">No account. Just a nickname. Nothing is kept after the game.</p>
+  </form>
+
+  <p class="host"><a href="/host">Hosting? Open the host page →</a></p>
+</main>
+
+<footer>HomPub · no ads · no accounts · no analytics</footer>
+
+<script>
+(function () {
+  'use strict';
+  var PIN_RE = /^[1-9][0-9]{5}$/;             // PROTOCOL §1: PINs never start with 0
+  var form = document.getElementById('join-form');
+  var input = document.getElementById('pin');
+  var button = document.getElementById('join');
+  var msg = document.getElementById('msg');
+  var busy = false;
+  var lastAuto = '';                             // last PIN we auto-submitted, so edits can retry
+
+  function say(text) { msg.textContent = text; }
+
+  function setBusy(on) {
+    busy = on;
+    button.disabled = on;
+    button.textContent = on ? 'Checking…' : 'Join';
+  }
+
+  // Keep only digits; auto-advance the moment the sixth digit lands.
+  input.addEventListener('input', function () {
+    var digits = input.value.replace(/\D/g, '').slice(0, 6);
+    if (digits !== input.value) input.value = digits;
+    say('');
+    if (digits.length === 6 && digits !== lastAuto) {
+      lastAuto = digits;
+      go(digits);
+    }
+  });
+
+  form.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    go(input.value.replace(/\D/g, ''));
+  });
+
+  // GET /api/room/<pin> before navigating, so a typo gets a clear answer here
+  // instead of a failed WebSocket on the next page.
+  async function go(pin) {
+    if (busy) return;
+    if (!PIN_RE.test(pin)) {
+      say(pin.length < 6 ? 'Enter all 6 digits of the PIN.' : 'No game with that PIN.');
+      input.focus();
+      return;
+    }
+    setBusy(true);
+    var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, 8000) : 0;
+    var res, room;
+    try {
+      res = await fetch('/api/room/' + pin, {
+        signal: ctrl ? ctrl.signal : undefined,
+        cache: 'no-store',
+        headers: { accept: 'application/json' }
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      setBusy(false);
+      say('Can’t reach the game server. Check your connection and try again.');
+      return;
+    }
+    clearTimeout(timer);
+    if (res.status === 404) {
+      setBusy(false);
+      say('No game with that PIN.');
+      input.focus();
+      input.select();
+      return;
+    }
+    if (!res.ok) {
+      setBusy(false);
+      say('Couldn’t check that PIN just now (server said ' + res.status + '). Try again.');
+      return;
+    }
+    try { room = await res.json(); } catch (err) { room = null; }
+    // podium counts as ended: the server refuses every join from the podium on.
+    if (room && (room.phase === 'ended' || room.phase === 'podium')) {
+      setBusy(false);
+      say('That game has already finished.');
+      return;
+    }
+    // Keep the button in its busy state while the browser navigates.
+    location.href = '/play?pin=' + pin;
+  }
+
+  // The back/forward cache restores this page exactly as we left it — including the
+  // "Checking…" state kept while navigating to /play. Make it usable again.
+  window.addEventListener('pageshow', function () { setBusy(false); lastAuto = ''; });
+
+  // A link such as /?pin=123456 pre-fills the field (handy for a shared link).
+  var pre = new URLSearchParams(location.search).get('pin');
+  if (pre && /^[0-9]{6}$/.test(pre)) input.value = pre;
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,74 @@
+# Deploys the HomPub Quiz referee (everything under quiz/) to Cloudflare Workers.
+#
+# When it runs
+#   - on a push to main that changes quiz/ (Markdown-only changes are skipped:
+#     a README edit should not restart live games), or this file;
+#   - by hand, from the Actions tab ("Run workflow").
+#   Never on pull-request branches. A deploy restarts every Durable Object and
+#   drops every open WebSocket, so a class in progress loses a few seconds while
+#   phones reconnect (PROTOCOL.md §5). Merge to main outside school hours.
+#
+# What it needs (repo → Settings → Secrets and variables → Actions)
+#   CLOUDFLARE_API_TOKEN    a token made from the "Edit Cloudflare Workers" template
+#   CLOUDFLARE_ACCOUNT_ID   shown on the Workers & Pages overview page
+#   Step-by-step instructions are in quiz/README.md, "Deploying through GitHub".
+#
+# The Wrangler version comes from quiz/package.json (installed by `npm ci`), so
+# the laptop and the workflow deploy with the same tool.
+
+name: Deploy quiz
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'quiz/**'
+      - '!quiz/**.md'
+      - '.github/workflows/deploy-quiz.yml'
+  workflow_dispatch:
+
+# The job only reads the repository; deploy credentials come from the secrets.
+permissions:
+  contents: read
+
+# One deploy at a time. A second push waits for the first instead of racing it,
+# and nothing is cancelled half-way through an upload.
+concurrency:
+  group: deploy-quiz
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Typecheck, test, deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: quiz
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: quiz/package-lock.json
+
+      - name: Install dependencies (exactly what package-lock.json says)
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: quiz
+          command: deploy

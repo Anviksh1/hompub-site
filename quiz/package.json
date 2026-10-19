@@ -1,0 +1,22 @@
+{
+  "name": "hompub-quiz",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "description": "HomPub Quiz: a live classroom quiz referee (Cloudflare Worker + Durable Object) with static host and player pages",
+  "license": "MIT",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test:load": "node test/load.mjs",
+    "test": "node --test test/shared.test.ts",
+    "check": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261019.1",
+    "qrcode-generator": "^2.0.4",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.151.1"
+  }
+}

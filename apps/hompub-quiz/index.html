@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HomPub Quiz</title>
+<meta name="description" content="HomPub Quiz: a Kahoot-style live classroom quiz for one teacher and a room full of phones. No student accounts, nicknames only, wiped after class. Pilot.">
+<meta name="theme-color" content="#1c1730">
+
+<link rel="icon" href="../../favicon.ico" sizes="any">
+<link rel="icon" type="image/png" sizes="32x32" href="../../favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="../../favicon-16.png">
+<link rel="apple-touch-icon" sizes="180x180" href="../../apple-touch-icon.png">
+
+<meta property="og:type" content="website">
+<meta property="og:title" content="HomPub Quiz">
+<meta property="og:description" content="A live classroom quiz for one teacher and a room full of phones. No student accounts, nicknames only, wiped after class.">
+<meta property="og:image" content="../../og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,650&family=Source+Serif+4:ital,wght@0,400;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body class="app-page">
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="wordmark" href="../../index.html">
+      <span class="badge" aria-hidden="true">
+        <svg viewBox="0 0 108 108" xmlns="http://www.w3.org/2000/svg">
+          <defs><linearGradient id="g" x1="0" y1="0" x2="108" y2="108" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#7a63c2"/><stop offset="1" stop-color="#4a3580"/>
+          </linearGradient></defs>
+          <rect width="108" height="108" rx="24" fill="url(#g)"/>
+          <rect x="34" y="39" width="40" height="10" rx="5" fill="#ffffff"/>
+          <rect x="34" y="59" width="40" height="10" rx="5" fill="#ffffff"/>
+        </svg>
+      </span>
+      <span>HomPub</span>
+    </a>
+    <nav class="site-nav">
+      <a href="../../index.html#apps">All apps</a>
+      <a href="privacy.html">Privacy</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <a class="back-link" href="../../index.html#apps">← All apps</a>
+
+  <div class="app-page-header">
+    <div class="phone-mock" aria-hidden="true">
+      <!-- A phone showing a live question: a countdown and the four fixed shape-and-colour answer tiles. -->
+      <svg width="160" height="200" viewBox="0 0 160 200" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="scrq" x1="0" y1="0" x2="160" y2="200" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#f3eef9"/><stop offset="1" stop-color="#e7defa"/>
+          </linearGradient>
+        </defs>
+        <rect x="1" y="1" width="158" height="198" rx="22" fill="#1c1730"/>
+        <rect x="7" y="7" width="146" height="186" rx="16" fill="url(#scrq)"/>
+        <rect x="18" y="24" width="60" height="4" rx="2" fill="#b6acc9"/>
+        <text x="18" y="54" font-family="IBM Plex Mono, monospace" font-size="18" fill="#241e33" font-weight="600">0:12</text>
+        <rect x="90" y="44" width="52" height="6" rx="3" fill="#c9b6ec"/>
+        <rect x="90" y="44" width="33" height="6" rx="3" fill="#6650a4"/>
+        <rect x="18" y="66" width="58" height="52" rx="8" fill="#d8232f"/>
+        <polygon points="47,78 61,104 33,104" fill="#ffffff"/>
+        <rect x="84" y="66" width="58" height="52" rx="8" fill="#1a5fc9"/>
+        <polygon points="113,78 127,92 113,106 99,92" fill="#ffffff"/>
+        <rect x="18" y="126" width="58" height="52" rx="8" fill="#d99a00"/>
+        <circle cx="47" cy="152" r="13" fill="#ffffff"/>
+        <rect x="84" y="126" width="58" height="52" rx="8" fill="#2a8a2a"/>
+        <rect x="101" y="140" width="24" height="24" rx="2" fill="#ffffff"/>
+      </svg>
+    </div>
+    <div>
+      <span class="chip">Pilot</span>
+      <h1>HomPub Quiz</h1>
+      <p class="tagline">A live classroom quiz for one teacher on the projector and a room full of phones. Students join with a PIN and a nickname — no accounts, and nothing kept after class.</p>
+    </div>
+  </div>
+
+  <section>
+    <h2>What it is</h2>
+    <p>HomPub Quiz is a Kahoot-style live quiz. The teacher runs it from a laptop plugged into the projector; students answer on their own phones, a whole class at once. Students join by typing the 6-digit PIN from the big screen or by scanning its QR code.</p>
+    <p>Every question has up to four answers, and each answer slot is always the same shape in the same colour — red triangle, blue diamond, yellow circle, green square — so the game can be played by shape alone. Scoring is your choice: speed mode, where a faster correct answer earns more points (the Kahoot formula), or accuracy mode, where every correct answer is worth one point.</p>
+  </section>
+
+  <section>
+    <h2>How it works</h2>
+    <h3>For the teacher</h3>
+    <ol>
+      <li><strong>Write the quiz</strong> on the host page: a question, up to four options, a time limit and a point value each. It is saved in your own browser and nowhere else.</li>
+      <li><strong>Start a game.</strong> A PIN and a QR code appear on the projector. Students join, and you watch the nicknames arrive. Press Start when the room is in.</li>
+      <li><strong>Run the questions.</strong> You control the pace: close, reveal, next. After the podium, press End game: the results file (a plain CSV) downloads to the laptop. Save it, confirm, and the referee forgets the game.</li>
+    </ol>
+    <h3>For students</h3>
+    <ol>
+      <li>Go to the address on the projector, type the PIN, then type a nickname or spin a random one.</li>
+      <li>Tap the shape that matches your answer before the timer runs out. Your own score and rank appear after every question.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Features</h2>
+    <ul class="feature-list">
+      <li>No accounts</li>
+      <li>Nickname only</li>
+      <li>Wiped after class</li>
+      <li>Open source</li>
+      <li>Up to 250 players</li>
+      <li>Works on any phone browser</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Run a quiz</h2>
+    <div class="cta-row">
+      <span class="btn disabled">Host page — URL announced when the pilot opens</span>
+    </div>
+    <p>Students join at the address shown on the projector — there is nothing for them to install and no account to make. HomPub Quiz is a pilot: a small number of classes are trying it first, and the host address will be published here when it opens more widely.</p>
+    <p>The referee — the small server that keeps score — is open source. You can <a href="https://github.com/anviksh1/hompub-site/tree/main/quiz">read the code or deploy your own copy</a>.</p>
+  </section>
+
+  <section>
+    <h2>Works where ordinary HTTPS works</h2>
+    <p>HomPub Quiz needs nothing more than a normal secure web connection. Wherever a phone can load an ordinary website, it can join a game. The one catch: the game itself is a live connection that stays open for the whole lesson, and some school networks block or drop those. The host page runs a quick network check before you start, so you find out in the staff room rather than in front of the class. If the check fails on the school Wi-Fi, ask IT to allow live (WebSocket) connections to the quiz address.</p>
+  </section>
+
+  <section>
+    <h2>Privacy</h2>
+    <p>No student accounts. Students type a nickname or spin a random one. A small open-source referee holds nicknames and scores for the length of the lesson, then forgets them. The only lasting copy is the results file the teacher downloads.</p>
+    <div class="privacy-callout">
+      <p>No sign-in, no cookies, no analytics, no ads, and no third-party scripts on the student page. The full policy says exactly what the referee holds, where, and for how long.</p>
+      <a class="btn-link" href="privacy.html">Read the privacy policy →</a>
+    </div>
+  </section>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div>HomPub — independent apps, built to stay out of your way.</div>
+    <div><a href="privacy.html">Privacy policy</a></div>
+  </div>
+</footer>
+
+</body>
+</html>

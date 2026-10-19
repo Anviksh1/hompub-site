@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HomPub Quiz — Host</title>
+<meta name="description" content="Host a live HomPub Quiz from your laptop: build the quiz here, show the PIN on the projector, students answer on their phones. No accounts, nothing kept after the game.">
+<meta name="theme-color" content="#1c1730">
+<meta name="robots" content="noindex">
+<!-- The host is one laptop, so loading the site's fonts here is fine. Player pages must not. -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,650&family=Source+Serif+4:ital,wght@0,400;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="host.css">
+</head>
+<body data-mode="page">
+
+<a class="skip" href="#app">Skip to content</a>
+
+<header class="topbar">
+  <div class="wrap">
+    <a class="wordmark" href="/" title="HomPub Quiz join page">
+      <span class="badge" aria-hidden="true">
+        <svg viewBox="0 0 108 108" xmlns="http://www.w3.org/2000/svg">
+          <defs><linearGradient id="g" x1="0" y1="0" x2="108" y2="108" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#7a63c2"/><stop offset="1" stop-color="#4a3580"/>
+          </linearGradient></defs>
+          <rect width="108" height="108" rx="24" fill="url(#g)"/>
+          <rect x="34" y="39" width="40" height="10" rx="5" fill="#ffffff"/>
+          <rect x="34" y="59" width="40" height="10" rx="5" fill="#ffffff"/>
+        </svg>
+      </span>
+      <span class="name">HomPub Quiz</span>
+      <span class="sub">host</span>
+    </a>
+    <div class="topbar-tools">
+      <span id="conn-pill" class="pill" data-status="idle" role="status" aria-live="polite">
+        <span class="dot" aria-hidden="true"></span><span id="conn-text">Not connected</span>
+      </span>
+      <button type="button" class="btn small" id="contrast-btn" data-action="toggle-contrast" aria-pressed="false">High contrast</button>
+      <button type="button" class="btn small" id="fullscreen-btn" data-action="toggle-fullscreen" title="Toggle fullscreen (F)">Fullscreen <kbd>F</kbd></button>
+    </div>
+  </div>
+</header>
+
+<!-- Every screen is rendered into #app from one state object; see host.js render(). -->
+<main id="app"></main>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<!-- Hidden file picker for "Import .json"; triggered from a visible button. -->
+<input type="file" id="import-file" accept=".json,application/json" hidden>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div>HomPub Quiz — no accounts, no analytics. Quizzes live only in this browser; games are wiped when you say so.</div>
+    <div><a href="/">Join page</a></div>
+  </div>
+</footer>
+
+<script src="vendor/qrcode.js" defer></script>
+<script src="host.js" defer></script>
+</body>
+</html>

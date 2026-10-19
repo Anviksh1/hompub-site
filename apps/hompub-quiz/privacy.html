@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy Policy — HomPub Quiz</title>
+<meta name="description" content="Privacy policy for HomPub Quiz: nicknames and scores held for one lesson, then deleted. No accounts, no cookies, no analytics, no ads.">
+<meta name="theme-color" content="#1c1730">
+<link rel="icon" href="../../favicon.ico" sizes="any">
+<link rel="icon" type="image/png" sizes="32x32" href="../../favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="../../favicon-16.png">
+<link rel="apple-touch-icon" sizes="180x180" href="../../apple-touch-icon.png">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Source+Serif+4:ital,wght@0,400;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body class="legal-page">
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="wordmark" href="../../index.html">
+      <span class="badge" aria-hidden="true">
+        <svg viewBox="0 0 108 108" xmlns="http://www.w3.org/2000/svg">
+          <defs><linearGradient id="g" x1="0" y1="0" x2="108" y2="108" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#7a63c2"/><stop offset="1" stop-color="#4a3580"/>
+          </linearGradient></defs>
+          <rect width="108" height="108" rx="24" fill="url(#g)"/>
+          <rect x="34" y="39" width="40" height="10" rx="5" fill="#ffffff"/>
+          <rect x="34" y="59" width="40" height="10" rx="5" fill="#ffffff"/>
+        </svg>
+      </span>
+      <span>HomPub</span>
+    </a>
+    <nav class="site-nav">
+      <a href="../../index.html#apps">All apps</a>
+      <a href="index.html">HomPub Quiz</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <a class="back-link" href="index.html">← HomPub Quiz</a>
+
+  <h1>Privacy Policy</h1>
+  <div class="meta-row">
+    <span class="chip">Effective: Pilot — October 2026</span>
+    <span class="chip">Applies to HomPub Quiz, pilot</span>
+    <span class="chip">quiz web app</span>
+  </div>
+
+  <div class="tldr">
+    <span class="tldr-label">The short version</span>
+    <p><strong>HomPub Quiz holds a nickname, answer choices and a score for each student for the length of one lesson, on one small server we call the referee, and then deletes them.</strong> There are no accounts, no cookies, no analytics and no ads. HomPub itself sees nothing. The only lasting copy of a game is the results file the teacher downloads.</p>
+    <p>Everything below is the detail behind those sentences.</p>
+  </div>
+
+  <section>
+    <h2>Information we collect</h2>
+    <p><strong>From students:</strong> a nickname (typed, or spun from a list of random two-word names — no real name is required or wanted), the answer chosen for each question, and the time each answer arrived at the referee.</p>
+    <p><strong>From the teacher:</strong> the quiz content — questions, options and the correct answers — for the duration of the game, plus a random host token so the game can be resumed if the laptop drops off the network.</p>
+    <p>That is the full list. There are no accounts, no email addresses, no sign-in and no cookies. The pages set no advertising ID and include no analytics or crash reporting. The student page loads no third-party scripts and fetches no fonts from third parties: a classroom of phones talks to exactly one server, the referee.</p>
+  </section>
+
+  <section>
+    <h2>Where it lives, and for how long</h2>
+    <p>A game lives in one Cloudflare Durable Object — a small, single-purpose storage unit — in the Cloudflare data center nearest the teacher who created it. It holds the quiz (including the answer key), the game's settings and current phase, and one row per player: nickname, score, streak and the answers given. No IP addresses, no device details, no browser details.</p>
+    <p>One more thing exists outside the game, to stop someone creating thousands of empty games in a day: when a teacher creates a game, the referee keeps a one-way hash of that day's date and the teacher's IP address, with a count. It is a one-way hash that HomPub never links back to an address, it cannot be linked to the same person on another day, it says nothing about students, and it is deleted within 48 hours.</p>
+    <p>It is deleted:</p>
+    <ul class="plain">
+      <li>when the teacher confirms the results download at the end of the game, or</li>
+      <li>automatically after 2 hours without any activity, or 30 minutes after the teacher presses End game if the download is never confirmed. If a game is left on the podium screen until that 2-hour limit, the results file is sent to the teacher's screen before the game is deleted.</li>
+    </ul>
+    <p>The only lasting copy is the CSV the teacher downloads: rank, nickname, score and the answer to each question. What the teacher does with that file is the teacher's responsibility, as with any class record.</p>
+    <p>On each student's phone, a random reconnect token sits in the browser's storage so a dropped connection can rejoin without losing the score. It identifies the phone to the referee for that one game only, and it is cleared when the game ends. The teacher's quizzes, and the PIN and host token of the current game, are kept in the teacher's own browser storage on the teacher's own device.</p>
+  </section>
+
+  <section>
+    <h2>What HomPub sees</h2>
+    <p>Nothing about any game. Request logging is switched off on the referee. No IP addresses, nicknames, quiz contents or scores are logged or forwarded to us. The only figures we see are the hosting provider's aggregate request counts, which say nothing about who played or what was asked.</p>
+  </section>
+
+  <section>
+    <h2>What the app can access on your device</h2>
+    <p>A web app asks the browser for access rather than installing permissions. Here is everything HomPub Quiz uses:</p>
+    <dl class="permission-grid">
+      <dt>Network access</dt><dd>Yes — to the quiz referee only</dd>
+      <dt>Browser storage</dt><dd>Students: one reconnect entry (PIN, token, nickname) for the current game, plus a high-contrast on/off preference. Host: your own quizzes and the current game</dd>
+      <dt>Keep screen awake</dt><dd>Yes, during a game, so the phone does not lock mid-question</dd>
+      <dt>Camera</dt><dd>Not requested — QR codes are read by the phone's camera app, not the page</dd>
+      <dt>Microphone</dt><dd>Not requested</dd>
+      <dt>Location</dt><dd>Not requested</dd>
+      <dt>Contacts</dt><dd>Not requested</dd>
+      <dt>Advertising ID</dt><dd>Not requested</dd>
+    </dl>
+  </section>
+
+  <section>
+    <h2>Third-party services</h2>
+    <p>Cloudflare hosts the referee. To route traffic it processes connection metadata — IP address and timing — under <a href="https://www.cloudflare.com/privacypolicy/">Cloudflare's own privacy policy</a>, just as GitHub does for this website. HomPub does not receive that metadata.</p>
+    <p>No advertising network, no analytics SDK, no crash reporting service and no social-media widgets are included on any page.</p>
+  </section>
+
+  <section>
+    <h2>Children's privacy</h2>
+    <p>HomPub Quiz is built for classrooms, so most players are children, and the design starts from that. A student is known to the referee only by a nickname, which is never linked to an account, email address, device identifier or any other persistent identifier. Nothing is retained once the lesson ends. The teacher is the only person who ever holds a copy of the results.</p>
+    <p>Schools that want even the nickname-and-score data to stay entirely under their own control can <a href="https://github.com/anviksh1/hompub-site/tree/main/quiz">deploy their own copy</a> of the referee, because it is open source.</p>
+  </section>
+
+  <section>
+    <h2>Fairness and timing</h2>
+    <p>Answers are timed on the referee's clock, not the phone's, so nobody gains by changing their device's time. The flip side: a student on a slow connection may lose a few points per question in speed mode, because their answer takes longer to arrive. Teachers who want to remove that effect can run the game in accuracy mode, where every correct answer is worth the same.</p>
+  </section>
+
+  <section>
+    <h2>Changes to this policy</h2>
+    <p>This is a pilot, and the service will change. If it changes in a way that affects this policy — for instance, if a future version stores anything beyond what is listed here — this page will be updated first, and the "Effective" chip above will change accordingly.</p>
+  </section>
+
+  <section>
+    <h2>Contact</h2>
+    <p>Questions about this policy can be raised on the <a href="https://github.com/Anviksh1/hompub-site/issues">public issue tracker for this website and the referee</a>, or sent through the developer contact link on HomPub's Google Play Store listing page — the same contact as for HomPub Calculator.</p>
+  </section>
+</div>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <div>HomPub — independent apps, built to stay out of your way.</div>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,40 @@
+{
+  "title": "HomPub Quiz sample: general knowledge",
+  "questions": [
+    {
+      "text": "Which planet is closest to the Sun?",
+      "options": ["Venus", "Mercury", "Mars", "Earth"],
+      "correct": 1,
+      "timeLimit": 20,
+      "points": 1000
+    },
+    {
+      "text": "What is the chemical formula for water?",
+      "options": ["CO2", "NaCl", "H2O", "O2"],
+      "correct": 2,
+      "timeLimit": 20,
+      "points": 1000
+    },
+    {
+      "text": "How many sides does a hexagon have?",
+      "options": ["Five", "Seven", "Eight", "Six"],
+      "correct": 3,
+      "timeLimit": 20,
+      "points": 1000
+    },
+    {
+      "text": "Which organelle makes most of a cell's ATP?",
+      "options": ["Mitochondrion", "Ribosome", "Golgi body", "Nucleus"],
+      "correct": 0,
+      "timeLimit": 20,
+      "points": 1000
+    },
+    {
+      "text": "What is 7 x 8?",
+      "options": ["54", "48", "56", "64"],
+      "correct": 2,
+      "timeLimit": 20,
+      "points": 1000
+    }
+  ]
+}
