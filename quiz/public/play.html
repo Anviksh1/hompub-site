@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>HomPub Quiz</title>
+<meta name="description" content="HomPub Quiz player page. No account, just a nickname.">
+<meta name="theme-color" content="#1c1730">
+<meta name="robots" content="noindex">
+<!--
+  HomPub Quiz player page (phones). MIT licence.
+  Every screen below is a <section data-screen="…">; play.js shows exactly one of
+  them, filled from a single state object (PROTOCOL.md §2 phases, §4.3 frames).
+  System fonts only, no external requests: play.css + play.js + one WebSocket.
+-->
+<link rel="stylesheet" href="/play.css">
+<script src="/play.js" defer></script>
+</head>
+<body data-screen="connecting">
+
+<header class="bar">
+  <div class="mark" aria-label="HomPub Quiz">
+    <span class="badge" aria-hidden="true">
+      <svg viewBox="0 0 108 108" xmlns="http://www.w3.org/2000/svg">
+        <defs><linearGradient id="g" x1="0" y1="0" x2="108" y2="108" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stop-color="#7a63c2"/><stop offset="1" stop-color="#4a3580"/>
+        </linearGradient></defs>
+        <rect width="108" height="108" rx="24" fill="url(#g)"/>
+        <rect x="34" y="39" width="40" height="10" rx="5" fill="#ffffff"/>
+        <rect x="34" y="59" width="40" height="10" rx="5" fill="#ffffff"/>
+      </svg>
+    </span>
+    <span class="mark-text">HomPub <span class="mark-sub">Quiz</span></span>
+  </div>
+  <span id="pill" class="pill" data-conn="connecting" role="status" aria-live="polite">Connecting…</span>
+  <button id="contrast" class="icon-btn" type="button" aria-pressed="false"
+          aria-label="High-contrast colours" title="High-contrast colours">
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/>
+      <path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/>
+    </svg>
+  </button>
+</header>
+
+<!-- Thin countdown bar; only visible while a question is open -->
+<div class="timebar" aria-hidden="true"><div id="timefill" class="timefill"></div></div>
+
+<main id="main">
+
+  <section data-screen="nopin" class="center" hidden>
+    <h1>No game PIN</h1>
+    <p class="muted">This link is missing its 6-digit game PIN.</p>
+    <a class="btn primary" href="/">Enter a PIN</a>
+  </section>
+
+  <section data-screen="join" hidden>
+    <p class="eyebrow">Join the game</p>
+    <h1 id="join-heading">Join the game</h1>
+    <p class="meta"><span id="join-pin" class="mono"></span> · <span id="join-count"></span></p>
+    <p id="join-notice" class="notice" hidden></p>
+    <form id="join-form" novalidate autocomplete="off">
+      <div id="nick-row">
+        <label class="label" for="nick">Your nickname</label>
+        <input id="nick" type="text" maxlength="20" autocomplete="off" autocapitalize="words"
+               autocorrect="off" spellcheck="false" enterkeyhint="go" placeholder="e.g. Priya">
+        <button id="join-btn" class="btn primary" type="submit">Join</button>
+        <p class="or">or</p>
+      </div>
+      <p id="spin-hint" class="hint" hidden>The host has asked everyone to use a spun name.</p>
+      <button id="spin-btn" class="btn secondary" type="button">Spin a name</button>
+    </form>
+    <p class="privacy">No account. Just a nickname. Nothing is kept after the game.</p>
+  </section>
+
+  <section data-screen="connecting" class="center" hidden>
+    <h1 id="connecting-title">Connecting…</h1>
+    <p id="connecting-text" class="muted"></p>
+    <p id="connecting-hint" class="hint" hidden>Still trying to reach the game… <a href="/">Back to the PIN page</a></p>
+  </section>
+
+  <section data-screen="lobby" class="center" hidden>
+    <p class="eyebrow">You’re in</p>
+    <h1 class="huge">You’re in, <span id="lobby-nick"></span>!</h1>
+    <p class="big-hint">Watch the big screen.</p>
+    <p id="lobby-count" class="meta"></p>
+    <button id="respin-btn" class="btn secondary slim" type="button" hidden>Spin a new name</button>
+  </section>
+
+  <section data-screen="intro" class="center" hidden>
+    <p id="intro-title" class="eyebrow"></p>
+    <h1 id="intro-q" class="huge"></h1>
+    <p class="big-hint">Get ready…</p>
+    <div id="intro-count" class="countdown" aria-hidden="true"></div>
+  </section>
+
+  <section data-screen="open" hidden>
+    <div class="open-head">
+      <span id="open-q" class="eyebrow"></span>
+      <span id="open-secs" class="mono secs"></span>
+    </div>
+    <p id="open-text" class="qtext" hidden></p>
+    <div id="grid" class="grid" data-count="4">
+      <button class="opt" type="button" data-choice="0" aria-label="Red triangle">
+        <svg class="shape" viewBox="0 0 100 100" aria-hidden="true"><polygon points="50,12 92,84 8,84"/></svg>
+        <span class="opt-text"></span>
+      </button>
+      <button class="opt" type="button" data-choice="1" aria-label="Blue diamond">
+        <svg class="shape" viewBox="0 0 100 100" aria-hidden="true"><polygon points="50,6 94,50 50,94 6,50"/></svg>
+        <span class="opt-text"></span>
+      </button>
+      <button class="opt" type="button" data-choice="2" aria-label="Yellow circle">
+        <svg class="shape" viewBox="0 0 100 100" aria-hidden="true"><circle cx="50" cy="50" r="42"/></svg>
+        <span class="opt-text"></span>
+      </button>
+      <button class="opt" type="button" data-choice="3" aria-label="Green square">
+        <svg class="shape" viewBox="0 0 100 100" aria-hidden="true"><rect x="12" y="12" width="76" height="76" rx="6"/></svg>
+        <span class="opt-text"></span>
+      </button>
+    </div>
+    <p id="open-status" class="status" role="status" aria-live="polite"></p>
+  </section>
+
+  <section data-screen="closed" class="center" hidden>
+    <p id="closed-q" class="eyebrow"></p>
+    <h1 id="verdict" class="huge verdict"></h1>
+    <p id="res-points" class="points"></p>
+    <p id="res-correct-row" class="meta">
+      Correct answer:
+      <span id="res-correct" class="chip-shape" data-shape="0">
+        <svg class="shape-0" viewBox="0 0 100 100" aria-hidden="true"><polygon points="50,12 92,84 8,84"/></svg>
+        <svg class="shape-1" viewBox="0 0 100 100" aria-hidden="true"><polygon points="50,6 94,50 50,94 6,50"/></svg>
+        <svg class="shape-2" viewBox="0 0 100 100" aria-hidden="true"><circle cx="50" cy="50" r="42"/></svg>
+        <svg class="shape-3" viewBox="0 0 100 100" aria-hidden="true"><rect x="12" y="12" width="76" height="76" rx="6"/></svg>
+        <span id="res-correct-text"></span>
+      </span>
+    </p>
+    <dl class="scoreboard">
+      <div><dt>Score</dt><dd id="res-score"></dd></div>
+      <div><dt>Rank</dt><dd id="res-rank"></dd></div>
+    </dl>
+    <p id="res-streak" class="streak" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2C12 2 7 7 7 13a5 5 0 0 0 10 0c0-2-1-3.5-2-5-.3 1.2-1 2-2 2.5C13 9.5 12.5 5 12 2Z"/></svg>
+      <span id="res-streak-n"></span>
+    </p>
+    <p class="muted waiting">Waiting for the host…</p>
+  </section>
+
+  <section data-screen="podium" class="center" hidden>
+    <p class="eyebrow">Final results</p>
+    <h1 id="pod-you" class="huge"></h1>
+    <p id="pod-score" class="points"></p>
+    <ol id="pod-top" class="top3" aria-label="Top three"></ol>
+    <p class="muted waiting">Waiting for the host…</p>
+  </section>
+
+  <section data-screen="ended" class="center" hidden>
+    <h1 class="huge">Game over.</h1>
+    <p class="big-hint">Nothing about this game is kept.</p>
+    <a class="btn primary slim" href="/">Join another game</a>
+  </section>
+
+  <section data-screen="fatal" class="center" hidden>
+    <h1 id="fatal-title"></h1>
+    <p id="fatal-text" class="muted"></p>
+    <div class="row">
+      <button id="fatal-retry" class="btn primary" type="button" hidden>Try again</button>
+      <a class="btn secondary" href="/">Back to the PIN page</a>
+    </div>
+  </section>
+
+</main>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+</body>
+</html>
