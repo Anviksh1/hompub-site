@@ -160,7 +160,9 @@ class ReconnectingSocket {
 
 const PIN_RE = /^[1-9][0-9]{5}$/;
 const PIN = new URLSearchParams(location.search).get('pin') || '';
-const STORE_KEY = 'hompub-quiz:player:' + PIN;      // §4.3 welcome
+const STORE_PREFIX = 'hompub-quiz:player:';
+const STORE_KEY = STORE_PREFIX + PIN;               // §4.3 welcome
+const SAVED_MAX_AGE_MS = 6 * 60 * 60 * 1000;        // entries older than this are swept on load
 const CONTRAST_KEY = 'hompub-quiz:contrast';        // per-phone convenience only
 const SHAPE_NAMES = ['Red triangle', 'Blue diamond', 'Yellow circle', 'Green square'];
 const MAX_SPINS = 3;                                // §4.1
@@ -229,12 +231,30 @@ function loadSaved() {
   } catch (err) { return null; }
 }
 function saveSaved(v) {
-  ui.saved = v;
-  try { localStorage.setItem(STORE_KEY, JSON.stringify(v)); } catch (err) { /* in-memory copy is enough */ }
+  const entry = Object.assign({}, v, { savedAt: Date.now() });
+  ui.saved = entry;
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(entry)); } catch (err) { /* in-memory copy is enough */ }
 }
 function clearSaved() {
   ui.saved = null;
   try { localStorage.removeItem(STORE_KEY); } catch (err) { /* ignore */ }
+}
+// "Cleared when the game ends" must also hold for a phone that was asleep when the game
+// ended and never came back to this PIN: on every load, drop every player entry that is
+// older than any room can live (§6: rooms are wiped after 2 h idle) or has no timestamp.
+function sweepSaved() {
+  try {
+    const now = Date.now();
+    const stale = [];
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      if (!key || !key.startsWith(STORE_PREFIX)) continue;
+      let v = null;
+      try { v = JSON.parse(localStorage.getItem(key) || 'null'); } catch (err) { v = null; }
+      if (!v || typeof v.savedAt !== 'number' || now - v.savedAt > SAVED_MAX_AGE_MS) stale.push(key);
+    }
+    stale.forEach((key) => localStorage.removeItem(key));
+  } catch (err) { /* storage unavailable: nothing to sweep */ }
 }
 
 function toast(text, ms = 2500) {
@@ -271,6 +291,7 @@ function openSocket() {
   sock = new ReconnectingSocket(wsUrl, {
     status(s) { ui.conn = s; renderPill(); },
     open(isReconnect) {
+      ui.failures = 0;
       if (isReconnect) toast('Reconnected');
       // §4.1: a newcomer introduces themself; a token holder sends nothing and gets `sync`.
       if (!ui.saved && ui.joinFrame) sock.send(ui.joinFrame);
@@ -289,14 +310,23 @@ function openSocket() {
         fetchSummary();
         return;
       }
+      if (code === 4000 && !ui.saved) {
+        // The server closes a socket that never completed its join after 60 s ("Join
+        // timed out"). Reconnecting would only replay the old join frame: drop the
+        // socket and hand the form back, so the next tap starts afresh.
+        const wasJoining = ui.joining;
+        cancelJoin();
+        if (wasJoining) toast('Joining took too long — try again.');
+        return;
+      }
       if (willRetry) {                             // pill already says "Reconnecting…"
         if (!sock.everOpened) { ui.failures += 1; render(); }
         return;
       }
+      if (code === 4003 || code === 4004) clearSaved();   // token is dead either way, even after `ended`
       if (ui.fatal || state.phase === 'ended') return;
       const [title, fallback] = CLOSE_TEXT[code] || ['Disconnected', `The connection was closed (code ${code}).`];
       ui.fatal = { title, text: reason || fallback, retry: code === 4009 || code === 4010 };
-      if (code === 4003 || code === 4004) clearSaved();   // token is dead either way
       ui.joining = false;
       render();
     },
@@ -346,6 +376,14 @@ function handleFrame(f) {
       ui.ack = { accepted: !!f.accepted, reason: f.reason || '' };
       if (f.accepted && state.me) { state.me.answered = true; state.me.choice = ui.pendingChoice; }
       if (!f.accepted && f.reason === 'invalid') ui.pendingChoice = null;   // let them tap again
+      if (!f.accepted && f.reason === 'closed' && state.phase === 'open' && !ui.timeUp
+          && state.question && serverNow() < state.question.deadline) {
+        // Our tap reached the server before opensAt (the phone's clock jumped forward):
+        // nothing was recorded and the question is still open, so let them tap again.
+        ui.pendingChoice = null;
+        ui.ack = null;
+        toast('Not open yet — tap again');
+      }
       break;
 
     case 'result':
@@ -380,11 +418,21 @@ function handleFrame(f) {
       break;
 
     case 'settings':
-      if (f.settings) state.settings = Object.assign({}, state.settings, f.settings);
+      // §4.3: sent when the host toggles showOnDevices. `question` (same object as in
+      // `sync`, only in intro/open/closed) carries or drops the text and options. This is
+      // deliberately not a sync: a pending tap / ack on the open question survives it.
+      if (f.settings && typeof f.settings === 'object') state.settings = Object.assign({}, state.settings, f.settings);
+      if (f.question && typeof f.question === 'object') state.question = f.question;
       break;
 
     case 'error':
-      toast(f.message || `Error: ${f.code}`);
+      if (f.code === 'already_joined' && ui.saved) {
+        // Only respin() sends `join` after we are in: the server has run out of spins.
+        ui.spins = MAX_SPINS;
+        toast('No spins left');
+      } else {
+        toast(f.message || `Error: ${f.code}`);
+      }
       ui.joining = false;
       break;
 
@@ -407,10 +455,18 @@ function applySync(f) {
     if (ui.saved && state.me.nick && state.me.nick !== ui.saved.nick) {
       saveSaved(Object.assign({}, ui.saved, { nick: state.me.nick }));
     }
+    // §4.3: me.spins = spins already used, so a reload does not offer a spin that cannot work.
+    if (typeof state.me.spins === 'number') ui.spins = Math.min(MAX_SPINS, Math.max(0, state.me.spins));
   }
   ui.pendingChoice = null;
   ui.ack = null;
   ui.timeUp = false;
+  if (state.phase === 'ended') {
+    // Reconnected after the host pressed End: same promise as the `ended` frame —
+    // nothing about this game is kept, here or on the server.
+    clearSaved();
+    if (sock) sock.close();
+  }
 }
 
 /* ---------- player actions ---------- */
@@ -423,6 +479,16 @@ function startJoin(spin) {
   ui.joining = true;
   if (!sock) openSocket();
   else if (!sock.send(ui.joinFrame)) sock.reconnectNow();   // sent from the open handler instead
+  render();
+}
+
+// Give up on a join that is not getting through: back to the form as if never tapped.
+function cancelJoin() {
+  if (sock) { sock.close(); sock = null; }
+  ui.joining = false;
+  ui.joinFrame = null;
+  ui.failures = 0;
+  ui.conn = 'connecting';          // the pill's pre-join look
   render();
 }
 
@@ -461,6 +527,9 @@ async function fetchSummary() {
       if (s && typeof s.title === 'string') state.title = s.title;
       if (s && s.phase === 'ended') {
         ui.fatal = { title: 'This game has ended', text: 'Nothing about it is kept.', retry: false };
+      } else if (s && s.phase === 'podium') {
+        // The server refuses every join in podium (4004 "This game has ended"): say so here.
+        ui.fatal = { title: 'This game has ended', text: 'The final results are on the big screen — it’s too late to join.', retry: false };
       }
     }
     // Other statuses: let the WebSocket report the real problem when they tap Join.
@@ -487,11 +556,15 @@ function pickScreen() {
 
 function render() {
   const screen = pickScreen();
+  const changed = screen !== shownScreen;
+  shownScreen = screen;
   document.body.dataset.screen = screen;
   document.querySelectorAll('[data-screen]').forEach((el) => { el.hidden = el.dataset.screen !== screen; });
   renderPill();
+  if (changed) focusScreenHeading(screen);     // before draw(): the join screen may move focus on to the nickname
   const draw = RENDER[screen];
   if (draw) draw();
+  if (changed) announceScreen(screen);         // after draw(): the headline is read back from the DOM
   if (screen === 'intro' || screen === 'open') {
     // paintClock() may move intro → open or flag time-up; each change is one-way,
     // so this recursion is bounded (at most two extra passes).
@@ -506,6 +579,48 @@ function renderPill() {
   const pill = $('pill');
   pill.dataset.conn = ui.conn;
   pill.textContent = PILL_TEXT[ui.conn] || ui.conn;
+}
+
+/* ---------- screen changes for screen-reader users ----------
+ * Swapping `hidden` on sections says nothing to VoiceOver / TalkBack and drops focus
+ * on <body>. On every screen change we move focus to the new screen's heading
+ * (tabindex="-1", no scrolling) and write its headline — plus the one or two lines
+ * that matter — into a single visually-hidden polite live region. */
+let shownScreen = null;     // the screen the last render() put on the page
+let announceTimer = 0;
+
+// Per screen: the heading to focus first, then the elements whose text is announced.
+const SCREEN_TEXT = {
+  nopin: ['nopin-heading'],
+  join: ['join-heading', 'join-notice'],
+  connecting: ['connecting-title', 'connecting-text'],
+  lobby: ['lobby-heading'],
+  intro: ['intro-q'],
+  open: ['open-q', 'open-text'],
+  closed: ['verdict', 'res-points', 'res-rank'],
+  podium: ['pod-you', 'pod-score'],
+  ended: ['ended-heading', 'ended-text'],
+  fatal: ['fatal-title', 'fatal-text'],
+};
+
+function focusScreenHeading(screen) {
+  const ids = SCREEN_TEXT[screen];
+  const heading = ids && $(ids[0]);
+  if (heading) heading.focus({ preventScroll: true });
+}
+
+function announceScreen(screen) {
+  const parts = [];
+  (SCREEN_TEXT[screen] || []).forEach((id) => {
+    const el = $(id);
+    if (!el || el.hidden) return;
+    const text = el.textContent.trim();
+    if (text) parts.push(text);
+  });
+  const el = $('announcer');
+  clearTimeout(announceTimer);
+  el.textContent = '';                         // empty first so an identical headline is still spoken
+  announceTimer = setTimeout(() => { el.textContent = parts.join('. '); }, 50);
 }
 
 function questionLabel() {
@@ -528,20 +643,27 @@ const RENDER = {
     $('nick-row').hidden = spinOnly;
     $('spin-hint').hidden = !spinOnly;
 
+    // podium counts as ended: the server refuses every join from the podium on (4004).
+    const tooLate = !!(s && (s.phase === 'podium' || s.phase === 'ended'));
+    const unreachable = ui.joining && ui.failures >= 3;   // handshakes keep failing (proxy, Worker down)
+
     let notice = '';
-    if (s && s.locked) notice = 'The host has locked this game — new players can’t join right now.';
+    if (unreachable) notice = 'Can’t reach the game yet — check your Wi-Fi. Still trying…';
+    else if (tooLate) notice = 'This game has finished — it’s too late to join.';
+    else if (s && s.locked) notice = 'The host has locked this game — new players can’t join right now.';
     else if (s && s.phase && s.phase !== 'lobby' && s.lateJoin === false) notice = 'This game has already started and the host isn’t letting new players in.';
     else if (s && s.phase && s.phase !== 'lobby') notice = 'This game has already started. You can still join; earlier questions won’t count for you.';
     $('join-notice').hidden = !notice;
     setText('join-notice', notice);
+    $('join-cancel').hidden = !unreachable;
 
     const busy = ui.joining;
-    $('nick').disabled = busy;
-    $('join-btn').disabled = busy;
-    $('spin-btn').disabled = busy;
+    $('nick').disabled = busy || tooLate;
+    $('join-btn').disabled = busy || tooLate;
+    $('spin-btn').disabled = busy || tooLate;
     setText('join-btn', busy ? 'Joining…' : 'Join');
     setText('spin-btn', busy ? 'Joining…' : 'Spin a name');
-    if (!spinOnly && !busy && !ui.focusedNick) { ui.focusedNick = true; $('nick').focus(); }
+    if (!spinOnly && !busy && !tooLate && !ui.focusedNick) { ui.focusedNick = true; $('nick').focus(); }
   },
 
   connecting() {
@@ -615,9 +737,11 @@ const RENDER = {
     const q = state.question || {};
     setText('closed-q', questionLabel());
 
+    const survey = q.points === 0;               // §2: nobody scores, so there is no right or wrong
     let verdict = 'No answer', cls = 'none';
     if (r && r.choice != null) {
-      if (r.choice === r.correct) { verdict = 'Correct ✓'; cls = 'correct'; }
+      if (survey) verdict = 'Answer recorded';
+      else if (r.choice === r.correct) { verdict = 'Correct ✓'; cls = 'correct'; }
       else { verdict = 'Wrong ✗'; cls = 'wrong'; }
     }
     const v = $('verdict');
@@ -627,7 +751,7 @@ const RENDER = {
     const points = r ? r.points : 0;
     setText('res-points', q.points === 0 ? 'Survey question — no points' : `+${fmt(points)} points`);
 
-    const hasCorrect = !!r && Number.isInteger(r.correct) && r.correct >= 0 && r.correct <= 3;
+    const hasCorrect = !survey && !!r && Number.isInteger(r.correct) && r.correct >= 0 && r.correct <= 3;
     $('res-correct-row').hidden = !hasCorrect;
     if (hasCorrect) {
       $('res-correct').dataset.shape = String(r.correct);
@@ -741,6 +865,7 @@ function boot() {
   initContrast();
   $('join-form').addEventListener('submit', (ev) => { ev.preventDefault(); startJoin(false); });
   $('spin-btn').addEventListener('click', () => startJoin(true));
+  $('join-cancel').addEventListener('click', cancelJoin);
   $('respin-btn').addEventListener('click', respin);
   $('fatal-retry').addEventListener('click', () => location.reload());
   $('grid').addEventListener('click', (ev) => {
@@ -751,6 +876,7 @@ function boot() {
     if (document.visibilityState === 'visible') requestWakeLock();
   });
 
+  sweepSaved();                    // forget entries from games that are long over
   if (!PIN_RE.test(PIN)) { render(); return; }
   ui.saved = loadSaved();
   render();

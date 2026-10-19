@@ -228,7 +228,8 @@
       return;
     }
     try { room = await res.json(); } catch (err) { room = null; }
-    if (room && room.phase === 'ended') {
+    // podium counts as ended: the server refuses every join from the podium on.
+    if (room && (room.phase === 'ended' || room.phase === 'podium')) {
       setBusy(false);
       say('That game has already finished.');
       return;
@@ -236,6 +237,10 @@
     // Keep the button in its busy state while the browser navigates.
     location.href = '/play?pin=' + pin;
   }
+
+  // The back/forward cache restores this page exactly as we left it — including the
+  // "Checking…" state kept while navigating to /play. Make it usable again.
+  window.addEventListener('pageshow', function () { setBusy(false); lastAuto = ''; });
 
   // A link such as /?pin=123456 pre-fills the field (handy for a shared link).
   var pre = new URLSearchParams(location.search).get('pin');
