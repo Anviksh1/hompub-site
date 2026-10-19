@@ -85,8 +85,16 @@ account is needed.
   If the phone cannot connect, your laptop firewall is probably blocking port
   8787 or the Wi-Fi isolates clients from each other.
 - `npm run test:load` runs `test/load.mjs`: it creates a room against the dev
-  server and drives 150 simulated players through a whole game, so you can
-  watch the host page cope with a full class without needing one.
+  server and drives 150 simulated players through a 20-question game, with a
+  fifth of them dropping and reconnecting during every question and a few
+  deliberately answering twice. It checks one welcome per player, a result for
+  every connected player on every question, the points formula, that no frame
+  carries the correct answer before reveal, duplicate refusals, tally sums,
+  rankings and the CSV, and exits non-zero on any violation. Flags:
+  `--url --players --questions --time-limit --answer-window --drop --join-burst
+  --seed --verbose` (e.g. `node test/load.mjs --players 12 --questions 2` for a
+  30-second smoke run). The Directory's per-IP cap of 30 rooms per UTC day
+  applies locally too; delete `.wrangler/state/` to reset it.
 - `npm run typecheck` runs the TypeScript compiler over `src/`.
   `npm test` runs the unit tests for scoring, validation and the nickname filter.
   `npm run check` does both. The deploy workflow runs them before every deploy.
@@ -292,6 +300,24 @@ These are estimates from reasoning about the protocol and from the load
 harness. After the first real sessions, replace them with the numbers under
 **Workers & Pages → hompub-quiz → Metrics** and **Durable Objects → Metrics**
 in the dashboard.
+
+### Measured in the load harness (local Wrangler runtime, 2026-10-19)
+
+`node test/load.mjs --players 150 --questions 20 --time-limit 5 --drop 0.2`,
+150 simulated phones against `wrangler dev` on one laptop-class machine:
+
+| | |
+|---|---|
+| Join, connect → welcome | p50 12 ms · p95 25 ms · max 37 ms |
+| Answer, send → ack | p50 2.4 ms · p95 4.9 ms · max 23 ms (2,773 answers) |
+| Reconnect → sync | p50 8 ms · p95 12 ms (599 reconnects) |
+| Accepted answers per question | 135–142 of 150 (30 phones dropped mid-question each time) |
+| Frames | 3,850 sent by clients, 15,470 received, 5.2 MB down for the whole game |
+| Checks | all pass: no answer key before reveal, 150/150 duplicates refused, CSV and ranks consistent |
+
+Local numbers say nothing about Cloudflare's network latency or billing, but
+they do show the single-threaded room has two orders of magnitude of headroom
+over a real class answering within two seconds.
 
 ## Privacy commitments the code keeps
 
