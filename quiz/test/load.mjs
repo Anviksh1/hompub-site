@@ -421,6 +421,13 @@ class Player {
     this.deliberateClose = true;
     this.reconnectDelay = reconnectAfterMs;
     stats.deliberateDrops += 1;
+    // Once close() is called nothing more is reliably delivered either way: cancel a pending tap
+    // and treat an answer already in flight as uncertain now, not only when the close event lands
+    // (a close that ends in 1006 can arrive late, after this.q has moved on).
+    this.clear('answer');
+    const inFlight = game.over ? null : this.answers.get(this.q);
+    if (inFlight && !inFlight.ackAt && !inFlight.uncertain) { inFlight.uncertain = true; game.uncertain[this.q] += 1; }
+    if (inFlight && inFlight.dupSentServerAt && !inFlight.dupAcked) { inFlight.dupAcked = true; inFlight.dupLost = true; game.dupsLost += 1; }
     this.ws.close(1000, 'simulated drop');
     vlog(`${this.tag}: dropped during ${game.phase} of question ${game.q + 1}, back in ${reconnectAfterMs} ms`);
     return true;
