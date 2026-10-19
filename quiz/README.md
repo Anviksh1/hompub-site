@@ -57,6 +57,8 @@ quiz/
   src/shared.ts      validation, scoring, nickname filter (pure functions, unit-tested)
   src/env.ts         the Env binding types
   public/            index.html (join), play.html/.js/.css (phone), host.html/.js/.css (laptop)
+  public/import-text.js         Word (.docx) and plain-text → quiz parser, no dependencies; used by the host page
+  public/template-questions.docx  the Word template teachers download from the host page
   public/vendor/     qrcode.js (qrcode-generator, MIT) — the only vendored library
   test/              shared.test.ts (unit tests), load.mjs (150-client load harness), sample-quiz.json
 ```
@@ -400,6 +402,83 @@ holds it up as follows:
 - **Several teachers, one school:** the per-IP cap of 30 rooms per day is
   shared by everyone behind the school's public IP. Raise
   `ROOM_CREATE_PER_IP_PER_DAY` if that bites.
+
+## Writing questions in Word
+
+You do not have to type a quiz into the host page. Write it in Microsoft Word,
+Google Docs or any text editor, then on the host page press **Import Word or
+text** and choose the file (`.docx` or `.txt`), or press **Paste questions**
+and paste the text. A preview shows what was understood — the title, each
+question, its options with the correct one ticked, the timer and the points,
+and a list of anything to check — and **Add to my quizzes** opens the result in
+the editor. Nothing is uploaded: the file is read inside the browser
+(`public/import-text.js` unzips the `.docx` and reads its text itself), and the
+quiz is stored in the browser like any other.
+
+The quickest start is the **Download the Word template** link on the host page
+(`public/template-questions.docx`): a document already laid out in the format
+below, with two example questions to overwrite.
+
+### The format
+
+One question per block, a blank line between blocks. The first line of a block
+is the question; the lines under it are the options. Numbers and letters are
+optional but help. This is a complete two-question quiz:
+
+```
+Cell biology — week 6
+
+1. Which organelle makes ATP?
+A. Ribosome
+B. Mitochondrion *
+C. Golgi body
+D. Nucleus
+
+2. Water boils at 100 °C at sea level. (10s)
+- True
+- False
+Answer: A
+```
+
+- **Title.** A first line that is not a question or an option (no `?`, no
+  `1.`/`A.` prefix) is the quiz title. Without one, the file name is used, or
+  "Pasted quiz".
+- **Question line.** `1.`, `1)`, `(1)`, `Q1.`, `Q1:`, `Question 1:` and `Q.`
+  prefixes are recognised and removed. A line ending in `?` is a question even
+  without a number, and so is the first line of a block. Word's automatic
+  numbering is read as well, so a numbered list in Word works without typing
+  the numbers.
+- **Option lines.** `A.` `A)` `(A)` `a.` `a)` `[A]`, or a bullet (`-` `•` `–` `*`
+  `○`). Two to four options per question; a fifth is dropped with a warning.
+  Word's bullet lists work too.
+- **Marking the correct answer** — any one of these:
+  - a `*` at the start or end of the option: `B. Mitochondrion *` or `B. *Mitochondrion`;
+  - `✓`, `✔`, `(correct)`, `(right)`, `[x]`, `(x)` or `<-- correct` at the end of the option;
+  - a line after the options: `Answer: B`, `Ans: b`, `Correct: B`, `Key: B`, or
+    the option's text, `Answer: Mitochondrion` (case and punctuation do not matter).
+
+  **Bold does not count** — bold is invisible once the text is extracted, so a
+  question whose answer is only marked in bold comes through with no answer
+  marked. That is not fatal: the preview lists it, the question is still
+  imported, and the editor asks you to tick the correct option before hosting.
+- **Time limit.** `(30s)` at the end of the question line, or a line `Time: 30`,
+  `Timer: 30 s` or `30 seconds` after the options. Snapped to the nearest
+  allowed value: 5, 10, 15, 20, 30, 60, 90, 120 or 240 seconds. Default 20.
+- **Points.** A line `Points: 2000` or `double points` for 2000; `Points: 0`,
+  `no points` or `survey` for a survey question nobody scores on. Default 1000.
+- **Limits**, the same as the editor's: title up to 80 characters, question text
+  200, each option 80 (longer text is cut, with a warning); up to 100 questions
+  (extra ones are skipped, with a warning); a question with fewer than two
+  options is skipped and named in the warnings. Files larger than 5 MB are
+  refused — a quiz is text, so remove the pictures or paste the text instead.
+- **Files.** `.docx` (Word 2007 or later, and Google Docs → Download → Word) and
+  plain text (`.txt`, `.md`). Old `.doc` files, PDFs and `.pages` are not read:
+  save as `.docx` first, or copy the text and use **Paste questions**. Tables are
+  read cell by cell, one cell per line.
+
+After importing, export a `.json` copy as usual: the Word file is not a backup
+of the quiz as the editor sees it (it may lack the ticked answers), and the
+`.json` is what the host page imports back losslessly.
 
 ## Protocol
 

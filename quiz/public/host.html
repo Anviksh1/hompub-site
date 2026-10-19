@@ -46,8 +46,9 @@
 
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
-<!-- Hidden file picker for "Import .json"; triggered from a visible button. -->
+<!-- Hidden file pickers for "Import .json" and "Import Word or text"; both triggered from visible buttons. -->
 <input type="file" id="import-file" accept=".json,application/json" hidden>
+<input type="file" id="import-text-file" accept=".docx,.txt,.md,.text" hidden>
 
 <footer class="site-footer">
   <div class="wrap">
@@ -57,6 +58,8 @@
 </footer>
 
 <script src="vendor/qrcode.js" defer></script>
+<!-- import-text.js defines window.HomPubImport (Word/text → quiz parser); host.js reads it, so it loads first. -->
+<script src="import-text.js" defer></script>
 <script src="host.js" defer></script>
 </body>
 </html>
