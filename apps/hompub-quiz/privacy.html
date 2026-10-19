@@ -63,11 +63,11 @@
   <section>
     <h2>Where it lives, and for how long</h2>
     <p>A game lives in one Cloudflare Durable Object — a small, single-purpose storage unit — in the Cloudflare data center nearest the teacher who created it. It holds the quiz (including the answer key), the game's settings and current phase, and one row per player: nickname, score, streak and the answers given. No IP addresses, no device details, no browser details.</p>
-    <p>One more thing exists outside the game, to stop someone creating thousands of empty games in a day: when a teacher creates a game, the referee keeps a one-way hash of that day's date and the teacher's IP address, with a count. The hash cannot be turned back into an address or linked to the same person on another day, it says nothing about students, and it is deleted within 48 hours.</p>
+    <p>One more thing exists outside the game, to stop someone creating thousands of empty games in a day: when a teacher creates a game, the referee keeps a one-way hash of that day's date and the teacher's IP address, with a count. It is a one-way hash that HomPub never links back to an address, it cannot be linked to the same person on another day, it says nothing about students, and it is deleted within 48 hours.</p>
     <p>It is deleted:</p>
     <ul class="plain">
       <li>when the teacher confirms the results download at the end of the game, or</li>
-      <li>automatically after 2 hours without any activity, or 30 minutes after the podium if the teacher never confirms.</li>
+      <li>automatically after 2 hours without any activity, or 30 minutes after the teacher presses End game if the download is never confirmed. If a game is left on the podium screen until that 2-hour limit, the results file is sent to the teacher's screen before the game is deleted.</li>
     </ul>
     <p>The only lasting copy is the CSV the teacher downloads: rank, nickname, score and the answer to each question. What the teacher does with that file is the teacher's responsibility, as with any class record.</p>
     <p>On each student's phone, a random reconnect token sits in the browser's storage so a dropped connection can rejoin without losing the score. It identifies the phone to the referee for that one game only, and it is cleared when the game ends. The teacher's quizzes, and the PIN and host token of the current game, are kept in the teacher's own browser storage on the teacher's own device.</p>
@@ -83,7 +83,7 @@
     <p>A web app asks the browser for access rather than installing permissions. Here is everything HomPub Quiz uses:</p>
     <dl class="permission-grid">
       <dt>Network access</dt><dd>Yes — to the quiz referee only</dd>
-      <dt>Browser storage</dt><dd>Students: one reconnect token. Host: your own quizzes and the current game</dd>
+      <dt>Browser storage</dt><dd>Students: one reconnect entry (PIN, token, nickname) for the current game, plus a high-contrast on/off preference. Host: your own quizzes and the current game</dd>
       <dt>Keep screen awake</dt><dd>Yes, during a game, so the phone does not lock mid-question</dd>
       <dt>Camera</dt><dd>Not requested — QR codes are read by the phone's camera app, not the page</dd>
       <dt>Microphone</dt><dd>Not requested</dd>
@@ -102,7 +102,7 @@
   <section>
     <h2>Children's privacy</h2>
     <p>HomPub Quiz is built for classrooms, so most players are children, and the design starts from that. A student is known to the referee only by a nickname, which is never linked to an account, email address, device identifier or any other persistent identifier. Nothing is retained once the lesson ends. The teacher is the only person who ever holds a copy of the results.</p>
-    <p>Schools that want even the nickname-and-score data to stay entirely under their own control can <a href="https://github.com/anviksh1/hompub-site/tree/main/quiz">deploy your own copy</a> of the referee, because it is open source.</p>
+    <p>Schools that want even the nickname-and-score data to stay entirely under their own control can <a href="https://github.com/anviksh1/hompub-site/tree/main/quiz">deploy their own copy</a> of the referee, because it is open source.</p>
   </section>
 
   <section>
@@ -117,7 +117,7 @@
 
   <section>
     <h2>Contact</h2>
-    <p>Questions about this policy can be sent through the developer contact link on HomPub's Google Play Store listing page — the same contact as for HomPub Calculator.</p>
+    <p>Questions about this policy can be raised on the <a href="https://github.com/Anviksh1/hompub-site/issues">public issue tracker for this website and the referee</a>, or sent through the developer contact link on HomPub's Google Play Store listing page — the same contact as for HomPub Calculator.</p>
   </section>
 </div>
 

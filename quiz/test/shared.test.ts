@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   DEFAULT_SETTINGS,
+  csvEscape,
   isProfane,
   mergeSettings,
   sanitizeNick,
@@ -78,9 +79,12 @@ test('mergeSettings only changes lobby-only fields in the lobby', () => {
   assert.equal(mergeSettings(DEFAULT_SETTINGS, { mode: 'turbo' }, true).mode, 'speed');
 });
 
-test('sanitizeNick trims, strips control characters and caps length', () => {
-  assert.equal(sanitizeNick('  Priya   S ​'), 'Priya S');
-  assert.equal(sanitizeNick('a\u0000b c'), 'abc');
+test('sanitizeNick trims, strips control characters, formula triggers, and caps length', () => {
+  assert.equal(sanitizeNick('=HYPERLINK("//x")'), 'HYPERLINK("//x")');
+  assert.equal(sanitizeNick('-2+3'), '2+3');
+  assert.equal(sanitizeNick('@@+='), '');
+  assert.equal(sanitizeNick('  Priya   S \u200b'), 'Priya S');
+  assert.equal(sanitizeNick('a\u0000b\u2028c'), 'abc');
   assert.equal(sanitizeNick('x'.repeat(40)).length, 20);
   assert.equal(sanitizeNick(42), '');
   assert.equal(sanitizeNick('   '), '');
@@ -89,7 +93,21 @@ test('sanitizeNick trims, strips control characters and caps length', () => {
 test('isProfane catches spacing and leetspeak but not ordinary names', () => {
   assert.equal(isProfane('sh1t head'), true);
   assert.equal(isProfane('F U C K'), true);
+  assert.equal(isProfane('fuckface'), true);
   assert.equal(isProfane('Priya'), false);
-  assert.equal(isProfane('Scunthorpe'), true); // known false positive of substring filters; replaced by a spun name, never shown
   assert.equal(isProfane('Brave Otter'), false);
+  // Whole-token matching keeps real names that contain a short deny-list word.
+  for (const name of ['Akshit', 'Dickens', 'Essex', 'Hancock', 'Nazir', 'Grape', 'Scunthorpe', 'Prickett', 'Alex Sexton']) {
+    assert.equal(isProfane(name), false, name);
+  }
+});
+
+test('csvEscape neutralises spreadsheet formula triggers', () => {
+  assert.equal(csvEscape('Priya'), 'Priya');
+  assert.equal(csvEscape(12), '12');
+  assert.equal(csvEscape('a,b'), '"a,b"');
+  assert.equal(csvEscape('=1+1'), '"\'=1+1"');
+  assert.equal(csvEscape('@SUM(A1)'), '"\'@SUM(A1)"');
+  assert.equal(csvEscape('-2'), '"\'-2"');
+  assert.equal(csvEscape('say "hi"'), '"say ""hi"""');
 });

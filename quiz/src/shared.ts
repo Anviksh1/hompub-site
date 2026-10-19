@@ -163,25 +163,40 @@ export function spinName(): string {
 export function sanitizeNick(raw: unknown): string {
   if (typeof raw !== 'string') return '';
   // eslint-disable-next-line no-control-regex
-  const cleaned = raw.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202f\ufeff]/g, '').replace(/\s+/g, ' ').trim();
+  const cleaned = raw
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202f\ufeff]/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/^[=+\-@]+/, '') // a name may not start with a spreadsheet formula trigger
+    .trim();
   return Array.from(cleaned).slice(0, LIMITS.nickChars).join('').trim();
 }
 
-// A short, deliberately conservative deny-list. Matching is done on a
-// lower-cased, letters-only, de-leeted form so spacing and digits do not
-// evade it. Hits are replaced with a spun name, never shown to anyone.
-const DENY = [
+// A short, deliberately conservative deny-list. Hits are replaced with a spun
+// name and never shown to anyone. Matching is done on a lower-cased, de-leeted
+// form. Short words are matched only as whole tokens, so Akshit, Dickens,
+// Essex, Hancock, Nazir, Grape and Scunthorpe pass; a few long, unambiguous
+// words are also matched inside the letters-only form so that spacing them
+// out ("f u c k") does not evade the filter.
+const DENY_TOKENS = new Set([
   'fuck', 'shit', 'cunt', 'bitch', 'asshole', 'bastard', 'dick', 'cock', 'pussy', 'whore', 'slut',
   'nigger', 'nigga', 'faggot', 'fag', 'retard', 'rape', 'nazi', 'hitler', 'penis', 'vagina', 'wank',
   'twat', 'prick', 'bollock', 'motherfucker', 'douche', 'jerkoff', 'blowjob', 'handjob', 'porn', 'sex',
-];
+  'fucker', 'fucking', 'shithead', 'dickhead', 'wanker',
+]);
+const DENY_ANYWHERE = ['fuck', 'nigger', 'nigga', 'faggot', 'asshole', 'bastard', 'motherfucker', 'blowjob', 'handjob', 'hitler'];
+
+function deleet(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[@4]/g, 'a').replace(/[3]/g, 'e').replace(/[1!|]/g, 'i').replace(/[0]/g, 'o').replace(/[5$]/g, 's').replace(/[7]/g, 't');
+}
 
 export function isProfane(nick: string): boolean {
-  const norm = nick
-    .toLowerCase()
-    .replace(/[@4]/g, 'a').replace(/[3]/g, 'e').replace(/[1!|]/g, 'i').replace(/[0]/g, 'o').replace(/[5$]/g, 's').replace(/[7]/g, 't')
-    .replace(/[^a-z]/g, '');
-  return DENY.some(w => norm.includes(w));
+  const norm = deleet(nick);
+  const tokens = norm.split(/[^a-z]+/).filter(Boolean);
+  if (tokens.some(t => DENY_TOKENS.has(t))) return true;
+  const blob = norm.replace(/[^a-z]/g, '');
+  return DENY_ANYWHERE.some(w => blob.includes(w));
 }
 
 // --------------------------------------------------------------------- misc
@@ -202,9 +217,15 @@ export function letterFor(index: number): string {
   return String.fromCharCode(65 + index);
 }
 
+/**
+ * Quote a CSV cell. A text cell that starts with = + - @ or a tab/CR would be
+ * evaluated as a formula by Excel, Sheets and LibreOffice; prefix it with an
+ * apostrophe so it stays text (the OWASP recommendation).
+ */
 export function csvEscape(v: string | number): string {
-  const s = String(v);
-  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  let s = String(v);
+  if (typeof v === 'string' && /^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+  return /[",'\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
 export async function sha256Hex(text: string): Promise<string> {

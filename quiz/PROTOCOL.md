@@ -123,7 +123,7 @@ reason="duplicate"`).
   every 25 s to keep NATs and proxies happy.
 - Frame > 4,096 bytes → server closes with **1009**.
 - More than 10 frames/s sustained (burst allowance 20) → server closes with **4008**.
-- Server close codes: `4000` bad request · `4001` bad host token · `4003` kicked · `4004` room not found / already ended / unknown player token · `4008` rate limited · `4009` room full · `4010` room locked / late join disabled · `1009` frame too large. Clients **must not** auto-reconnect after 4001, 4003, 4004, 4009, 4010; show the message instead. Any other close → reconnect with backoff.
+- Server close codes: `4000` bad request (also `Join timed out` for a player socket that sends no `join` within 60 s) · `4001` bad host token · `4003` kicked · `4004` room not found / already ended / unknown player token · `4008` rate limited · `4009` room full · `4010` room locked / late join disabled · `1009` frame too large. Clients **must not** auto-reconnect after 4001, 4003, 4004, 4009, 4010; show the message instead. Any other close → reconnect with backoff.
 
 ### 4.1 Client → server (player)
 
@@ -170,7 +170,8 @@ Every frame has `t`. Frames with times carry `serverNow` (ms since epoch, server
   },
   // ---- player only ----
   "me": { "pid": "p_ab12", "nick": "Priya", "score": 2310, "rank": 12, "streak": 2,
-          "answered": true, "choice": 1 },     // answered/choice refer to the current question
+          "answered": true, "choice": 1,       // answered/choice refer to the current question
+          "spins": 1 },                        // name spins used so far (max 3)
   "result": { ...same fields as the result frame, without t... },   // only in phase closed
   "podium": { "top": [{"nick":"...","score":1234}, ...], "you": {"score": 2310, "rank": 12} }, // podium / ended
   // ---- host only ----
@@ -195,7 +196,7 @@ Every frame has `t`. Frames with times carry `serverNow` (ms since epoch, server
 | `podium` | `top:[{nick,score}] (≤3), you:{score,rank}, playerCount` |
 | `ended` | — (clear the localStorage entry; show "Game over. Nothing about this game is kept.") |
 | `kicked` | — (then close 4003) |
-| `settings` | `settings` (only when `showOnDevices` changed) |
+| `settings` | `settings`, plus `question` (the same object as in `sync`, present in intro/open/closed) — sent when the host changes `showOnDevices`; clients update settings and question and keep any in-progress answer UI |
 | `error` | `code, message` |
 
 **Host frames**
@@ -226,7 +227,7 @@ Players never receive `correct` before `closed`. The Room never sends the quiz's
 
 - `intro → open` and `open → closed` use `setTimeout` inside the Room plus `ctx.storage.setAlarm(deadline + 1500)` as a durable backstop. The alarm handler re-reads the room row and closes the question if it is still open and past its deadline; otherwise it handles TTL below.
 - Between questions the Room has no pending timers and hibernates (WebSocket Hibernation API; sockets stay attached at the edge). Each socket's attachment is `{pid, role}` only; all authoritative state is in SQLite and reloaded in the constructor.
-- TTL (alarm): wipe the room 2 h after the last frame (any direction), 30 min after `podium` or `ended` without `ack_results`, or 2 h after players arrive with no host ever connecting. "Wipe" = `deleteAll()`, release the PIN in the Directory, close all sockets with 4004.
+- TTL (alarm): wipe the room 2 h after the last frame (any direction; keepalive `ping`s do not count, and idle attached sockets do not extend it), or 30 min after `ended` without `ack_results`. A room left on `podium` stays on the 2 h clock, and if that expires the host sockets receive `results_csv` immediately before the wipe, so results are never destroyed unsent. "Wipe" = `deleteAll()`, release the PIN in the Directory (only if it still maps to this room), close all sockets with 4004.
 - Auto-response: `ping` → `pong` is registered with `setWebSocketAutoResponse` so keepalives never wake the object.
 
 ## 7. Directory (PIN → room id)
@@ -237,7 +238,8 @@ center nearest the host that created them (a Durable Object never moves).
 
 - `POST /allocate {"roomId": "<hex>", "ipHash": "<hex>"}` → `200 {"pin":"123456"}` · `429 {"error":"too_many_rooms"}` (per-IP cap `ROOM_CREATE_PER_IP_PER_DAY`, default 30, or global cap `ROOM_CREATE_PER_DAY`, default 300) · `503` no free PIN after 20 tries.
 - `GET /lookup/:pin` → `200 {"roomId": "<hex>"}` · `404`. Entries older than 24 h are treated as expired.
-- `POST /release {"pin": "123456"}` → `200`.
+- `POST /release {"pin": "123456", "roomId": "<hex>"}` → `200`; a no-op if the PIN has since been re-issued to another room.
+- Housekeeping: expired PINs and creation counters older than yesterday are deleted at most hourly on traffic and from a daily alarm just after 00:00 UTC, so a counter written on day D is gone by 00:05 UTC on D+2.
 
 ## 8. CSV
 
@@ -252,10 +254,11 @@ Filename: `hompub-quiz-<pin>-<YYYYMMDD>.csv`.
 
 | Thing | Limit |
 |---|---|
-| Players per room | `MAX_PLAYERS` = 250 (→ 4009) |
+| Players per room | `MAX_PLAYERS` = 250 joined players; at most 2 × that many player sockets including not-yet-joined ones and second tabs (→ 4009) |
+| Join timeout | a player socket that sends no `join` within 60 s is closed with 4000 |
 | Quiz body | 200 KB, 100 questions, text 200 chars, option 80 chars, title 80 chars |
 | Nickname | 20 chars after trim |
-| Frame size | 4,096 bytes (→ 1009) |
+| Frame size | 4,096 bytes of UTF-8 (→ 1009) |
 | Frames per socket | 10/s sustained, burst 20 (→ 4008) |
 | Rooms per IP per UTC day | 30 (→ 429) |
 | Rooms per day (whole deployment) | 300 (→ 429) |
@@ -274,7 +277,10 @@ Nothing else. No IPs, no user agents, no logs (observability stays off in
 `wrangler.jsonc`). Everything is deleted at `ack_results` or by TTL. The
 only lasting copy is the CSV the host downloads.
 
-The Directory keeps one IP-derived value for abuse limiting: a SHA-256 of
-`<UTC date>|<client IP>`, truncated, with a per-day creation count. It
-cannot be linked across days and rows older than 48 hours are deleted on
-every allocation. Nothing about players is ever hashed or kept.
+The Directory keeps one IP-derived value for abuse limiting: a truncated
+SHA-256 of `<IP_HASH_KEY secret>|<UTC date>|<client IP>`, with a per-day
+creation count. With the optional `IP_HASH_KEY` secret set (`wrangler secret
+put IP_HASH_KEY`) it cannot be brute-forced back to an address; without it,
+it is a pseudonym that HomPub never links back. It cannot be linked across
+days, and counters are deleted within 48 hours (see §7). Nothing about
+players is ever hashed or kept.

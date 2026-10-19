@@ -96,6 +96,8 @@ type Frame = Record<string, unknown> & { t: string };
 type Timer = ReturnType<typeof setTimeout>;
 
 const ACTIVITY_PERSIST_MS = 60_000;
+/** A socket that connects as a player but never sends `join` is closed after this long. */
+const PENDING_JOIN_MS = 60_000;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS room (
@@ -235,9 +237,15 @@ export class Room extends DurableObject<Env> {
 
     const refusal = this.joinRefusal();
     if (refusal) return reject(refusal.code, refusal.reason);
-    // Pending player: joins with a `join` frame.
+    // Pending player: joins with a `join` frame, or is dropped after a minute.
     this.accept(server, { role: 'player', pid: null });
     this.touch();
+    setTimeout(() => {
+      try {
+        const a = server.deserializeAttachment() as Attachment | null;
+        if (a && a.pid === null) server.close(4000, 'Join timed out');
+      } catch { /* socket already gone */ }
+    }, PENDING_JOIN_MS);
     return respond();
   }
 
@@ -253,6 +261,8 @@ export class Room extends DurableObject<Env> {
     if (s.phase !== 'lobby' && !s.settings.lateJoin) return { code: 4010, reason: 'Late joining is off for this game' };
     const max = Number(this.env.MAX_PLAYERS) || 250;
     if (this.activePlayers().length >= max) return { code: 4009, reason: 'This game is full' };
+    // Sockets that have not joined yet (and second tabs) also count, against a looser cap.
+    if (this.ctx.getWebSockets('player').length >= max * 2) return { code: 4009, reason: 'This game is full' };
     return null;
   }
 
@@ -261,7 +271,10 @@ export class Room extends DurableObject<Env> {
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const att = ws.deserializeAttachment() as Attachment | null;
     if (!att) { ws.close(4000, 'No session'); return; }
-    const size = typeof message === 'string' ? message.length : message.byteLength;
+    // Limit is in bytes; a UTF-16 code unit is at most 3 UTF-8 bytes, so only measure long strings.
+    const size = typeof message === 'string'
+      ? (message.length * 3 > LIMITS.frameBytes ? new TextEncoder().encode(message).byteLength : message.length)
+      : message.byteLength;
     if (size > LIMITS.frameBytes) { ws.close(1009, 'Frame too large'); return; }
     if (!this.allow(ws)) { ws.close(4008, 'Too many messages'); return; }
     if (typeof message !== 'string') { this.sendError(ws, 'bad_frame', 'Text frames only'); return; }
@@ -388,7 +401,7 @@ export class Room extends DurableObject<Env> {
     if (s.settings.earlyClose && this.eligible && this.eligible.size > 0) {
       let all = true;
       for (const e of this.eligible) if (!this.answered.has(e)) { all = false; break; }
-      if (all) this.closeQuestion();
+      if (all) void this.closeQuestion();
     }
   }
 
@@ -449,11 +462,14 @@ export class Room extends DurableObject<Env> {
         this.persistRoom();
         this.broadcast('host', { t: 'settings', settings: s.settings, locked: s.locked });
         if (before.showOnDevices !== s.settings.showOnDevices) {
-          // Phones may need the question text they did not have a moment ago: send a snapshot.
-          for (const sock of this.ctx.getWebSockets('player')) {
-            const a = sock.deserializeAttachment() as Attachment | null;
-            if (a?.pid) this.send(sock, this.buildSync('player', a.pid));
-          }
+          // Phones may need the question text they did not have a moment ago. A
+          // `settings` frame (not a sync) lets them keep an in-progress answer UI.
+          const inQuestion = s.phase === 'intro' || s.phase === 'open' || s.phase === 'closed';
+          this.broadcast('player', {
+            t: 'settings',
+            settings: s.settings,
+            ...(inQuestion ? { question: this.questionView(s.settings.showOnDevices) } : {}),
+          });
         }
         return;
       }
@@ -488,6 +504,7 @@ export class Room extends DurableObject<Env> {
   private async openQuestion(): Promise<void> {
     const s = this.state;
     if (!s || s.phase !== 'intro') return;
+    if (this.openTimer) clearTimeout(this.openTimer);
     this.openTimer = null;
     const now = Date.now();
     s.phase = 'open';
@@ -600,7 +617,7 @@ export class Room extends DurableObject<Env> {
     if (s) {
       try {
         const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName('global'));
-        await dir.release(s.pin);
+        await dir.release(s.pin, this.ctx.id.toString());
       } catch { /* the Directory expires PINs on its own after 24 h */ }
     }
   }
@@ -616,21 +633,18 @@ export class Room extends DurableObject<Env> {
     if (!this.state) return;
     const ttl = this.ttlAt();
     if (now >= ttl) {
-      const finished = s.phase === 'podium' || s.phase === 'ended';
-      if (finished || this.ctx.getWebSockets().length === 0) {
-        await this.wipe();
-        return;
-      }
-      // Sockets are still attached: treat that as activity and look again later.
-      s.lastActivity = now;
-      this.persistActivity(now);
+      // A room left on the podium still holds unsaved results: hand the host the
+      // CSV before forgetting everything. Idle sockets do not extend the TTL.
+      if (s.phase === 'podium') this.broadcast('host', this.resultsFrame());
+      await this.wipe();
+      return;
     }
     await this.armAlarm();
   }
 
   private ttlAt(): number {
     const s = this.state!;
-    if (s.phase === 'podium' || s.phase === 'ended') return s.phaseAt + LIMITS.ttlFinishedMs;
+    if (s.phase === 'ended') return s.phaseAt + LIMITS.ttlFinishedMs;
     return Math.max(s.lastActivity, this.lastPersistedActivity) + LIMITS.ttlActiveMs;
   }
 
@@ -677,7 +691,7 @@ export class Room extends DurableObject<Env> {
         const ans = inQuestion ? p.answers[String(s.q)] : undefined;
         base.me = {
           pid: p.pid, nick: p.nick, score: p.score, rank: ranks.get(pid) ?? playerCount,
-          streak: p.streak, answered: !!ans, choice: ans ? ans.c : null,
+          streak: p.streak, answered: !!ans, choice: ans ? ans.c : null, spins: p.spins,
         };
         if (s.phase === 'closed') base.result = this.resultFor(p, s.quiz.questions[s.q], ranks, playerCount);
         if (finished) base.podium = this.podiumFor(p, sorted.slice(0, 3), ranks);
@@ -848,6 +862,10 @@ export class Room extends DurableObject<Env> {
   private broadcast(tag: 'host' | 'player', frame: object): void {
     const text = JSON.stringify(frame);
     for (const sock of this.ctx.getWebSockets(tag)) {
+      if (tag === 'player') {
+        const a = sock.deserializeAttachment() as Attachment | null;
+        if (!a?.pid) continue; // connected but not joined yet
+      }
       try { sock.send(text); } catch { /* socket gone */ }
     }
   }

@@ -14,6 +14,8 @@ import type { Env } from './env';
 import { PIN_RE, randomInt } from './shared';
 
 const PIN_TTL_MS = 24 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUSEKEEP_EVERY_MS = 60 * 60 * 1000;
 const GLOBAL_KEY = '__all__';
 
 export type AllocateResult =
@@ -22,6 +24,7 @@ export type AllocateResult =
 
 export class Directory extends DurableObject<Env> {
   private sql: SqlStorage;
+  private lastHousekeep = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -47,10 +50,7 @@ export class Directory extends DurableObject<Env> {
     const day = new Date(now).toISOString().slice(0, 10);
     const perIp = Number(this.env.ROOM_CREATE_PER_IP_PER_DAY) || 30;
     const perDay = Number(this.env.ROOM_CREATE_PER_DAY) || 300;
-
-    // Housekeeping: expired PINs and creation counters older than yesterday.
-    this.sql.exec('DELETE FROM pins WHERE created_at < ?', now - PIN_TTL_MS);
-    this.sql.exec('DELETE FROM creations WHERE day < ?', new Date(now - 2 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10));
+    await this.housekeep(now);
 
     const ipCount = this.count(ipHash, day);
     const allCount = this.count(GLOBAL_KEY, day);
@@ -73,6 +73,7 @@ export class Directory extends DurableObject<Env> {
   /** Resolve a PIN to a Room id, or null if unknown or expired. */
   async lookup(pin: string): Promise<{ roomId: string } | null> {
     if (!PIN_RE.test(pin)) return null;
+    await this.housekeep(Date.now());
     const rows = this.sql
       .exec<{ room_id: string; created_at: number }>('SELECT room_id, created_at FROM pins WHERE pin = ?', pin)
       .toArray();
@@ -81,9 +82,33 @@ export class Directory extends DurableObject<Env> {
     return { roomId: rows[0].room_id };
   }
 
-  /** Free a PIN once its room has been wiped. Idempotent. */
-  async release(pin: string): Promise<void> {
-    this.sql.exec('DELETE FROM pins WHERE pin = ?', pin);
+  /** Free a PIN once its room has been wiped. Idempotent; a PIN re-issued to another room is left alone. */
+  async release(pin: string, roomId: string): Promise<void> {
+    await this.housekeep(Date.now());
+    this.sql.exec('DELETE FROM pins WHERE pin = ? AND room_id = ?', pin, roomId);
+  }
+
+  /** Daily sweep so the retention promise holds even when nobody creates rooms. */
+  async alarm(): Promise<void> {
+    await this.housekeep(Date.now(), true);
+  }
+
+  /**
+   * Delete expired PINs and creation counters. Counters are kept for today and
+   * yesterday only, so a row written on day D is gone by 00:05 UTC on D+2, i.e.
+   * within 48 hours (PROTOCOL.md §10). Runs at most hourly on traffic, plus
+   * from a daily alarm scheduled for just after UTC midnight.
+   */
+  private async housekeep(now: number, force = false): Promise<void> {
+    if (!force && now - this.lastHousekeep < HOUSEKEEP_EVERY_MS) return;
+    this.lastHousekeep = now;
+    this.sql.exec('DELETE FROM pins WHERE created_at < ?', now - PIN_TTL_MS);
+    const yesterday = new Date(now - DAY_MS).toISOString().slice(0, 10);
+    this.sql.exec('DELETE FROM creations WHERE day < ?', yesterday);
+    const d = new Date(now);
+    const nextSweep = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 5);
+    const current = await this.ctx.storage.getAlarm();
+    if (current == null || current > nextSweep) await this.ctx.storage.setAlarm(nextSweep);
   }
 
   private count(key: string, day: string): number {

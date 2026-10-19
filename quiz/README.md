@@ -55,9 +55,10 @@ quiz/
   src/room.ts        Room Durable Object: one game, SQLite-backed, the referee
   src/directory.ts   Directory Durable Object: PIN table and daily caps
   src/shared.ts      validation, scoring, nickname filter (pure functions, unit-tested)
+  src/env.ts         the Env binding types
   public/            index.html (join), play.html/.js/.css (phone), host.html/.js/.css (laptop)
   public/vendor/     qrcode.js (qrcode-generator, MIT) — the only vendored library
-  test/              shared.test.ts (unit tests), load.mjs (150-client load harness)
+  test/              shared.test.ts (unit tests), load.mjs (150-client load harness), sample-quiz.json
 ```
 
 ## Running locally
@@ -92,7 +93,7 @@ account is needed.
   carries the correct answer before reveal, duplicate refusals, tally sums,
   rankings and the CSV, and exits non-zero on any violation. Flags:
   `--url --players --questions --time-limit --answer-window --drop --join-burst
-  --seed --verbose` (e.g. `node test/load.mjs --players 12 --questions 2` for a
+  --seed --quiz <file> --verbose --help` (e.g. `node test/load.mjs --players 12 --questions 2` for a
   30-second smoke run). The Directory's per-IP cap of 30 rooms per UTC day
   applies locally too; delete `.wrangler/state/` to reset it.
 - `npm run typecheck` runs the TypeScript compiler over `src/`.
@@ -194,6 +195,17 @@ Four variables in `wrangler.jsonc` → `vars`, read at request time:
 
 Change a value, redeploy. Keep `observability.enabled` at `false`; see
 [Privacy](#privacy-commitments-the-code-keeps).
+
+### Optional secret: `IP_HASH_KEY`
+
+The per-IP room-creation cap stores a truncated SHA-256 of
+`<IP_HASH_KEY>|<UTC date>|<IP>` for up to 48 hours. Without the key that value
+is a pseudonym HomPub never links back; with it, it cannot be brute-forced
+back to an address. Set it once per deployment from a laptop:
+
+```
+npx wrangler secret put IP_HASH_KEY     # paste any long random string
+```
 
 ## Deploying through GitHub
 
@@ -334,8 +346,10 @@ holds it up as follows:
   kept by the Directory and deleted after 48 hours. Students' IPs are never
   read.
 - **Wipe on ack or TTL.** The room is `deleteAll()`-ed when the host confirms
-  the CSV (`ack_results`), or 2 h after the last frame, or 30 min after the
-  podium if the host never confirms, or 2 h after players arrive with no host.
+  the CSV (`ack_results`), or 2 h after the last frame (idle sockets do not
+  extend it), or 30 min after End game if the host never confirms. A room left
+  on the podium stays on the 2 h clock and the host receives the CSV before it
+  is wiped, so results are never destroyed unsent.
   The PIN is released at the same moment.
 - **No third-party requests from the student page.** `index.html` and
   `play.html` load no fonts, scripts or images from anywhere but the referee;
@@ -377,7 +391,9 @@ holds it up as follows:
   CSV (`hompub-quiz-<pin>-<date>.csv`: rank, nickname, score, correct count,
   one column per question) downloads to the laptop. Save it somewhere before
   confirming the wipe. If you never confirm, the room deletes itself 30 minutes
-  after the podium — so download first.
+  after End game; the file has already been downloaded by then. A room left on
+  the podium screen is kept for 2 hours, and the CSV is sent to the host page
+  before it is deleted.
 - **If the laptop dies mid-game**, open the host page in any browser and press
   **Resume game**; the room keeps closing questions on its own timers
   meanwhile. Students see "Waiting for the host" only between questions.

@@ -66,8 +66,9 @@ function directory(env: Env) {
 async function createRoom(request: Request, url: URL, env: Env): Promise<Response> {
   const declared = Number(request.headers.get('content-length') || 0);
   if (declared > LIMITS.quizBytes) return json({ error: 'too_large' }, 413);
-  const text = await request.text();
-  if (text.length > LIMITS.quizBytes) return json({ error: 'too_large' }, 413);
+  const body_bytes = await request.arrayBuffer();
+  if (body_bytes.byteLength > LIMITS.quizBytes) return json({ error: 'too_large' }, 413);
+  const text = new TextDecoder().decode(body_bytes);
 
   let body: { quiz?: unknown; settings?: unknown };
   try {
@@ -81,18 +82,27 @@ async function createRoom(request: Request, url: URL, env: Env): Promise<Respons
   if (!quiz.ok) return json({ error: quiz.error }, 400);
   const settings = mergeSettings(DEFAULT_SETTINGS, body.settings, true);
 
-  // Rate-limit key: SHA-256 of the client IP and the UTC date. It lives in the
-  // Directory for at most 48 hours and cannot be linked across days.
+  // Rate-limit key: SHA-256 of the client IP and the UTC date, keyed with the
+  // optional IP_HASH_KEY secret (wrangler secret put IP_HASH_KEY) so it cannot
+  // be brute-forced back to an address. It lives in the Directory for at most
+  // 48 hours and cannot be linked across days.
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
   const day = new Date().toISOString().slice(0, 10);
-  const ipHash = (await sha256Hex(`${day}|${ip}`)).slice(0, 32);
+  const ipHash = (await sha256Hex(`${env.IP_HASH_KEY || ''}|${day}|${ip}`)).slice(0, 32);
 
   const id = env.ROOM.newUniqueId();
   const alloc = await directory(env).allocate(id.toString(), ipHash);
   if (!alloc.ok) return json({ error: alloc.error }, alloc.status);
 
   const room = env.ROOM.get(id);
-  const { hostToken } = await room.init(alloc.pin, quiz.value, settings);
+  let hostToken: string;
+  try {
+    ({ hostToken } = await room.init(alloc.pin, quiz.value, settings));
+  } catch {
+    // Do not leave a PIN pointing at an empty room.
+    try { await directory(env).release(alloc.pin, id.toString()); } catch { /* expires on its own */ }
+    return json({ error: 'room_unavailable' }, 503);
+  }
   return json({ pin: alloc.pin, hostToken, joinUrl: `${url.origin}/play?pin=${alloc.pin}` });
 }
 
