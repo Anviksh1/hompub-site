@@ -234,8 +234,10 @@ Use a different passcode on staging.
 After sign-in the host page keeps an HttpOnly, Secure, SameSite=Strict cookie
 (`__Host-hq_session`) for 30 days, renewed while you use it, never longer than
 90 days. **"This is a shared computer"** at sign-in makes it last only until
-the browser closes (and 4 idle hours). **Sign out on this device** is in the
-header and on the Game over screen; it clears this browser's cookie only.
+the browser closes, after 4 hours without use (the open page does not count as
+use), and after 12 hours at most. **Sign out on this device** is in the
+header and on the Game over screen; it clears this browser's cookie and the
+game from this screen (the game itself keeps running; sign in to resume it).
 
 **Changing the passcode** (for example after a laptop is lost):
 
@@ -252,8 +254,11 @@ header and on the Game over screen; it clears this browser's cookie only.
    "redeploy-ref" keeps the current ones (see below).
 
 Five wrong passcodes from one network in 15 minutes lock sign-in from that
-network for 15 minutes. A student on the school network could trigger that;
-hosts already signed in are not affected.
+network for 15 minutes; a restart of the referee does not reset the count. A
+student on the school network could trigger that; hosts already signed in are
+not affected. There is deliberately no limit across all networks, so nobody can
+lock out every teacher at once; a passcode of at least 12 random characters is
+what makes guessing hopeless.
 
 **Why a passcode and not Cloudflare Access.** Cloudflare Access could put an
 email one-time-code login in front of the host page, and its free tier covers
@@ -316,6 +321,13 @@ tags the deployed commit.
   passcode; it runs only with *accept_secret_revert* ticked.
 - Without GitHub: dashboard → **Workers & Pages → hompub-quiz → Deployments**
   → the earlier version → **Rollback**.
+- **Rolling back to before Phase 1** (commit `0198fcd…`) also brings back that
+  version's storage rules: it keeps a per-network room-creation counter again
+  (a hash of the date and the host's IP, keyed only if `IP_HASH_KEY` is set, so
+  set it first), and it leaves any wrong-passcode rows from the last 15 minutes
+  in place until the next deploy of Phase 1 deletes them. The privacy page
+  (`apps/hompub-quiz/privacy.html`) describes Phase 1: for a rollback that
+  lasts, put its previous text back too.
 - Static pages roll back with the Worker version.
 
 ### Deploys interrupt live games
@@ -419,11 +431,13 @@ holds it up as follows:
   console output in `src/` is an unexpected-error message from a Room timer,
   which carries no player data and is kept nowhere.
 - **No IPs, no nicknames logged.** The Room stores no IP address, user agent or
-  device detail. IP-derived values: the room-creation counter (a truncated
-  SHA-256 of `<key>|<UTC day>|<host's IP>`, deleted after 48 hours); during a
-  wrong-passcode lockout only, one keyed hash of the network, deleted when the
-  15-minute lockout ends; and the PIN-guess counters, which live in memory
-  only and are never written down.
+  device detail. Creating a room needs the passcode, so the daily room counter
+  is kept for the whole site only, with no IP-derived key (deleted after 48
+  hours). IP-derived values: from the
+  4th wrong passcode from one network, one keyed hash of the network (keyed
+  with `IP_HASH_KEY`, or `SESSION_KEY` without it), deleted by an alarm when
+  its 15 minutes end; and the PIN-guess counters, which live in memory only
+  and are never written down.
 - **The host's session** is an HttpOnly cookie in the host's own browser; the
   server stores no sessions and students get no cookies.
 - **Wipe on ack or TTL.** The room is `deleteAll()`-ed when the host confirms
@@ -484,11 +498,14 @@ holds it up as follows:
   only" are the alternatives, changeable in the lobby (Options). Students can
   change their own name up to three times in the lobby; it switches off at
   Start, and you can switch it on again from Options. You can rename anyone at
-  any time from **All players**, including after End game, so the CSV has the
-  right names.
+  any time from **All players** (in Options, and on the Game over screen), so
+  the CSV has the right names.
 - **Removing a student** keeps their answers so far in the CSV, marked
   `removed`. They could join again under another name unless you lock the
   room: use **Remove and lock**.
+- **"Some students cannot join by typing the PIN"** on the stage means one
+  network sent too many wrong PINs, so typed PINs from it are refused for a few
+  minutes. Ask those students to scan the QR code, which always works.
 - **Several teachers, one school:** hosting needs the passcode, and signed-in
   hosts skip the per-IP cap, so only the whole-site cap of 300 rooms a day
   applies.

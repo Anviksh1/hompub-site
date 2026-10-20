@@ -21,6 +21,7 @@ export const SESSION = {
   ttlMs: 30 * DAY,          // normal sign-in, renewed after half of it has passed
   maxMs: 90 * DAY,          // never renewed past this age
   sharedIdleMs: 4 * HOUR,   // "This is a shared computer": browser-session cookie, idle limit
+  sharedMaxMs: 12 * HOUR,   // ... and never renewed past this age
   hostHeaderMs: 60_000,     // lifetime of the Worker → Room signed host header
 } as const;
 
@@ -151,14 +152,17 @@ export async function readSession(key: CryptoKey, value: string | null, origin: 
   try { s = JSON.parse(new TextDecoder().decode(body)) as Session; } catch { return null; }
   if (!s || s.v !== 1 || typeof s.lib !== 'string' || s.o !== origin) return null;
   if (typeof s.exp !== 'number' || typeof s.iat !== 'number' || s.exp <= now) return null;
-  if (now - s.iat > SESSION.maxMs) return null;
+  if (now - s.iat > (s.sh === 1 ? SESSION.sharedMaxMs : SESSION.maxMs)) return null;
   return s;
 }
 
-/** A renewed session when this one is past half-life (or idle-limited and used), else null. */
+/**
+ * A renewed session when this one is past half-life (or idle-limited and used), else null.
+ * Only call it for real use: for a shared-computer session, renewing is what keeps it alive.
+ */
 export function renewSession(s: Session, now: number): Session | null {
   if (s.sh === 1) {
-    const exp = now + SESSION.sharedIdleMs;
+    const exp = Math.min(now + SESSION.sharedIdleMs, s.iat + SESSION.sharedMaxMs);
     return exp - s.exp > 5 * MINUTE ? { ...s, exp } : null;
   }
   if (s.exp - now > SESSION.ttlMs / 2) return null;
@@ -204,21 +208,28 @@ export function originOkForSession(o: { method: string; upgrade: boolean; origin
 
 // ------------------------------------------------------- signed host header
 
-/** Worker → Room: "this host upgrade carried a valid session for this PIN". Short-lived. */
-export async function signHostHeader(key: CryptoKey, pin: string, now: number): Promise<string> {
+/**
+ * Worker → Room: "this host upgrade carried a valid session for this PIN, which
+ * expires at `sessionExp`". The header itself lives a minute; the Room keeps
+ * `sessionExp` and closes the host socket with 4011 once it has passed.
+ */
+export async function signHostHeader(key: CryptoKey, pin: string, now: number, sessionExp: number): Promise<string> {
   const exp = now + SESSION.hostHeaderMs;
-  return `${exp}.${b64url(await mac(key, `host|${pin}|${exp}`))}`;
+  const sexp = Math.floor(sessionExp);
+  return `${exp}.${sexp}.${b64url(await mac(key, `host|${pin}|${exp}|${sexp}`))}`;
 }
 
-export async function verifyHostHeader(key: CryptoKey, value: string | null, pin: string, now: number): Promise<boolean> {
-  if (!value) return false;
-  const m = /^(\d{13})\.([A-Za-z0-9_-]{43})$/.exec(value);
-  if (!m) return false;
+/** The session expiry the Worker vouched for, or null if the header is missing, stale or forged. */
+export async function verifyHostHeader(key: CryptoKey, value: string | null, pin: string, now: number): Promise<number | null> {
+  if (!value) return null;
+  const m = /^(\d{13})\.(\d{13})\.([A-Za-z0-9_-]{43})$/.exec(value);
+  if (!m) return null;
   const exp = Number(m[1]);
-  if (exp <= now || exp > now + SESSION.hostHeaderMs + 5_000) return false;
-  const sig = fromB64url(m[2]);
-  if (!sig) return false;
-  return crypto.subtle.verify('HMAC', key, sig, enc.encode(`host|${pin}|${exp}`));
+  const sexp = Number(m[2]);
+  if (exp <= now || exp > now + SESSION.hostHeaderMs + 5_000 || sexp <= now) return null;
+  const sig = fromB64url(m[3]);
+  if (!sig) return null;
+  return (await crypto.subtle.verify('HMAC', key, sig, enc.encode(`host|${pin}|${exp}|${sexp}`))) ? sexp : null;
 }
 
 // -------------------------------------------- self-verifying tokens and keys
@@ -306,7 +317,10 @@ export class WindowCounter {
 /**
  * Wrong-passcode limiter: an attempt is reserved before the (async) check and
  * released after it, so parallel requests can never test more than
- * `maxFailures` passcodes per window.
+ * `maxFailures` passcodes per network per window. Counts live in memory; the
+ * caller persists what `settle` reports and hands it back through `restore` /
+ * `restoreFailures` after a restart. There is deliberately no cap across all
+ * networks: one person could then block sign-in for everyone.
  */
 export class AttemptLimiter {
   private failures: WindowCounter;
@@ -332,20 +346,26 @@ export class AttemptLimiter {
     return { ok: true };
   }
 
-  /** Release a reservation. Returns the lockout end if this failure started one. */
-  settle(key: string, success: boolean, now: number): { lockedUntil: number | null; remaining: number } {
+  /** Release a reservation. Returns the lockout end if this failure started one, and the failures now in the window. */
+  settle(key: string, success: boolean, now: number): { lockedUntil: number | null; remaining: number; failures: number } {
     const p = (this.pending.get(key) ?? 1) - 1;
     if (p <= 0) this.pending.delete(key); else this.pending.set(key, p);
-    if (success) { this.failures.clear(key); return { lockedUntil: null, remaining: this.max }; }
+    if (success) { this.failures.clear(key); return { lockedUntil: null, remaining: this.max, failures: 0 }; }
     const n = this.failures.add(key, now);
     if (n >= this.max) {
       const until = now + this.windowMs;
       this.lockedUntil.set(key, until);
-      return { lockedUntil: until, remaining: 0 };
+      return { lockedUntil: until, remaining: 0, failures: n };
     }
-    return { lockedUntil: null, remaining: this.max - n };
+    return { lockedUntil: null, remaining: this.max - n, failures: n };
   }
 
   /** Restore a lockout read back from storage after the object restarted. */
   restore(key: string, until: number): void { this.lockedUntil.set(key, until); }
+
+  /** Restore a saved failure count: `n` failures, counted from `at`. */
+  restoreFailures(key: string, n: number, at: number): void {
+    const have = this.failures.count(key, at);
+    for (let i = have; i < n; i++) this.failures.add(key, at);
+  }
 }

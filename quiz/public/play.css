@@ -197,6 +197,7 @@ p { margin: 0; }
 }
 .pill[data-conn="open"]::before { background: #8adde1; box-shadow: 0 0 6px rgba(138,221,225,0.8); }
 .pill[data-conn="closed"]::before { background: #ff8a80; box-shadow: none; }
+.pill[data-conn="offline"]::before { background: #ff8a80; box-shadow: none; }
 body[data-screen="ended"] .pill,
 body[data-screen="fatal"] .pill,
 body[data-screen="nopin"] .pill { visibility: hidden; }

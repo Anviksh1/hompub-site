@@ -125,9 +125,14 @@ function clientIp(request: Request, env: Env): string {
   return request.headers.get('CF-Connecting-IP') || 'unknown';
 }
 
-/** Keyed hash of the caller's network, for one purpose. Not linked to a day: kept in memory, or for a 15-minute lockout. */
+/**
+ * Keyed hash of the caller's network, for one purpose. Not linked to a day: kept in
+ * memory, or for a 15-minute lockout. Keyed with IP_HASH_KEY, or with SESSION_KEY
+ * (always set when hosting works) if that optional secret is missing, so a stored
+ * value cannot be reversed by trying every IPv4 address.
+ */
 async function ipKey(request: Request, env: Env, purpose: 'auth' | 'pin'): Promise<string> {
-  return (await sha256Hex(`${env.IP_HASH_KEY || ''}|${purpose}|${ipGroup(clientIp(request, env))}`)).slice(0, 32);
+  return (await sha256Hex(`${env.IP_HASH_KEY || env.SESSION_KEY || ''}|${purpose}|${ipGroup(clientIp(request, env))}`)).slice(0, 32);
 }
 
 function minutes(ms: number): number {
@@ -136,18 +141,24 @@ function minutes(ms: number): number {
 
 // --------------------------------------------------------------- sessions
 
-interface SignedIn { session: Session; renewed: string | null }
+/** session: as renewed (if due); held: as the browser's cookie has it; renewed: the Set-Cookie, if any. */
+interface SignedIn { session: Session; held: Session; renewed: string | null }
 
-/** The caller's valid session (renewing it if due), or null. */
-async function signedIn(request: Request, url: URL, env: Env): Promise<SignedIn | null> {
+/**
+ * The caller's valid session (renewing it if due), or null. `passive`: a timer on
+ * the host page, not the teacher, so a shared-computer session is not renewed
+ * and its 4-hour idle limit holds while the tab stays open.
+ */
+async function signedIn(request: Request, url: URL, env: Env, passive = false): Promise<SignedIn | null> {
   if (secretsProblem(env)) return null;
   const now = Date.now();
   const key = await deriveKey(env.SESSION_KEY!, env.HOST_PASSCODE!, 'session');
   const s = await readSession(key, readCookie(request.headers.get('Cookie'), SESSION_COOKIE), url.origin, now);
   if (!s || s.lib !== LIBRARY_ID) return null;
+  if (passive && s.sh === 1) return { session: s, held: s, renewed: null };
   const next = renewSession(s, now);
-  if (!next) return { session: s, renewed: null };
-  return { session: next, renewed: sessionCookie(await signSession(key, next), next, now) };
+  if (!next) return { session: s, held: s, renewed: null };
+  return { session: next, held: s, renewed: sessionCookie(await signSession(key, next), next, now) };
 }
 
 function sessionView(s: Session): object {
@@ -159,7 +170,7 @@ async function handleSession(request: Request, url: URL, env: Env): Promise<Resp
   const problem = secretsProblem(env);
 
   if (request.method === 'GET') {
-    const si = await signedIn(request, url, env);
+    const si = await signedIn(request, url, env, url.searchParams.get('passive') === '1');
     if (!si) return json({ signedIn: false, ...(problem ? { problem, message: MESSAGES[problem] } : {}) });
     return json(sessionView(si.session), 200, si.renewed ? { 'set-cookie': si.renewed } : undefined);
   }
@@ -278,7 +289,7 @@ async function listRooms(request: Request, url: URL, env: Env): Promise<Response
 }
 
 /** GET summary or WebSocket upgrade for one PIN. */
-async function roomRequest(request: Request, url: URL, env: Env, pin: string, wantsSocket: boolean): Promise<Response> {
+async function roomRequest(request: Request, url: URL, env: Env, ctx: ExecutionContext, pin: string, wantsSocket: boolean): Promise<Response> {
   const role = url.searchParams.get('role');
   const v = Number(url.searchParams.get('v')) >= 2 ? 2 : 1;
   const isHost = wantsSocket && role === 'host';
@@ -286,6 +297,7 @@ async function roomRequest(request: Request, url: URL, env: Env, pin: string, wa
   if (!PIN_RE.test(pin)) return notFound();
 
   let library: string | null = null;
+  let sessionExp = 0;
   if (isHost) {
     // A host socket needs a valid session. A page from before protocol 2 cannot sign in at all.
     if (!sessionOrigin(request, url)) return wsReject(4011, 'Sign in again to continue this game.');
@@ -296,6 +308,8 @@ async function roomRequest(request: Request, url: URL, env: Env, pin: string, wa
         : wsReject(4011, 'Sign in again to continue this game.');
     }
     library = si.session.lib;
+    // The cookie's own expiry: a WebSocket response cannot carry a renewed cookie, and a reconnect is not use.
+    sessionExp = si.held.exp;
   }
 
   const keysOk = !secretsProblem(env);
@@ -321,6 +335,11 @@ async function roomRequest(request: Request, url: URL, env: Env, pin: string, wa
     return wantsSocket ? wsReject(1011, 'Try again') : json({ error: 'try_again', message: MESSAGES.try_again }, 503);
   }
   if (found && found.limited) {
+    if (found.notifyRoom) {
+      // Tell the PIN's host, so the teacher can ask students to scan the QR code instead.
+      const notice = env.ROOM.get(env.ROOM.idFromString(found.notifyRoom)).limitNotice(found.retryAfterMs);
+      ctx.waitUntil(notice.catch(() => { /* an older Room during a deploy */ }));
+    }
     const m = minutes(found.retryAfterMs);
     const message = `Too many wrong PINs from this network. Wait ${m} minute${m === 1 ? '' : 's'}, then try again, or scan the QR code.`;
     if (!wantsSocket) return json({ error: 'rate_limited', retryAfter: Math.ceil(found.retryAfterMs / 1000), message }, 429, { 'retry-after': String(Math.ceil(found.retryAfterMs / 1000)) });
@@ -328,13 +347,14 @@ async function roomRequest(request: Request, url: URL, env: Env, pin: string, wa
     return wsReject(v >= 2 ? 4014 : 4010, message);
   }
   if (!found) return notFound();
-  if (isHost && found.library !== library) return notFound();
+  // An older Directory (for a few seconds during a deploy) returns no library: rooms then count as 'main'.
+  if (isHost && (found.library ?? LIBRARY_ID) !== library) return notFound();
 
   const room = env.ROOM.get(env.ROOM.idFromString(found.roomId));
   if (!wantsSocket) {
     const summary = await room.summary();
     if (!summary) return json({ error: 'not_found' }, 404);
-    if (summary.phase === 'ended') { try { await directory(env).noteMiss(pinKey); } catch { /* ignore */ } }
+    if (summary.phase === 'ended' && !bypass) { try { await directory(env).noteMiss(pinKey); } catch { /* ignore */ } }
     return json(summary);
   }
 
@@ -342,13 +362,16 @@ async function roomRequest(request: Request, url: URL, env: Env, pin: string, wa
   const headers = new Headers(request.headers);
   headers.delete('Cookie');
   for (const name of [...headers.keys()]) if (name.toLowerCase().startsWith('x-hq-')) headers.delete(name);
-  headers.set('X-HQ-IpKey', pinKey);
-  if (isHost && keysOk && !(devOn(env) && env.DEV_SKIP_HOST_VOUCH === '1')) headers.set('X-HQ-Host', await signHostHeader(await deriveKey(env.SESSION_KEY!, env.HOST_PASSCODE!, 'host'), pin, Date.now()));
+  // The Room reports an unknown token as a PIN miss; a caller that proved it belongs is not guessing.
+  if (!bypass) headers.set('X-HQ-IpKey', pinKey);
+  if (isHost && keysOk && !(devOn(env) && env.DEV_SKIP_HOST_VOUCH === '1')) {
+    headers.set('X-HQ-Host', await signHostHeader(await deriveKey(env.SESSION_KEY!, env.HOST_PASSCODE!, 'host'), pin, Date.now(), sessionExp));
+  }
   return room.fetch(new Request(request.url, { method: 'GET', headers }));
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (!url.pathname.startsWith('/api/')) return env.ASSETS.fetch(request);
     if (!originAllowed(request, url, env)) return json({ error: 'forbidden_origin' }, 403);
@@ -367,7 +390,7 @@ export default {
       const wantsSocket = m[2] === '/ws';
       if (wantsSocket && !isUpgrade(request)) return new Response('Expected WebSocket upgrade', { status: 426 });
       if (!wantsSocket && request.method !== 'GET') return json({ error: 'method_not_allowed' }, 405);
-      return roomRequest(request, url, env, m[1], wantsSocket);
+      return roomRequest(request, url, env, ctx, m[1], wantsSocket);
     }
 
     return json({ error: 'not_found' }, 404);

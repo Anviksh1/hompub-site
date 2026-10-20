@@ -74,31 +74,55 @@ jobs:
       VERSION_ID: ${{ inputs.version_id }}
       ACCEPT_SECRET_REVERT: ${{ inputs.accept_secret_revert }}
       REASON: ${{ inputs.reason }}
+    # bash -eo pipefail: a failing `wrangler … | tee` fails the step instead of passing.
+    defaults:
+      run:
+        shell: bash
     steps:
+      # Each input is matched as a whole string ([[ =~ ]], not grep, which passes when
+      # any one line matches), and nothing typed in goes into $GITHUB_ENV.
       - name: Check the inputs
+        id: pick
         run: |
-          set -eu
+          set -u
+          tag_re='^quiz-phase-[0-9]+([.][0-9]+)?$'
+          ref_re='^(quiz-phase-[0-9]+([.][0-9]+)?|[0-9a-f]{40})$'
+          uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          reason_re='^[A-Za-z0-9][A-Za-z0-9 .,:()_/-]{0,99}$'
           case "$ACTION" in
             deploy)
               if [ "$GITHUB_REF" != "refs/heads/main" ]; then echo "::error::Run this from main."; exit 1; fi
-              echo "$RELEASE_TAG" | grep -Eq '^quiz-phase-[0-9]+(\.[0-9]+)?$' || { echo "::error::release_tag must look like quiz-phase-1"; exit 1; }
-              echo "CHECKOUT_REF=$GITHUB_SHA" >> "$GITHUB_ENV" ;;
+              [[ $RELEASE_TAG =~ $tag_re ]] || { echo "::error::release_tag must look like quiz-phase-1"; exit 1; }
+              echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT" ;;
             redeploy-ref)
-              echo "$REF_INPUT" | grep -Eq '^(quiz-phase-[0-9]+(\.[0-9]+)?|[0-9a-f]{40})$' || { echo "::error::ref must be a quiz-phase-N tag or a 40-character commit id"; exit 1; }
-              echo "CHECKOUT_REF=$REF_INPUT" >> "$GITHUB_ENV" ;;
+              [[ $REF_INPUT =~ $ref_re ]] || { echo "::error::ref must be a quiz-phase-N tag or a 40-character commit id"; exit 1; }
+              echo "ref=$REF_INPUT" >> "$GITHUB_OUTPUT" ;;
             rollback-version)
-              echo "$VERSION_ID" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' || { echo "::error::version_id must be a UUID"; exit 1; }
+              [[ $VERSION_ID =~ $uuid_re ]] || { echo "::error::version_id must be a UUID"; exit 1; }
               if [ "$ACCEPT_SECRET_REVERT" != "true" ]; then echo "::error::Tick accept_secret_revert, or use redeploy-ref, which keeps current secrets."; exit 1; fi
-              echo "CHECKOUT_REF=$GITHUB_SHA" >> "$GITHUB_ENV" ;;
+              echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT" ;;
             *) echo "::error::Unknown action"; exit 1 ;;
           esac
-          printf '%s' "$REASON" | grep -Eq '^[A-Za-z0-9 .,:()_/-]{1,100}$' || { echo "::error::reason may use letters, digits, spaces and . , : ( ) _ / - only (100 max)"; exit 1; }
+          [[ $REASON =~ $reason_re ]] || { echo "::error::reason must start with a letter or digit and may use letters, digits, spaces and . , : ( ) _ / - (100 max)"; exit 1; }
 
+      # No credentials are left in .git/config, so npm install and test scripts cannot
+      # use this job's write token. The tag is created through the API further down.
       - name: Check out the code to deploy
         uses: actions/checkout@v5
         with:
-          ref: ${{ env.CHECKOUT_REF }}
+          ref: ${{ steps.pick.outputs.ref }}
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the commit is on main
+        run: |
+          set -u
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::$(git rev-parse HEAD) is not on main. Only code that is on main can go to production."; exit 1
+          fi
+          if [ "$ACTION" = "deploy" ] && git rev-parse -q --verify "refs/tags/$RELEASE_TAG" >/dev/null; then
+            echo "::error::The tag $RELEASE_TAG already exists. Pick the next number."; exit 1
+          fi
 
       - name: Set up Node 22
         uses: actions/setup-node@v5
@@ -119,22 +143,25 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CHECKOUT_REF: ${{ steps.pick.outputs.ref }}
         run: |
-          set -eu
+          set -u
           if [ "$ACTION" = "rollback-version" ]; then
-            npx wrangler rollback "$VERSION_ID" --durable-objects-code-update-mode immediate -m "$REASON" -y 2>&1 | tee ../wrangler-out.txt
+            npx wrangler rollback "$VERSION_ID" --durable-objects-code-update-mode immediate --message="$REASON" -y 2>&1 | tee ../wrangler-out.txt
+            if ! grep -q "Current Version ID: $VERSION_ID" ../wrangler-out.txt; then echo "::error::Wrangler did not confirm the rollback to $VERSION_ID; check the log above."; exit 1; fi
             echo "Rolled back to $VERSION_ID. Secrets are those of that version: re-set any secret rotated since." >> "$GITHUB_STEP_SUMMARY"
           else
-            npx wrangler deploy --durable-objects-code-update-mode immediate --message "$REASON" 2>&1 | tee ../wrangler-out.txt
+            npx wrangler deploy --durable-objects-code-update-mode immediate --message="$REASON" 2>&1 | tee ../wrangler-out.txt
             VID=$(grep -Eo 'Current Version ID: [0-9a-f-]{36}' ../wrangler-out.txt | awk '{print $4}' || true)
-            echo "Deployed $CHECKOUT_REF. Version id: ${VID:-see log}" >> "$GITHUB_STEP_SUMMARY"
+            if [ -z "$VID" ]; then echo "::error::Wrangler printed no version id; check the log above before trusting this deploy."; exit 1; fi
+            echo "Deployed $CHECKOUT_REF. Version id: $VID" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Tag the deployed commit
         if: env.ACTION == 'deploy'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -eu
-          git config user.name "github-actions"
-          git config user.email "github-actions@users.noreply.github.com"
-          git tag -a "$RELEASE_TAG" -m "Deployed to production: $REASON" "$GITHUB_SHA"
-          git push origin "refs/tags/$RELEASE_TAG"
+          set -u
+          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$RELEASE_TAG" -f sha="$GITHUB_SHA" >/dev/null
+          echo "Tagged $GITHUB_SHA as $RELEASE_TAG." >> "$GITHUB_STEP_SUMMARY"

@@ -147,9 +147,10 @@ export function mergeSettings(base: Settings, patch: unknown, inLobby: boolean):
 /**
  * Fill in fields a stored settings object may lack. A room created before
  * nameMode existed had a Spin button next to the name box, so its 'free' means
- * 'either'.
+ * 'either'. A room stored before allowRename existed gets it on only while it is
+ * still in the lobby (`phase`), because Start switches it off.
  */
-export function normalizeSettings(raw: unknown): Settings {
+export function normalizeSettings(raw: unknown, phase?: Phase): Settings {
   const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
   const out: Settings = { ...DEFAULT_SETTINGS };
   if (r.mode === 'speed' || r.mode === 'accuracy' || r.mode === 'coarse') out.mode = r.mode;
@@ -157,6 +158,7 @@ export function normalizeSettings(raw: unknown): Settings {
   if (typeof r.lateJoin === 'boolean') out.lateJoin = r.lateJoin;
   if (typeof r.earlyClose === 'boolean') out.earlyClose = r.earlyClose;
   if (typeof r.allowRename === 'boolean') out.allowRename = r.allowRename;
+  else if (phase !== undefined) out.allowRename = phase === 'lobby';
   if (r.nameMode === 'typed' || r.nameMode === 'either' || r.nameMode === 'random') out.nameMode = r.nameMode;
   else if (r.nicknameMode === 'spin') out.nameMode = 'random';
   else if (r.nicknameMode === 'free') out.nameMode = 'either';
@@ -200,12 +202,21 @@ export function spinName(): string {
   return `${a} ${b}`;
 }
 
-/** Trim, strip control characters, collapse whitespace, cap length. May return ''. */
+/**
+ * Invisible characters: format characters (soft hyphen, word joiner, zero-width
+ * joiners, bidi controls, tags) and other default-ignorable code points such as
+ * the Hangul filler. Stripped so the name shown is the name the filter checks.
+ * Emoji variation selectors (U+FE0E, U+FE0F) are kept.
+ */
+const INVISIBLE_RE = /(?![\uFE0E\uFE0F])[\p{Cf}\p{Default_Ignorable_Code_Point}]/gu;
+
+/** Trim, strip control and invisible characters, collapse whitespace, cap length. May return ''. */
 export function sanitizeNick(raw: unknown): string {
   if (typeof raw !== 'string') return '';
   // eslint-disable-next-line no-control-regex
   const cleaned = raw
     .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202f\ufeff]/g, '')
+    .replace(INVISIBLE_RE, '')
     .replace(/\s+/g, ' ')
     .replace(/^[=+\-@]+/, '') // a name may not start with a spreadsheet formula trigger
     .trim();
@@ -236,7 +247,7 @@ function deleet(text: string): string {
 
 /** Words of a name as the filter sees them: accents folded, leetspeak undone, single letters joined. */
 export function nameWords(nick: string): string[] {
-  const norm = deleet(nick.normalize('NFD').replace(/\p{M}/gu, ''));
+  const norm = deleet(nick.normalize('NFD').replace(/\p{M}/gu, '').replace(INVISIBLE_RE, ''));
   const words: string[] = [];
   let run = '';
   for (const w of norm.split(/[^a-z]+/).filter(Boolean)) {
@@ -254,7 +265,7 @@ export function isProfane(nick: string): boolean {
 
 // ------------------------------------------------------------ name choices
 
-export interface NameNote { reason: 'duplicate' | 'stripped' | 'shortened'; message: string }
+export interface NameNote { reason: 'duplicate' | 'stripped' | 'shortened' | 'random'; message: string }
 
 export const NAME_MESSAGES = {
   empty: 'Type your name to join.',
@@ -279,7 +290,8 @@ function typedNote(raw: unknown, clean: string): NameNote | null {
 }
 
 export type JoinName =
-  | { kind: 'random' }
+  /** replaced: a version-2 page typed a name, but this game gives random names only (the phone is told why). */
+  | { kind: 'random'; replaced?: boolean }
   | { kind: 'typed'; nick: string; note: NameNote | null }
   | { kind: 'reject'; reason: 'empty' | 'filtered' | 'random_off'; message: string };
 
@@ -289,7 +301,7 @@ export type JoinName =
  * becomes a spun one. A version-2 page is told why instead.
  */
 export function joinName(i: { nameMode: NameMode; v2: boolean; nick: unknown; spin: boolean }): JoinName {
-  if (i.nameMode === 'random') return { kind: 'random' };
+  if (i.nameMode === 'random') return i.v2 && !i.spin && sanitizeNick(i.nick) ? { kind: 'random', replaced: true } : { kind: 'random' };
   if (i.spin) {
     if (i.v2 && i.nameMode === 'typed') return { kind: 'reject', reason: 'random_off', message: NAME_MESSAGES.random_off };
     return { kind: 'random' };

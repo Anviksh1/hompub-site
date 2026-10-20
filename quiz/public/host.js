@@ -83,6 +83,7 @@ const STAGE_PHASES = new Set(['connecting', 'lobby', 'intro', 'open', 'closed', 
 const RING_R = 54;
 const RING_C = 2 * Math.PI * RING_R;
 const SHORTCUT_MUTE_MS = 500;   // Space/Enter stay quiet this long after a rebuild dropped focus to <body>
+const SESSION_CHECK_MS = 20 * 60 * 1000;   // how often the open page checks (and renews) its sign-in
 const NOT_SAVED_MSG = 'Not saved — this browser is blocking storage. Export your quiz to keep it.';
 // "Import Word or text" / "Paste questions" (section 4a-ii). The parsing itself lives in import-text.js
 // (window.HomPubImport); the file is read in this browser and never sent anywhere.
@@ -332,7 +333,7 @@ const state = {
   auth: { status: 'checking', shared: false, problem: '', message: '', busy: false, error: '' },
   liveRooms: [],           // this library's live games, from GET /api/rooms (resume on another device)
   reauth: false,           // the host socket closed with 4011: sign in again over the stage, then reconnect
-  panel: null,             // "All players" panel: null | {q: search text, editPid: pid being renamed}
+  panel: null,             // "All players" panel: null | {q: search text, editPid: pid being renamed, draft: the name being typed}
   serverNote: '',          // '' | 'old' (server rolled back to before protocol 2) | 'new' (a newer protocol)
   storageError: '',        // the server could not save (daily limit): shown until the page is reloaded
   pending: null,           // {action, at}: a start/close/next/end that was sent and awaits the next phase frame
@@ -341,12 +342,16 @@ const state = {
   autoResume: false,       // this connection was opened automatically on page load
   urlTokenTried: false,    // after a 4001 on the first-frame token, try the URL form once (older servers)
   keyNotSaved: false,      // the host key could not be stored: resuming must happen from another device
+  limitedUntil: 0,         // server time until which some students cannot join by typing the PIN (`notice` pin_limited)
   prefs: {
     highContrast: !!storedPrefs.highContrast,
     settings: prefSettings(storedPrefs.settings),
   },
 };
 let passcodeDraft = '';   // the passcode being typed survives a re-render; cleared after sign-in
+let sharedDraft = false;  // the "shared computer" box, likewise (a retry after a typo must not lose it)
+let usedSinceCheck = true;  // a key or click since the last session check: only real use renews a shared-computer session
+let silentReauthAt = 0;   // last time a 4011 was answered by reconnecting with a still-valid session
 let socket = null;        // reconnect wrapper (section 7)
 let clockOffset = 0;      // serverNow - Date.now(), refreshed by every frame that carries serverNow
 let wakeLock = null;
@@ -452,7 +457,37 @@ function scheduleRender() {
 function screenSig() {
   const g = state.game;
   return [currentPhase(), g ? g.q : '', state.reauth, !!state.panel, state.serverNote, state.storageError,
-    g ? !!g.locked : '', state.pending ? state.pending.action : '', expiryVisible(g)].join('|');
+    g ? !!g.locked : '', state.pending ? state.pending.action : '', expiryVisible(g), limitVisible()].join('|');
+}
+// Update a list of keyed nodes (every node has an id) in place: unchanged nodes are kept, never
+// moved or rebuilt, so the button under the pointer and the focused one survive a roster burst.
+function patchKeyed(list, nodes, fallbackId) {
+  const active = document.activeElement;
+  const focusedId = active && list.contains(active) ? active.id : '';
+  const old = new Map();
+  for (const c of Array.from(list.children)) if (c.id) old.set(c.id, c);
+  const keep = new Set();
+  let cursor = list.firstElementChild;
+  for (const n of nodes) {
+    const prev = n.id ? old.get(n.id) : null;
+    if (prev && prev.isEqualNode(n)) {
+      keep.add(prev);
+      if (prev === cursor) cursor = cursor.nextElementSibling;
+      else list.insertBefore(prev, cursor);
+      continue;
+    }
+    if (prev && prev === cursor) { list.replaceChild(n, prev); cursor = n.nextElementSibling; }
+    else list.insertBefore(n, cursor);
+    keep.add(n);
+  }
+  for (const c of Array.from(list.children)) if (!keep.has(c)) c.remove();
+  if (focusedId && document.activeElement !== $(focusedId)) {
+    // The focused item may have left the list (a chip pushed out of the newest 30): never leave
+    // focus on <body>, where Space or Enter would be the stage's main action.
+    const el = $(focusedId) || (fallbackId ? $(fallbackId) : null);
+    if (el) { try { el.focus({ preventScroll: true }); } catch (e) { /* ignore */ } }
+    if (!el || document.activeElement !== el) shortcutMuteUntil = Date.now() + SHORTCUT_MUTE_MS;
+  }
 }
 function patchStage() {
   const g = state.game;
@@ -471,12 +506,13 @@ function patchStage() {
     const text = answeredText(g.tally);
     if (first && first.nodeType === 3) { if (first.nodeValue !== text) first.nodeValue = text; } else return false;
   }
+  set('players-open-ended', `All players (${count})`);
   const recent = $('lobby-recent');
-  if (recent) recent.replaceChildren(...recentChips(g));
+  if (recent) patchKeyed(recent, recentChips(g), 'players-open-lobby');
   const empty = $('lobby-empty');
   if (empty) empty.hidden = count > 0;
   const list = $('players-list');
-  if (list && !(state.panel && state.panel.editPid)) list.replaceChildren(...playerRows());
+  if (list && !(state.panel && state.panel.editPid)) patchKeyed(list, playerRows(), 'players-search');
   return true;
 }
 function refresh() { if (!patchStage()) scheduleRender(); }
@@ -536,7 +572,7 @@ function renderSignIn(title, opts) {
           h('label', { class: 'field-label', for: 'passcode' }, 'Host passcode'),
           h('input', { type: 'password', id: 'passcode', 'data-field': 'passcode', autocomplete: 'current-password', maxlength: 512, value: passcodeDraft, required: true }),
           h('label', { class: 'check' },
-            h('input', { type: 'checkbox', id: 'signin-shared' }),
+            h('input', { type: 'checkbox', id: 'signin-shared', 'data-field': 'signin-shared', checked: sharedDraft }),
             h('span', null, 'This is a shared computer — sign me out when the browser closes')),
           a.error && h('p', { class: 'notice bad', role: 'alert', id: 'signin-error' }, a.error),
           h('div', { class: 'btn-row' },
@@ -853,7 +889,10 @@ function stageFrame(body, controls, hint, opts) {
   const o = opts || {};
   if (state.reauth) {
     // The host socket closed with 4011 (session expired). The game keeps running on the server.
-    return h('div', { class: 'stage' }, renderStageHead(g), h('section', { class: 'stage-body' }, renderSignIn(`Sign in to continue game ${g.pin || ''}`, { stage: true })));
+    // A results file this page holds stays downloadable (it may be the only copy).
+    return h('div', { class: 'stage' }, renderStageHead(g), h('section', { class: 'stage-body' },
+      renderSignIn(`Sign in to continue game ${g.pin || ''}`, { stage: true }),
+      heldResults(g) && !gameWasCancelled(g) ? h('div', { class: 'center-card' }, finalScreenResults(g)) : null));
   }
   const ctl = controls && controls.length
     ? h('div', { class: 'controls' }, hint ? h('span', { class: 'hint' }, hint) : null, controls.map(stableControlId))
@@ -870,8 +909,10 @@ function stageFrame(body, controls, hint, opts) {
 // Idle-wipe warning (P0-67), a failed save (daily limit), and a server/page version mismatch.
 function expiryVisible(g) {
   const e = g && g.expiry;
-  return !!(e && e.wipeAt && e.warnAt && serverNow() >= e.warnAt && g.phase !== 'ended');
+  const now = serverNow();
+  return !!(e && e.wipeAt && e.warnAt && now >= e.warnAt && now < e.wipeAt + 60000 && g.phase !== 'ended');
 }
+function limitVisible() { return !!state.game && state.limitedUntil > serverNow() && state.game.phase !== 'ended'; }
 function renderStageBanners(g) {
   const out = [];
   if (state.storageError) out.push(h('div', { class: 'stage-banner bad', role: 'alert' }, state.storageError));
@@ -879,6 +920,11 @@ function renderStageBanners(g) {
     out.push(h('div', { class: 'stage-banner warn', role: 'alert', id: 'expiry' },
       h('span', null, `Nothing has happened for a while, so the server will delete this game and its results at ${fmtClock(g.expiry.wipeAt)}.`),
       btn('Keep 2 more hours', 'keep', { cls: 'primary', attrs: { id: 'keep-btn' } })));
+  }
+  if (limitVisible()) {
+    const m = Math.max(1, Math.ceil((state.limitedUntil - serverNow()) / 60000));
+    out.push(h('div', { class: 'stage-banner warn', role: 'status', id: 'pin-limited' },
+      `Some students cannot join by typing the PIN: too many wrong PINs came from their network. Ask them to scan the QR code (about ${m} minute${m === 1 ? '' : 's'} left).`));
   }
   if (state.serverNote) out.push(h('div', { class: 'stage-banner warn', role: 'status' },
     state.serverNote === 'old' ? 'The server is running an older version. Reload this page between questions.' : 'A newer version of this page is ready. Reload it after the game.'));
@@ -918,7 +964,7 @@ function renderStageMenu(g) {
       toggle('g-showOnDevices', !!s.showOnDevices, 'Show question on phones', 'Off: phones show only the four shapes.'),
       toggle('g-lateJoin', !!s.lateJoin, 'Allow late joiners', null),
       toggle('g-lock', !!g.locked, 'Lock room', 'No new players; reconnects still work.'),
-      toggle('g-allowRename', s.allowRename !== false, 'Students can change their name', inLobby ? 'Switches off when you press Start.' : 'Lets students fix their name now.'),
+      state.serverNote === 'old' ? null : toggle('g-allowRename', s.allowRename !== false, 'Students can change their name', inLobby ? 'Switches off when you press Start.' : 'Lets students fix their name now.'),
       inLobby ? [
         h('hr'),
         h('label', { class: 'field-label', for: 'g-mode' }, 'Scoring'),
@@ -1015,27 +1061,33 @@ function renderPlayersPanel() {
       btn('Close', 'players-close', { cls: 'ghost', attrs: { id: 'players-close' } })),
     h('input', { type: 'search', id: 'players-search', 'data-field': 'players-search', placeholder: 'Search names', 'aria-label': 'Search players', value: state.panel.q || '', autocomplete: 'off' }),
     h('ul', { class: 'players-list', id: 'players-list' }, playerRows()),
-    h('p', { class: 'fine' }, 'Removed players cannot answer any more. Their answers so far stay in the results file, marked “removed”. They could join again under another name unless the room is locked.'));
+    h('p', { class: 'fine' }, g.phase === 'ended'
+      ? 'A new name goes into the results file at once; download it again afterwards.'
+      : 'Removed players cannot answer any more. Their answers so far stay in the results file, marked “removed”. They could join again under another name unless the room is locked.'));
 }
 
 function playerRows() {
   const g = state.game;
   const q = (state.panel && state.panel.q || '').trim().toLowerCase();
   const roster = (Array.isArray(g.roster) ? g.roster : []).filter((p) => !q || String(p.nick).toLowerCase().includes(q));
-  if (!roster.length) return [h('li', { class: 'empty' }, q ? 'No player matches that search.' : 'No players yet.')];
+  if (!roster.length) return [h('li', { class: 'empty', id: 'row-empty' }, q ? 'No player matches that search.' : 'No players yet.')];
+  // After End only names can still change (the results file follows); an older server cannot rename or lock.
+  const ended = g.phase === 'ended';
+  const old = state.serverNote === 'old';
   return roster.map((p) => {
     if (state.panel.editPid === p.pid) {
-      return h('li', { class: 'editing' },
+      const draft = typeof state.panel.draft === 'string' ? state.panel.draft : p.nick;
+      return h('li', { class: 'editing', id: 'row-edit-' + p.pid },
         h('label', { class: 'sr-only', for: 'rename-input' }, `New name for ${p.nick}`),
-        h('input', { type: 'text', id: 'rename-input', value: p.nick, maxlength: 20, 'data-pid': p.pid, autocomplete: 'off' }),
+        h('input', { type: 'text', id: 'rename-input', 'data-field': 'rename-draft', value: draft, maxlength: 20, 'data-pid': p.pid, autocomplete: 'off' }),
         btn('Save', 'rename-save', { cls: 'primary small', attrs: { 'data-pid': p.pid } }),
         btn('Cancel', 'rename-cancel', { cls: 'ghost small' }));
     }
-    return h('li', null,
+    return h('li', { id: 'row-' + p.pid },
       h('span', { class: 'nick' + (p.connected === false ? ' offline' : '') }, p.nick, p.connected === false ? ' (offline)' : ''),
-      btn('Rename', 'rename-start', { cls: 'small', attrs: { 'data-pid': p.pid, id: 'rename-' + p.pid, 'aria-label': `Rename ${p.nick}` } }),
-      btn('Remove', 'kick', { cls: 'small danger', attrs: { 'data-pid': p.pid, 'data-nick': p.nick, id: 'kick-' + p.pid, 'aria-label': `Remove ${p.nick}` } }),
-      btn('Remove and lock', 'kick-lock', { cls: 'small danger', attrs: { 'data-pid': p.pid, 'data-nick': p.nick, 'aria-label': `Remove ${p.nick} and lock the room` } }));
+      old ? null : btn('Rename', 'rename-start', { cls: 'small', attrs: { 'data-pid': p.pid, id: 'rename-' + p.pid, 'aria-label': `Rename ${p.nick}` } }),
+      ended ? null : btn('Remove', 'kick', { cls: 'small danger', attrs: { 'data-pid': p.pid, 'data-nick': p.nick, id: 'kick-' + p.pid, 'aria-label': `Remove ${p.nick}` } }),
+      ended || old ? null : btn('Remove and lock', 'kick-lock', { cls: 'small danger', attrs: { 'data-pid': p.pid, 'data-nick': p.nick, id: 'kicklock-' + p.pid, 'aria-label': `Remove ${p.nick} and lock the room` } }));
   });
 }
 
@@ -1226,7 +1278,8 @@ function renderEnded() {
       r ? [
         h('p', null, 'The results file ', h('b', { class: 'mono' }, r.filename), resultsStatus(r)),
         h('p', { class: 'fine' }, 'It is the only copy. Once you confirm below, nothing about this game remains on the server. The phones already show “Game over”.'),
-        h('div', { class: 'btn-row' }, downloadButton(r)),
+        h('div', { class: 'btn-row' }, downloadButton(r),
+          state.serverNote === 'old' ? null : btn(`All players (${g.playerCount | 0})`, 'players-open', { attrs: { id: 'players-open-ended' } })),
         h('div', { class: 'btn-row' }, btn('I have the results — wipe the game', 'ack', { cls: 'primary big' })),
         state.auth.status === 'in' ? h('div', { class: 'btn-row' }, h('button', { type: 'button', class: 'link-btn', 'data-action': 'sign-out' }, 'Sign out on this device')) : null,
       ] : [
@@ -1441,9 +1494,14 @@ const actions = {
     send({ t: 'kick', pid: d.pid, lock: true });
   },
   'players-open'() { state.panel = { q: '', editPid: null }; render(); focusLater('players-search'); },
-  'players-close'() { state.panel = null; render(); focusLater('players-open-lobby') || focusLater('stage-menu-summary'); },
-  'rename-start'(d) { if (!state.panel) return; state.panel.editPid = d.pid; render(); focusLater('rename-input', true); },
-  'rename-cancel'() { if (!state.panel) return; const pid = state.panel.editPid; state.panel.editPid = null; render(); focusLater('rename-' + pid); },
+  'players-close'() { state.panel = null; render(); focusLater('players-open-lobby') || focusLater('players-open-ended') || focusLater('stage-menu-summary'); },
+  'rename-start'(d) {
+    if (!state.panel) return;
+    const p = ((state.game && state.game.roster) || []).find((x) => x.pid === d.pid);
+    state.panel.editPid = d.pid; state.panel.draft = p ? p.nick : '';
+    render(); focusLater('rename-input', true);
+  },
+  'rename-cancel'() { if (!state.panel) return; const pid = state.panel.editPid; state.panel.editPid = null; state.panel.draft = null; render(); focusLater('rename-' + pid); },
   'rename-save'(d) { saveRename(d.pid); },
   keep() { send({ t: 'keep' }); },
   'toggle-lock'() { if (state.game) setLock(!state.game.locked); },
@@ -1459,7 +1517,12 @@ const actions = {
     send({ t: 'ack_results' });
   },
   'ack-cancelled'() { send({ t: 'ack_results' }); },          // nothing was played, so nothing to confirm
-  leave() { leaveGame(); },
+  leave() {
+    const g = state.game;
+    const r = heldResults(g);
+    if (r && !r.downloaded && !gameWasCancelled(g) && !window.confirm('The results file has not been downloaded, and this page holds the only copy. Leave anyway?')) return;
+    leaveGame();
+  },
   'toggle-contrast'() { toggleContrast(); },
   'toggle-fullscreen'() { toggleFullscreen(); },
 };
@@ -1497,6 +1560,7 @@ document.addEventListener('input', (e) => {
   else if (f === 'q-text') editQuiz((q) => { const qq = q.questions[+el.dataset.q]; if (qq) qq.text = el.value; });
   else if (f === 'opt') editQuiz((q) => { const qq = q.questions[+el.dataset.q]; if (qq) qq.options[+el.dataset.i] = el.value; });
   else if (f === 'passcode') { passcodeDraft = el.value; }
+  else if (f === 'rename-draft') { if (state.panel) state.panel.draft = el.value; }
   else if (f === 'players-search') {
     if (!state.panel) return;
     state.panel.q = el.value;
@@ -1532,6 +1596,7 @@ document.addEventListener('change', (e) => {
     case 'g-mode': if (MODES_IDS.includes(el.value)) updateSettings({ mode: el.value }); break;
     case 'g-nameMode': if (NAME_MODES.some((m) => m.id === el.value)) updateSettings({ nameMode: el.value, nicknameMode: legacyNick(el.value) }); break;
     case 'g-lock': setLock(!!el.checked); break;
+    case 'signin-shared': sharedDraft = !!el.checked; break;
     default: break;
   }
 });
@@ -1750,10 +1815,11 @@ function checkNetwork() {
 
 /* ---------- sign-in (PROTOCOL §11) ---------- */
 
-async function checkSession() {
+// `passive`: asked by the page itself, not by the teacher (see keepSessionAlive).
+async function checkSession(passive) {
   let res, body = null;
   try {
-    res = await fetch('/api/session', { cache: 'no-store' });
+    res = await fetch('/api/session' + (passive ? '?passive=1' : ''), { cache: 'no-store' });
     try { body = await res.json(); } catch (e) { body = null; }
   } catch (e) {
     state.auth = Object.assign({}, state.auth, { status: 'offline' });
@@ -1769,7 +1835,8 @@ async function checkSession() {
 
 async function signIn() {
   const pass = passcodeDraft || (($('passcode') || {}).value || '');
-  const shared = !!(($('signin-shared') || {}).checked);
+  const box = $('signin-shared');
+  const shared = box ? !!box.checked : sharedDraft;
   if (!pass) { state.auth.error = 'Type the host passcode.'; render(); focusLater('passcode'); return; }
   state.auth.busy = true; state.auth.error = ''; render();
   let res, body = null;
@@ -1784,6 +1851,7 @@ async function signIn() {
   state.auth.busy = false;
   if (res.ok && body && body.signedIn) {
     passcodeDraft = '';
+    sharedDraft = false;
     state.auth = { status: 'in', shared: !!body.shared, busy: false, error: '', problem: '', message: '' };
     toast(body.shared ? 'Signed in until this browser closes.' : 'Signed in on this device.');
     afterSignIn();
@@ -1808,12 +1876,49 @@ function afterSignIn() {
   render();
 }
 
+// Signing out leaves nothing of the game on this screen for the next person at the computer. The
+// game itself keeps running on the server; signing in again (here or elsewhere) resumes it.
 async function signOut() {
-  try { await fetch('/api/session', { method: 'DELETE' }); } catch (e) { /* the cookie is HttpOnly: only the server can clear it */ }
+  const g = state.game;
+  const r = heldResults(g);
+  if (r && !r.downloaded && !gameWasCancelled(g) && !window.confirm('The results file has not been downloaded, and this page holds the only copy. Sign out anyway?')) return;
+  // The cookie is HttpOnly: only the server can clear it, so a failed request means still signed in.
+  let ok = false;
+  try { ok = (await fetch('/api/session', { method: 'DELETE' })).ok; } catch (e) { ok = false; }
+  if (!ok) {
+    toast('Could not reach the server, so you are still signed in on this computer. Try again, or close the browser.', 10000);
+    return;
+  }
+  forgetGameScreen();
   state.auth = { status: 'out', shared: false, busy: false, error: '', problem: '', message: '' };
   state.liveRooms = [];
   toast('Signed out on this device.');
   render();
+}
+function forgetGameScreen() {
+  if (socket) { socket.close(); socket = null; }
+  state.game = null; state.results = null; state.closeInfo = null; state.wiped = false; state.reauth = false;
+  state.panel = null; state.pending = null; state.autoResume = false; state.storageError = ''; state.limitedUntil = 0;
+  state.screen = 'home';
+  qrCache = null;
+  releaseWakeLock();
+  setConn('idle');
+}
+// The session ended while this page was open. A shared computer forgets the game screen, as on
+// sign-out; on the teacher's own device the stage asks for the passcode and keeps a held results file.
+function sessionLost(wasShared) {
+  const shared = typeof wasShared === 'boolean' ? wasShared : state.auth.shared;
+  state.auth = { status: 'out', shared: false, busy: false, error: '', problem: '', message: '' };
+  if (shared || !state.game) {
+    if (state.game) toast('Signed out: this shared computer was not used for a while.', 7000);
+    forgetGameScreen();
+    render();
+    return;
+  }
+  if (socket) { socket.close(); socket = null; }
+  state.reauth = true;
+  render();
+  focusLater('passcode');
 }
 
 async function loadLiveRooms() {
@@ -1827,12 +1932,27 @@ async function loadLiveRooms() {
   if (!state.game) render();
 }
 
-// GET /api/session renews the cookie when it is due; a shared-computer session renews on use only.
+// GET /api/session renews the cookie when it is due. A shared-computer session renews on use only,
+// so without a key or click since the last check this asks with ?passive=1, which does not renew it.
 function keepSessionAlive() {
   if (state.auth.status !== 'in') return;
-  fetch('/api/session', { cache: 'no-store' }).then((r) => r.json()).then((b) => {
-    if (b && b.signedIn === false && state.auth.status === 'in') { state.auth.status = 'out'; if (!isLive()) render(); }
+  const passive = !usedSinceCheck;
+  usedSinceCheck = false;
+  fetch('/api/session' + (passive ? '?passive=1' : ''), { cache: 'no-store' }).then((r) => r.json()).then((b) => {
+    if (b && b.signedIn === false && state.auth.status === 'in') sessionLost();
   }).catch(() => { /* offline: try again later */ });
+}
+// The first session check failed (offline): try again when the network or the tab comes back.
+// Only the quiz list resumes a game on its own; elsewhere the Resume card appears instead.
+function retrySessionCheck() {
+  if (state.auth.status !== 'offline') return;
+  const passive = !usedSinceCheck;
+  usedSinceCheck = false;
+  checkSession(passive).then(() => {
+    if (state.screen === 'home' && !state.importer) sessionReady();
+    else if (state.auth.status === 'in') { loadLiveRooms(); render(); }
+    else render();
+  });
 }
 
 function focusLater(id, select) {
@@ -1895,7 +2015,7 @@ function connectHost(key, keepFallback) {
   if (!keepFallback) state.urlTokenTried = false;
   state.game = { pin: key.pin, title: key.title || '', hostToken: key.hostToken };   // minimal until the first sync
   state.closeInfo = null; state.wiped = false; state.busy = false; state.error = null; state.reauth = false;
-  state.pending = null; state.storageError = ''; state.panel = null;
+  state.pending = null; state.storageError = ''; state.panel = null; state.limitedUntil = 0;
   if (state.results && state.results.pin !== key.pin) state.results = null;
   qrCache = null;
   const urlFor = () => {
@@ -2007,6 +2127,12 @@ function applyFrame(f) {
       g.expiry = { wipeAt: f.wipeAt || null, warnAt: f.warnAt || null };
       if (g.expiry.warnAt) wakeAt(g.expiry.warnAt);
       break;
+    case 'notice':
+      if (f.code === 'pin_limited' && typeof f.retryAfterMs === 'number') {
+        state.limitedUntil = serverNow() + Math.min(f.retryAfterMs, 3600000);
+        wakeAt(state.limitedUntil);
+      }
+      break;
     case 'intro':
       markPhase();
       g.phase = 'intro';
@@ -2080,7 +2206,11 @@ function applyFrame(f) {
 }
 
 // A phase frame arrived: the phase buttons are live again (after a short guard, see primarySend).
-function markPhase() { state.phaseChangedAt = Date.now(); state.pending = null; state.confirmEndAt = 0; }
+// It is also activity, so an idle-wipe warning no longer applies (the server warns again if needed).
+function markPhase() {
+  state.phaseChangedAt = Date.now(); state.pending = null; state.confirmEndAt = 0;
+  if (state.game) state.game.expiry = null;
+}
 // Redraw when a server time is reached (the idle-wipe warning appears without a frame).
 let wakeTimer = null;
 function wakeAt(serverTs) {
@@ -2094,15 +2224,20 @@ function onSocketClosed(code, reason, willRetry) {
   if (state.wiped) return;                                   // the expected 4004 after `wiped`
   const g = state.game;
   if (code === 4004 && g && g.phase === 'ended') { finishWipe(); return; }   // `wiped` frame lost in flight: same meaning
-  if (code === 4011) {                                       // session expired: sign in over the stage, keep the key
-    socket = null; state.reauth = true; state.auth.status = 'out'; render(); focusLater('passcode'); return;
+  if (code === 4011) {
+    // The sign-in this socket was opened with has expired. A session renewed since then reconnects
+    // at once (at most once a minute); otherwise sign in over the stage, keeping the key.
+    socket = null;
+    recheckAfter4011(state.auth.shared);                     // checkSession() resets state.auth.shared
+    return;
   }
   if (code === 4001 && !state.urlTokenTried && g && g.hostToken) {
     state.urlTokenTried = true;                              // an older server: try the token in the URL once
     connectHost({ pin: g.pin, hostToken: g.hostToken, title: g.title || '' }, true);
     return;
   }
-  if (code === 4004 || code === 4001) removeKey(KEYS.host);  // this host key cannot work any more
+  // This game's host key cannot work any more (the stored key may belong to another live game).
+  if ((code === 4004 || code === 4001) && g) { const k = loadHostKey(); if (k && k.pin === g.pin) removeKey(KEYS.host); }
   if (code === 4004 && state.autoResume && g && !g.phase) {
     // Resuming on page load found the game already gone: back to the quiz list with a short note.
     const pin = g.pin;
@@ -2113,6 +2248,24 @@ function onSocketClosed(code, reason, willRetry) {
   state.closeInfo = { code, reason: typeof reason === 'string' ? reason : '' };
   releaseWakeLock();
   render();
+}
+
+function recheckAfter4011(wasShared) {
+  // A 4011 comes from the Room's clock, not from the teacher: unless the page was used, ask passively.
+  const passive = !usedSinceCheck;
+  usedSinceCheck = false;
+  checkSession(passive).then(() => {
+    const g = state.game;
+    if (!g) return;
+    if (state.auth.status === 'offline') { setTimeout(() => recheckAfter4011(wasShared), 5000); return; }   // ask again
+    if (state.auth.status === 'in' && Date.now() - silentReauthAt > 60000) {
+      silentReauthAt = Date.now();
+      const k = loadHostKey();
+      connectHost(k && k.pin === g.pin ? k : { pin: g.pin, hostToken: g.hostToken || '', title: g.title || '' });
+      return;
+    }
+    sessionLost(wasShared);
+  });
 }
 
 function finishWipe() {
@@ -2128,10 +2281,12 @@ function leaveGame() {
   if (socket) { socket.close(); socket = null; }
   state.game = null; state.closeInfo = null; state.wiped = false; state.results = null;
   state.reauth = false; state.panel = null; state.pending = null; state.autoResume = false; state.storageError = '';
+  state.limitedUntil = 0;
   state.screen = 'home';
   releaseWakeLock();
   setConn('idle');
   render();
+  loadLiveRooms();                                           // the list may have changed since it was loaded
 }
 
 function safeFilename(name, pin) {
@@ -2176,14 +2331,20 @@ function createSocket(opts) {
     ws = s;
     let opened = false;
     // A handshake that hangs (captive portal, dead proxy) is closed after 10 s so the backoff loop continues.
-    connectTimer = setTimeout(() => { if (s === ws && s.readyState === WebSocket.CONNECTING) drop(s); }, 10000);
+    connectTimer = setTimeout(() => {
+      if (s !== ws || s.readyState !== WebSocket.CONNECTING) return;
+      neverOpened += 1;
+      if (opts.onFail) opts.onFail(neverOpened);
+      drop(s);
+    }, 10000);
+    let gotFrame = false;
 
     s.addEventListener('open', () => {
       if (s !== ws) return;
       opened = true;
       clearTimeout(connectTimer);
-      attempt = 0;
-      neverOpened = 0;
+      neverOpened = 0;                                       // the backoff resets on the first frame, not here: a
+                                                             // server that accepts and then closes must not be retried at full speed
       if (opts.onFail) opts.onFail(0);
       status('live');
       if (opts.onOpen) opts.onOpen((obj) => { try { s.send(JSON.stringify(obj)); } catch (e) { /* ignore */ } });
@@ -2193,23 +2354,29 @@ function createSocket(opts) {
     s.addEventListener('message', (ev) => {
       if (s !== ws) return;
       clearTimeout(pongTimer); pongTimer = null;             // any frame proves the connection is alive
+      if (!gotFrame) { gotFrame = true; attempt = 0; }
       if (typeof ev.data !== 'string' || ev.data === 'pong') return;
       let frame;
       try { frame = JSON.parse(ev.data); } catch (e) { return; }
-      if (frame && typeof frame.t === 'string') opts.onFrame(frame);
+      if (!frame || typeof frame.t !== 'string') return;
+      // PROTOCOL §4: the server is about to close this socket. Act now: the close itself can be slow to arrive.
+      if (frame.t === 'closing' && typeof frame.code === 'number') { closed(frame.code, typeof frame.reason === 'string' ? frame.reason : ''); return; }
+      opts.onFrame(frame);
     });
-    s.addEventListener('close', (ev) => {
+    function closed(code, reason) {
       if (s !== ws) return;
       clearTimeout(connectTimer);
       clearLive();
       ws = null;
+      try { s.close(); } catch (e) { /* already closing */ }
       if (stopped) return;
       if (!opened) { neverOpened += 1; if (opts.onFail) opts.onFail(neverOpened); }
-      const retry = !NO_RETRY_CODES.has(ev.code);
-      if (!retry) { stopped = true; status('closed', ev.reason); }
-      if (opts.onClose) opts.onClose(ev.code, ev.reason, retry);
+      const retry = !NO_RETRY_CODES.has(code);
+      if (!retry) { stopped = true; status('closed', reason); }
+      if (opts.onClose) opts.onClose(code, reason, retry);
       if (retry) scheduleRetry();
-    });
+    }
+    s.addEventListener('close', (ev) => closed(ev.code, ev.reason));
     s.addEventListener('error', () => { /* the close event that follows drives the retry */ });
   }
 
@@ -2409,7 +2576,9 @@ document.addEventListener('visibilitychange', () => {
   if (isLive()) requestWakeLock();
   renderPill();
 });
-window.addEventListener('online', () => { if (socket) socket.nudge(); renderPill(); });
+window.addEventListener('online', () => { if (socket) socket.nudge(); renderPill(); retrySessionCheck(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') retrySessionCheck(); });
+for (const type of ['keydown', 'pointerdown']) document.addEventListener(type, () => { usedSinceCheck = true; }, { capture: true, passive: true });
 window.addEventListener('offline', renderPill);
 document.addEventListener('fullscreenchange', onFullscreenChange);
 document.addEventListener('webkitfullscreenchange', onFullscreenChange);
@@ -2422,14 +2591,15 @@ state.quizzes = loadQuizzes();
 applyContrast();
 render();
 // After a refresh mid-game, go straight back to the stage (P0-53); the connecting screen offers "Not now".
-checkSession().then(() => {
+function sessionReady() {
   const key = loadHostKey();
   if (state.auth.status === 'in') {
     loadLiveRooms();
     if (key && !state.game) { state.autoResume = true; connectHost(key); return; }
   }
   render();
-});
-setInterval(keepSessionAlive, 20 * 60 * 1000);
+}
+checkSession().then(sessionReady);
+setInterval(keepSessionAlive, SESSION_CHECK_MS);
 
 })();

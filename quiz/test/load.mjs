@@ -496,6 +496,11 @@ class Player {
       case 'welcome': return this.onWelcome(f);
       case 'sync': return this.onSync(f);
       case 'lobby': return undefined;
+      case 'closing':
+        // §4: version-2 pages act on this as on the close itself; version-1 pages ignore unknown frames.
+        if (this.v1 || game.legacy) return undefined;
+        try { ws.close(); } catch { /* ignore */ }
+        return this.onClose(ws, f.code, f.reason);
       case 'intro':
         this.phase = 'intro';
         if (f.question && Number.isInteger(f.question.q)) this.q = f.question.q;
@@ -859,6 +864,9 @@ class Host {
     vlog(`host <- ${f.t}${f.q !== undefined ? ` q=${f.q}` : ''}${f.t === 'sync' ? ` phase=${f.phase}` : ''}`);
     switch (f.t) {
       case 'sync': return this.onSync(f);
+      case 'closing':
+        try { ws.close(); } catch { /* ignore */ }
+        return this.onClose(ws, f.code, f.reason);
       case 'roster':
         if (!game.legacy) violate('host: a version-2 host received a full roster frame (expected deltas)');
         if (!Array.isArray(f.players) || f.players.length !== f.playerCount) violate(`host: roster.players has ${f.players?.length} entries but playerCount is ${f.playerCount}`);
@@ -1497,7 +1505,11 @@ async function main() {
   // 7. Tidy up, check, report.
   for (const p of players) p.clearAll();
   host.clearAll();
-  const stillOpen = players.filter((p) => p.ws !== null);
+  // CLOSING means the server's close frame arrived and only the handshake stalled: a local workerd
+  // quirk for sockets that never sent a frame (PROTOCOL §4), seen here on version-1 phones only.
+  const stalled = players.filter((p) => p.ws !== null && p.ws.readyState === WebSocket.CLOSING);
+  if (stalled.length) warn(`${stalled.length} version-1 socket(s) got the 4004 close but their closing handshake stalled (local workerd; v2 pages act on the closing frame)`);
+  const stillOpen = players.filter((p) => p.ws !== null && p.ws.readyState !== WebSocket.CLOSING);
   if (host.ws) stillOpen.push(host);
   if (!game.aborted && stillOpen.length) violate(`${stillOpen.length} socket(s) were still open ${WIPE_CLOSE_WAIT_MS / 1000} s after wipe (expected 4004 closes)`);
   if (process.env.DEBUG_OPEN) for (const p of stillOpen) process.stderr.write(`OPEN: ${p.tag || 'host'} v1=${p.v1} synced=${p.synced} readyState=${p.ws && p.ws.readyState} lastDisconnect=${p.lastDisconnectAt ? Math.round((Date.now() - p.lastDisconnectAt) / 1000) + 's ago' : '-'}\n`);

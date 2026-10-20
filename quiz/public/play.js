@@ -30,7 +30,7 @@ class ReconnectingSocket {
    * @param {() => string} urlFor   Called before every attempt, so the URL can gain a
    *                                token between the first connection and a reconnect.
    * @param {object} handlers       { status(s), open(isReconnect), frame(obj), close(code, reason, willRetry) }
-   *                                status is 'connecting' | 'open' | 'reconnecting' | 'closed'.
+   *                                status is 'connecting' | 'open' | 'reconnecting' | 'offline' | 'closed'.
    */
   constructor(urlFor, handlers) {
     this.urlFor = urlFor;
@@ -41,19 +41,36 @@ class ReconnectingSocket {
     this.stopped = false;
     this.timers = { retry: 0, open: 0, ping: 0, probe: 0 };
     this.hiddenAt = 0;
+    this.onlineWhileHidden = false;
     // §5: reconnect when the page comes back (tab switch, screen unlock, Wi-Fi back).
     this._wake = (ev) => {
-      if (document.visibilityState === 'hidden') { this.hiddenAt = Date.now(); return; }
+      if (document.visibilityState === 'hidden') {
+        // Only going hidden starts the clock; an 'online' or 'pageshow' while hidden must not reset it.
+        if (ev && ev.type === 'visibilitychange' && !this.hiddenAt) this.hiddenAt = Date.now();
+        if (ev && ev.type === 'online') this.onlineWhileHidden = true;
+        return;
+      }
       const away = this.hiddenAt ? Date.now() - this.hiddenAt : 0;
+      const online = (ev && ev.type === 'online') || this.onlineWhileHidden;
       this.hiddenAt = 0;
+      this.onlineWhileHidden = false;
       // After the screen was locked or the app switched away, the old socket is often dead while the
       // browser still calls it open. Do not wait to find out: open a fresh one now (P0-12).
-      if ((ev && ev.type === 'online') || away > WAKE_FRESH_MS) this.fresh();
+      if (online || away > WAKE_FRESH_MS) this.fresh();
       else this.checkAlive();
+    };
+    // The phone says it has no network: say so at once and check the socket (P0-11).
+    this.offlineShown = false;
+    this._offline = () => {
+      if (this.stopped) return;
+      this.offlineShown = true;
+      this.h.status('offline');
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) this.checkAlive();
     };
     document.addEventListener('visibilitychange', this._wake);
     window.addEventListener('online', this._wake);
     window.addEventListener('pageshow', this._wake);
+    window.addEventListener('offline', this._offline);
   }
 
   connect() {
@@ -63,16 +80,19 @@ class ReconnectingSocket {
     let ws;
     try { ws = new WebSocket(this.urlFor()); } catch (err) { this._scheduleRetry(); return; }
     this.ws = ws;
+    this.offlineShown = false;
     this.h.status(this.everOpened ? 'reconnecting' : 'connecting');
     // School Wi-Fi sometimes black-holes a handshake; give it 10 s, then try again.
     this.timers.open = setTimeout(() => { if (ws.readyState === WebSocket.CONNECTING) ws.close(); }, 10000);
+    let gotFrame = false;
 
     ws.addEventListener('open', () => {
       if (ws !== this.ws) return;
       clearTimeout(this.timers.open);
       const isReconnect = this.everOpened;
       this.everOpened = true;
-      this.attempt = 0;
+      // The backoff resets on the first frame, not here: a server that accepts and then
+      // closes at once must not be retried at full speed.
       this.timers.ping = setInterval(() => this.keepalive(), PING_EVERY_MS);   // §4: literal "ping"
       this.h.status('open');
       this.h.open(isReconnect);
@@ -82,22 +102,30 @@ class ReconnectingSocket {
       if (ws !== this.ws) return;
       clearTimeout(this.timers.probe);
       this.timers.probe = 0;
+      if (!gotFrame) { gotFrame = true; this.attempt = 0; }
+      if (this.offlineShown) { this.offlineShown = false; this.h.status('open'); }   // it got through after all
       if (typeof ev.data !== 'string' || ev.data === 'pong') return;
       let frame = null;
       try { frame = JSON.parse(ev.data); } catch (err) { return; }
-      if (frame && typeof frame.t === 'string') this.h.frame(frame);
+      if (!frame || typeof frame.t !== 'string') return;
+      // §4: the server is about to close this socket. Act now: the close itself can be slow to arrive.
+      if (frame.t === 'closing' && typeof frame.code === 'number') { this._closed(ws, frame.code, frame.reason); return; }
+      this.h.frame(frame);
     });
 
-    ws.addEventListener('close', (ev) => {
-      if (ws !== this.ws) return;
-      this.ws = null;
-      this._clearTimers();
-      const retry = !this.stopped && !NO_RETRY_CODES.has(ev.code);
-      if (!retry) { this.stopped = true; this.h.status('closed'); }
-      this.h.close(ev.code, ev.reason || '', retry);
-      if (retry) this._scheduleRetry();
-    });
+    ws.addEventListener('close', (ev) => this._closed(ws, ev.code, ev.reason));
     // 'error' is always followed by 'close' in browsers; nothing to do for it.
+  }
+
+  _closed(ws, code, reason) {
+    if (ws !== this.ws) return;
+    this.ws = null;
+    this._clearTimers();
+    try { ws.close(); } catch (err) { /* already closing */ }
+    const retry = !this.stopped && !NO_RETRY_CODES.has(code);
+    if (!retry) { this.stopped = true; this.h.status('closed'); }
+    this.h.close(code, typeof reason === 'string' ? reason : '', retry);
+    if (retry) this._scheduleRetry();
   }
 
   /** Sends a JSON object (or a raw string such as "ping"). Returns false when not open. */
@@ -164,6 +192,7 @@ class ReconnectingSocket {
     document.removeEventListener('visibilitychange', this._wake);
     window.removeEventListener('online', this._wake);
     window.removeEventListener('pageshow', this._wake);
+    window.removeEventListener('offline', this._offline);
     const ws = this.ws;
     this.ws = null;
     if (ws) { try { ws.close(code); } catch (err) { /* already closed */ } }
@@ -206,6 +235,7 @@ const CONTRAST_KEY = 'hompub-quiz:contrast';        // per-phone convenience onl
 const SHAPE_NAMES = ['Red triangle', 'Blue diamond', 'Yellow circle', 'Green square'];
 const MAX_SPINS = 3;                                // §4.1
 const PLACES = ['1st', '2nd', '3rd'];
+const TAB_KEY = 'hompub-quiz:tab';                  // sessionStorage: one id per tab (PROTOCOL §11)
 
 // Title + fallback body for the no-retry close codes (§4). The server's own
 // close reason, when it sends one, replaces the body.
@@ -219,7 +249,7 @@ const CLOSE_TEXT = {
   4014: ['Too many wrong PINs', 'Too many wrong PINs came from this network. Wait a few minutes, or scan the QR code on the big screen.'],
 };
 
-const PILL_TEXT = { connecting: 'Connecting…', open: 'Connected', reconnecting: 'Reconnecting…', closed: 'Disconnected' };
+const PILL_TEXT = { connecting: 'Connecting…', open: 'Connected', reconnecting: 'Reconnecting…', offline: 'No connection', closed: 'Disconnected' };
 
 // Mirrors the server's `sync` frame (§4.3). Replaced wholesale on every sync.
 let state = {
@@ -248,12 +278,21 @@ const ui = {
   renameMsg: '',        // why a rename was refused
   sentAt: 0,            // when the pending answer was sent; no ack within ACK_WAIT_MS → reconnect and resend
   stuck: false,         // the pending answer is not getting through
+  renamePending: false, // a rename was sent and its answer (renamed / rename_rejected) has not arrived
+  refocusRename: false, // after this render, move focus out of the closed rename form
+  renameFromForm: false, // the pending rename was sent with focus in the form (where focus goes back to)
+  refocusRenameField: false, // after this render, focus the rename form's field (the rename was refused)
+  renameTimer: 0,       // gives up on a rename answer that never came
   legacyServer: false,  // the server speaks protocol 1 (rolled back): no renames
 };
 const ACK_WAIT_MS = 2000;
 
 let clockOffset = 0;    // §2: serverNow - Date.now(); refreshed by every timed frame
 let sock = null;
+// Every connection says which tab it comes from and how many this page has opened, so the server can
+// tell a second tab (4012) from this page's own reconnect racing an older one (4013, ignored here).
+let tabId = '';
+let connSeq = 0;
 let rafId = 0;
 let toastTimer = 0;
 let wakeLock = null;
@@ -331,10 +370,32 @@ function requestWakeLock() {
 
 function wsUrl() {
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  let url = `${scheme}//${location.host}/api/room/${PIN}/ws?role=player&v=${PROTO}`;
+  connSeq += 1;
+  let url = `${scheme}//${location.host}/api/room/${PIN}/ws?role=player&v=${PROTO}&tab=${tabId}&seq=${connSeq}`;
   if (ROOM_KEY) url += '&k=' + ROOM_KEY;
   if (ui.saved && ui.saved.token) url += '&token=' + encodeURIComponent(ui.saved.token);
   return url;
+}
+function newTabId() {
+  const id = randomId();
+  try { sessionStorage.setItem(TAB_KEY, id); } catch (err) { /* the in-memory id is enough */ }
+  return id;
+}
+// A duplicated tab starts with a copy of sessionStorage, so the id is checked with the other tabs.
+function initTabId() {
+  let id = '';
+  try { id = sessionStorage.getItem(TAB_KEY) || ''; } catch (err) { id = ''; }
+  tabId = /^[0-9a-f]{32}$/.test(id) ? id : newTabId();
+  try {
+    const bootAt = Date.now();
+    const bc = new BroadcastChannel('hompub-quiz-tabs');
+    bc.onmessage = (ev) => {
+      const m = ev.data || {};
+      if (m.t === 'hello' && m.id === tabId) bc.postMessage({ t: 'taken', id: tabId });
+      else if (m.t === 'taken' && m.id === tabId && Date.now() - bootAt < 5000) tabId = newTabId();
+    };
+    bc.postMessage({ t: 'hello', id: tabId });
+  } catch (err) { /* no BroadcastChannel: a duplicated tab then behaves like a reconnect of this one */ }
 }
 function randomId() {
   const b = new Uint8Array(16);
@@ -357,6 +418,9 @@ function openSocket() {
     },
     frame: handleFrame,
     close(code, reason, willRetry) {
+      renameAnswered();
+      // 4013 on the live socket: another tab has the same tab id (a duplicated tab). Take a new one.
+      if (code === 4013) tabId = newTabId();
       if ((code === 4004 || code === 4000) && ui.saved && state.phase === null) {
         // The room did not accept our stored token (PROTOCOL §5: 4004 "Unknown player
         // token; join again", e.g. the PIN was reused for a new game). Retrying the same
@@ -413,18 +477,24 @@ function handleFrame(f) {
       ui.joinFrame = null;
       ui.nickMsg = typeof f.message === 'string' ? f.message : 'Please choose another name.';
       ui.focusedNick = false;
+      // The host may have changed the name setting since the form was drawn: draw it for the current one.
+      if (f.nameMode === 'typed' || f.nameMode === 'either' || f.nameMode === 'random') ui.summary = Object.assign({}, ui.summary, { nameMode: f.nameMode });
       break;
 
     case 'renamed':
       if (state.me) { state.me.nick = f.nick; if (typeof f.renamesLeft === 'number') state.me.renamesLeft = f.renamesLeft; }
       if (ui.saved) saveSaved(Object.assign({}, ui.saved, { nick: f.nick }));
+      ui.refocusRename = ui.renaming && (ui.renameFromForm || $('rename-form').contains(document.activeElement));
       ui.renaming = false;
+      renameAnswered();
       ui.renameMsg = '';
       ui.nameNote = f.byHost ? 'The host changed your name.' : (f.note && f.note.message ? f.note.message : '');
       say(`Your name is now ${f.nick}.` + (ui.nameNote ? ' ' + ui.nameNote : ''));   // P0-06: announce it
       break;
 
     case 'rename_rejected':
+      ui.refocusRenameField = ui.renameFromForm;
+      renameAnswered();
       ui.renameMsg = typeof f.message === 'string' ? f.message : 'That name cannot be used.';
       if (state.me && typeof f.renamesLeft === 'number') state.me.renamesLeft = f.renamesLeft;
       break;
@@ -512,7 +582,13 @@ function handleFrame(f) {
       break;
 
     case 'error':
-      if (f.code === 'join_timeout') { cancelJoin(); toast('Joining took too long — try again.'); return; }
+      if (f.code === 'join_timeout') {
+        // Only a join that was actually waiting timed out; a student still typing just gets a fresh start.
+        const wasJoining = ui.joining;
+        cancelJoin();
+        if (wasJoining) toast('Joining took too long — try again.');
+        return;
+      }
       if (f.code === 'already_joined' && ui.saved) {
         // Only respin() sends `join` after we are in: the server has run out of spins.
         ui.spins = MAX_SPINS;
@@ -527,6 +603,8 @@ function handleFrame(f) {
       break;   // unknown frame types are ignored (forward compatibility)
   }
   render();
+  if (ui.refocusRename) { ui.refocusRename = false; focusAfterRename(); }
+  if (ui.refocusRenameField) { ui.refocusRenameField = false; focusRenameField(); }
 }
 
 // §4.3: the snapshot is the truth; replace everything. Client bookkeeping that
@@ -556,7 +634,7 @@ function applySync(f) {
   // server has no answer from us, send it again (the server ignores duplicates). P0-17, P0-20.
   if (held != null && state.phase === 'open' && state.q === prevQ && state.me && !state.me.answered) {
     ui.pendingChoice = held;
-    if (sock && sock.send({ t: 'answer', q: state.q, choice: held })) ui.sentAt = Date.now();
+    sendAnswer(held);
   }
   if (state.phase === 'ended') {
     // Reconnected after the host pressed End: same promise as the `ended` frame —
@@ -587,6 +665,7 @@ function cancelJoin() {
   if (sock) { sock.close(); sock = null; }
   ui.joining = false;
   ui.joinFrame = null;
+  ui.nickMsg = '';
   ui.failures = 0;
   ui.conn = 'connecting';          // the pill's pre-join look
   render();
@@ -610,16 +689,19 @@ function onChoice(choice) {
   if (navigator.vibrate) { try { navigator.vibrate(30); } catch (err) { /* ignore */ } }
   ui.pendingChoice = choice;
   ui.ack = null;
-  if (sock && sock.send({ t: 'answer', q: state.q, choice })) {
-    ui.sentAt = Date.now();
-    ui.stuck = false;
-    setTimeout(checkAck, ACK_WAIT_MS + 50);
-  } else {
-    ui.sentAt = 0;
+  if (!sendAnswer(choice)) {
     ui.stuck = true;
     if (sock) sock.reconnectNow(); else openSocket();
   }
   render();
+}
+// Every send of the pending answer (the tap, and each resend after a reconnect) gets the 2 s check.
+function sendAnswer(choice) {
+  if (!sock || !sock.send({ t: 'answer', q: state.q, choice })) { ui.sentAt = 0; return false; }
+  ui.sentAt = Date.now();
+  ui.stuck = false;
+  setTimeout(checkAck, ACK_WAIT_MS + 50);
+  return true;
 }
 function checkAck() {
   if (ui.pendingChoice == null || ui.ack || !ui.sentAt || state.phase !== 'open') return;
@@ -645,20 +727,58 @@ function openRename() {
   if (!canRename()) return;
   ui.renaming = true;
   ui.renameMsg = '';
+  renameAnswered();
   render();
   const input = $('rename-nick');
   input.value = (state.me && state.me.nick) || '';
+  if (input.disabled) { $('rename-title').focus({ preventScroll: true }); return; }   // "Random names only"
   input.focus();
   try { input.select(); } catch (err) { /* ignore */ }
 }
-function closeRename() { ui.renaming = false; ui.renameMsg = ''; render(); }
+function closeRename() {
+  const inForm = $('rename-form').contains(document.activeElement);
+  ui.renaming = false; ui.renameMsg = ''; renameAnswered();
+  render();
+  if (inForm) focusAfterRename();
+}
+// Back to the button that opened the form, or to the screen heading when no changes are left.
+function focusAfterRename() {
+  const btn = $(shownScreen === 'closed' ? 'edit-name-closed' : 'edit-name-btn');
+  const target = btn && !btn.hidden ? btn : $(shownScreen === 'closed' ? 'verdict' : 'lobby-heading');
+  if (target) { try { target.focus({ preventScroll: true }); } catch (err) { /* ignore */ } }
+}
+// One change at a time: a second tap while the first is on its way would spend another of the three.
 function sendRename(random) {
+  if (ui.renamePending) return;
   const nick = random ? '' : cutName($('rename-nick').value);
   if (!random && !nick) { ui.renameMsg = 'Type a name.'; render(); return; }
   const frame = random ? { t: 'rename', random: true } : { t: 'rename', nick };
   if (!sock || !sock.send(frame)) { ui.renameMsg = 'Not connected — try again in a moment.'; render(); return; }
   ui.renameMsg = '';
+  // Disabling the pressed button drops its focus, so remember now that the form had it.
+  ui.renameFromForm = $('rename-form').contains(document.activeElement);
+  ui.renamePending = true;
+  clearTimeout(ui.renameTimer);
+  ui.renameTimer = setTimeout(() => {
+    if (!ui.renamePending) return;
+    const refocus = ui.renameFromForm;
+    renameAnswered();
+    render();
+    if (refocus) focusRenameField();
+  }, 5000);
   render();
+}
+function renameAnswered() {
+  ui.renamePending = false;
+  ui.renameFromForm = false;
+  clearTimeout(ui.renameTimer);
+  ui.renameTimer = 0;
+}
+// After a refusal the form stays open: back to the name box, or to "Random name" where the box is off.
+function focusRenameField() {
+  const input = $('rename-nick');
+  const target = input && !input.disabled ? input : $('rename-random');
+  if (target && !target.hidden) { try { target.focus({ preventScroll: true }); } catch (err) { /* ignore */ } }
 }
 function say(text) {
   const el = $('announcer');
@@ -734,8 +854,10 @@ function render() {
 
 function renderPill() {
   const pill = $('pill');
-  pill.dataset.conn = ui.conn;
-  pill.textContent = PILL_TEXT[ui.conn] || ui.conn;
+  // While the phone reports no network, say so, rather than "Reconnecting…" over and over.
+  const conn = navigator.onLine === false && ui.conn !== 'closed' && ui.conn !== 'open' ? 'offline' : ui.conn;
+  pill.dataset.conn = conn;
+  pill.textContent = PILL_TEXT[conn] || conn;
 }
 
 /* ---------- screen changes for screen-reader users ----------
@@ -985,6 +1107,9 @@ function renderRenameForm(screen) {
   $('rename-save').hidden = mode === 'random';
   $('rename-msg').hidden = !ui.renameMsg;
   setText('rename-msg', ui.renameMsg);
+  $('rename-save').disabled = !!ui.renamePending;
+  $('rename-random').disabled = !!ui.renamePending;
+  setText('rename-save', ui.renamePending ? 'Saving…' : 'Save');
   $('rename-nick').setAttribute('aria-invalid', ui.renameMsg ? 'true' : 'false');
   const left = typeof me.renamesLeft === 'number' ? me.renamesLeft : 3;
   setText('rename-left', `${left} change${left === 1 ? '' : 's'} left.`);
@@ -1063,6 +1188,7 @@ function initContrast() {
 
 function boot() {
   initContrast();
+  initTabId();
   $('join-form').addEventListener('submit', (ev) => { ev.preventDefault(); startJoin(false); });
   $('spin-btn').addEventListener('click', () => startJoin(true));
   $('join-cancel').addEventListener('click', cancelJoin);

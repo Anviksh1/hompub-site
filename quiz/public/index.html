@@ -222,6 +222,14 @@
       input.select();
       return;
     }
+    if (res.status === 429) {
+      // Too many wrong PINs from this network (PROTOCOL §9): the server's message says how long to wait.
+      var limited = null;
+      try { limited = await res.json(); } catch (err) { limited = null; }
+      setBusy(false);
+      say(limited && typeof limited.message === 'string' ? limited.message : 'Too many wrong PINs from this network. Wait a few minutes, or scan the QR code.');
+      return;
+    }
     if (!res.ok) {
       setBusy(false);
       say('Couldn’t check that PIN just now (server said ' + res.status + '). Try again.');

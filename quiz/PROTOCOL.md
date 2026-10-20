@@ -27,7 +27,7 @@ budget). Only `/api/*` invokes the Worker.
 | `GET /host` | Host page (laptop): quiz editor, lobby, game control, results |
 | `GET /api/health` | `200 {"ok":true,"now":<ms>,"version":"0.2.0","proto":2}` |
 | `POST /api/session` | Sign in. Body `{"passcode": "...", "shared"?: true}`. `200 {"signedIn":true,"shared","expiresAt","library"}` and `Set-Cookie: __Host-hq_session=…; Path=/; Secure; HttpOnly; SameSite=Strict` (with `Max-Age`, except for a shared computer). `401 {"error":"wrong_passcode","remaining","message"}`. `429 {"error":"locked","retryAfter","message"}` + `Retry-After` after 5 wrong passcodes from one network in 15 minutes. `503 {"error":"not_configured"\|"passcode_too_short"\|"try_again","message"}`. |
-| `GET /api/session` | `200 {"signedIn":true,…}` (renews the cookie when due) or `200 {"signedIn":false[,"problem","message"]}`. |
+| `GET /api/session` | `200 {"signedIn":true,…}` (renews the cookie when due) or `200 {"signedIn":false[,"problem","message"]}`. `?passive=1`: the host page's timer, not the teacher, is asking; a shared-computer session is then not renewed, so its 4-hour idle limit holds while the tab stays open (it is never renewed past 12 hours in any case). |
 | `DELETE /api/session` | Sign out on this device: clears the cookie. `200 {"signedIn":false}`. |
 | `GET /api/rooms` | Signed in: `200 {"rooms":[{"pin","title","phase","playerCount","createdAt"}]}`, this library's live games (at most 10, newest first). Never contains host tokens. `401` signed out. |
 | `GET /api/echo` | WebSocket echo (handled in the Worker, no Durable Object). Used by the network preflight. Any text frame is echoed back verbatim. Closes after 60 s. |
@@ -152,22 +152,30 @@ reason="duplicate"`).
   of a ping, the page treats the connection as dead and reconnects at once.
 - Frame > 4,096 bytes → server closes with **1009**.
 - More than 10 frames/s sustained (burst allowance 20) → server closes with **4008**.
-- Server close codes: `4000` bad request (also `Join timed out` for a player socket that sends no `join` within 60 s) · `4001` bad host token · `4003` kicked · `4004` room not found / already ended / unknown player token · `4008` rate limited · `4009` room full, or too many sockets for one player · `4010` room locked / late join disabled / a version-1 host page (out of date) / a version-1 player over the PIN-guess limit · `4011` host session missing or expired: sign in again · `4012` this player is now connected in another tab or device · `4014` too many wrong PINs from this network (version 2) · `1009` frame too large. Clients **must not** auto-reconnect after 4001, 4003, 4004, 4009, 4010, 4011, 4012, 4014; show the message instead. Any other close → reconnect with backoff.
-- A close issued by a Room timer (the 10 s host sign-in limit, the 60 s join limit) is preceded by an `error` frame with code `auth_timeout` / `join_timeout`, because in local workerd such a close does not always reach the client; version-2 pages close the socket themselves on that frame.
+- Server close codes: `4000` bad request (also `Join timed out` for a player socket that has not joined after 60 s without a `join` attempt, or 3 minutes in all) · `4001` bad host token · `4003` kicked · `4004` room not found / already ended / unknown player token · `4008` rate limited · `4009` room full, or too many sockets for one player · `4010` room locked / late join disabled / a version-1 host page (out of date) / a version-1 player over the PIN-guess limit · `4011` host session missing or expired: sign in again · `4012` this player is now connected in another tab or device · `4013` replaced by a newer connection from the same tab (version 2; the page has normally abandoned that socket already and ignores it; on its live socket it means a duplicated tab id, so the page takes a new tab id and reconnects) · `4014` too many wrong PINs from this network (version 2) · `1009` frame too large. Clients **must not** auto-reconnect after 4001, 4003, 4004, 4009, 4010, 4011, 4012, 4014; show the message instead (a host page first checks its session after 4011, below). Any other close → reconnect with backoff; the backoff restarts only once a frame has arrived, so a server that accepts and closes at once is not retried at full speed.
+- Before the Room closes a socket from another socket's event or an alarm (a second tab, the wipe, an expired host sign-in), it sends `{"t":"closing","code":4012,"reason":"…"}`; version-2 pages act on it as on the close itself. In local workerd the close handshake of a socket that has not sent a frame yet stalls in that case (a phone that reconnected and has not answered yet), and the frame does not depend on it.
+- A close issued by a Room timer (the 10 s host sign-in limit, the join limits) is preceded by an `error` frame with code `auth_timeout` / `join_timeout`, because in local workerd such a close does not always reach the client; version-2 pages close the socket themselves on that frame.
 
 ### 4.1 Client → server (player)
 
 | Frame | When | Notes |
 |---|---|---|
-| `{"t":"join","nick":"Priya","joinId":"<32 hex>"}` | first connection, no token | nick is trimmed, control chars stripped, a leading `= + - @` removed, max 20 characters; duplicate → numeric suffix (`Priya 2`) and `welcome.note`. Version 2: empty or profane (whole-word deny-list, §9) → `join_rejected`, the socket stays open for another try. Version 1: empty or profane → a spun name, silently. `nameMode: "random"` → a spun name whatever was typed. `joinId` (optional): a join repeated with the same id within 60 s of its `welcome` (the welcome was lost) gets the same player back instead of a second one. |
-| `{"t":"join","spin":true,"joinId":"…"}` | first connection | a random two-word name (adjective + animal, e.g. `Brave Otter`). Refused with `join_rejected` (`random_off`) for a version-2 page when `nameMode` is `"typed"`; always honoured for version 1. A version-1 page may send further `join` + `spin` frames before its first answer to re-spin (max 3 spins). |
+| `{"t":"join","nick":"Priya","joinId":"<32 hex>"}` | first connection, no token | nick is trimmed, control chars stripped, a leading `= + - @` removed, max 20 characters; duplicate → numeric suffix (`Priya 2`) and `welcome.note`. Invisible characters (soft hyphens, zero-width and other format characters) are removed first, so the name shown is the name checked. Version 2: empty or profane (whole-word deny-list, §9) → `join_rejected`, the socket stays open for another try. Version 1: empty or profane → a spun name, silently. `nameMode: "random"` → a spun name whatever was typed (version 2: `welcome.note` with reason `random` says so). `joinId` (optional): a join repeated with the same id within 60 s of its `welcome` (the welcome was lost) gets the same player back instead of a second one; if the host has removed that player meanwhile, it gets `kicked` and 4003. |
+| `{"t":"join","spin":true,"joinId":"…"}` | first connection | a random two-word name (adjective + animal, e.g. `Brave Otter`). Refused with `join_rejected` (`random_off`) for a version-2 page when `nameMode` is `"typed"`; always honoured for version 1. A version-1 page may send further `join` + `spin` frames before its first answer to re-spin (max 3 spins); a version-2 page gets `error` `already_joined` and uses `rename`. |
 | `{"t":"rename","nick":"Priya S"}` / `{"t":"rename","random":true}` | any phase while `settings.allowRename` | Same checks as joining (sanitising, deny-list, 20 characters, duplicate numbering). At most 3 renames per player, counted apart from spins. Typed names refused when `nameMode` is `"random"`, random ones when it is `"typed"`. Reply `renamed` or `rename_rejected` (old name kept); the host gets `player_updated`. |
 | `{"t":"answer","q":3,"choice":1}` | phase `open` | `q` must equal the current question index; `choice` an integer in `[0, optionCount)`. Refusal reasons are checked in this order: wrong `q` or not open/closed → `closed`; phase `closed` → `late`; bad `choice` → `invalid`; already answered → `duplicate`. |
 
 A reconnecting player (`?token=`) sends nothing; the server replies with `sync`.
-A version-2 reconnect closes the player's other open version-2 sockets with
-`4012` (one live page per player); version-1 sockets are not evicted, only
-capped at 3 per player (§9).
+Version-2 pages add `tab=<32 hex>` (one id per browser tab, kept in
+sessionStorage and checked against other tabs over a BroadcastChannel, since a
+duplicated tab copies it) and `seq=<n>` (how many connections this page has
+opened). A version-2 reconnect closes the player's other open version-2 sockets:
+another tab's with `4012` (one live page per player), the same tab's older one
+with `4013`; an upgrade from the same tab with a lower `seq` than an open socket
+is one the page already abandoned, and is itself closed with `4013`. Version-1
+sockets are not evicted for a second tab; at 3 per player the oldest is closed
+with 4009 (it is usually a half-open socket a phone abandoned on waking). The
+room-wide socket cap is checked before anything is closed.
 
 ### 4.2 Client → server (host)
 
@@ -179,14 +187,24 @@ capped at 3 per player (§9).
 | `{"t":"close"}` | open | close the question now |
 | `{"t":"end"}` | podium (also allowed from any phase as an abort) | → `ended`; host receives `results_csv`; players receive `ended` |
 | `{"t":"ack_results"}` | ended | host confirms it has the CSV → room wiped (`deleteAll`), host receives `wiped`, all sockets closed with 4004 |
-| `{"t":"kick","pid":"...","lock"?:true}` | any | player's token is banned, their sockets closed with 4003, they are removed from the roster; their name stays reserved; their answers stay in the CSV, marked `removed`. `lock: true` also locks the room. A removed student can rejoin under another name unless the room is locked. |
+| `{"t":"kick","pid":"...","lock"?:true}` | any | player's token is banned, their sockets closed with 4003, they are removed from the roster; their name stays reserved; their answers stay in the CSV, marked `removed`. `lock: true` also locks the room. A removed student can rejoin under another name unless the room is locked. If saving fails (`storage_full`), nothing changes, except that a removal whose lock could not be saved still removes the player. |
 | `{"t":"rename_player","pid":"...","nick":"..."}` | any | the host renames anyone (also removed players, also after `end`). Sanitising and duplicate numbering apply; the deny-list does not. The phone gets `renamed` with `byHost`; after `end` the host gets `results_csv` again with `update: true`. |
-| `{"t":"keep"}` | any | counts as activity: postpones the idle wipe by 2 h ("Keep 2 more hours"); the host gets `expiry` |
+| `{"t":"keep"}` | any but `ended` | counts as activity: postpones the idle wipe by 2 h ("Keep 2 more hours"); the host gets `expiry`. In `ended` the room is wiped 30 min after `end` whatever happens, so `keep` changes nothing there. |
 | `{"t":"dev_stats"}` | any | dev only (`DEV_MODE` and `DEV_REPORT_ROWS` in `.dev.vars`): reply `dev_stats {statements, rowsWritten, alarms, players, wipeRows}` |
 | `{"t":"lock","on":true}` | any | locked rooms reject new players with 4010 (reconnects still work) |
 | `{"t":"settings","settings":{...partial...}}` | any (`mode`, `earlyClose`, `nameMode` only in lobby) | server replies with `settings` to host and, if `showOnDevices`, `nameMode` or `allowRename` changed, to players |
 
 Anything not allowed in the current phase → `{"t":"error","code":"bad_phase","message":"..."}` in plain words (for example "This question is already closed."), no state change.
+
+When a save fails (`storage_full`), `start`, `next`, `close`, `lock` and
+`settings` change nothing, so memory and storage agree and the host can try
+again. `next` to the podium and `end` are sent first and saved after: every
+answer they show is already saved, and the results file must reach the host
+even when nothing more can be saved.
+
+A host socket the Worker vouched for carries the session's expiry; once it has
+passed, the socket's next frame (or the Room's next alarm) closes it with
+`4011`.
 
 ### 4.3 Server → client
 
@@ -229,8 +247,8 @@ Every frame has `t`. Frames with times carry `serverNow` (ms since epoch, server
 
 | Frame | Fields |
 |---|---|
-| `welcome` | `pid, token, nick, pin, note?` — store `{pin, token, pid, nick, savedAt}` in localStorage key `hompub-quiz:player:<pin>`; entries older than 6 h are swept on page load. `note: {reason: "duplicate"\|"stripped"\|"shortened", message}` says why the name differs from what was typed. `token` is 48 hex for rooms created with secrets set (it carries a MAC the Worker can check, §9). |
-| `join_rejected` | `reason: "empty"\|"filtered"\|"random_off", message` — version 2 only; the socket stays open |
+| `welcome` | `pid, token, nick, pin, note?` — store `{pin, token, pid, nick, savedAt}` in localStorage key `hompub-quiz:player:<pin>`; entries older than 6 h are swept on page load. `note: {reason: "duplicate"\|"stripped"\|"shortened"\|"random", message}` says why the name differs from what was typed. `token` is 48 hex for rooms created with secrets set (it carries a MAC the Worker can check, §9). |
+| `join_rejected` | `reason: "empty"\|"filtered"\|"random_off"\|"unavailable", message, nameMode` — version 2 only; the socket stays open. `nameMode` is the room's current setting, so a join form drawn before the host changed it can redraw itself. `unavailable`: the player could not be saved (`storage_full`). |
 | `renamed` | `nick, renamesLeft, note?, byHost?` — the name changed (the student's own rename, or the host's) |
 | `rename_rejected` | `reason: "off"\|"limit"\|"empty"\|"filtered"\|"random_off"\|"typed_off"\|"same", message, renamesLeft` — the old name is kept |
 | `lobby` | `playerCount, locked` (coalesced, ≤ 2/s) |
@@ -249,10 +267,11 @@ Every frame has `t`. Frames with times carry `serverNow` (ms since epoch, server
 | Frame | Fields |
 |---|---|
 | `roster` | version-1 hosts only: `players:[{pid,nick,connected,score,answered}], playerCount` (coalesced, ≤ 2/s) |
-| `player_joined` / `player_updated` | version 2: `players:[{pid,nick,connected,score,answered}], playerCount` — new players / players whose name or connection changed since the last frame (coalesced, ≤ 2/s). Scores and `answered` reach the host through `tally`, `reveal` and the leaderboard, and are fresh only in `sync`. After the Room wakes from hibernation the host gets a full `sync` instead. |
+| `player_joined` / `player_updated` | version 2: `players:[{pid,nick,connected,score,answered}], playerCount` — new players / players whose name or connection changed since the last frame (coalesced, ≤ 2/s). Scores and `answered` reach the host through `tally`, `reveal` and the leaderboard, and are fresh only in `sync`. After the Room wakes from hibernation the host gets a full `sync` instead, and a rename during `closed` or `podium` (where names also show in the leaderboard and the top three) sends every host a `sync`. |
 | `player_left` | version 2: `pids:[...], playerCount` — removed players |
 | `hosts` | `count` — authenticated host sockets (another device or tab took over too) |
-| `expiry` | `wipeAt, warnAt, serverNow` — sent at `warnAt` (15 min before an idle wipe that would delete results) and after `keep` |
+| `expiry` | `wipeAt, warnAt, serverNow` — sent at `warnAt` (15 min before an idle wipe that would delete results), after `keep`, and on the first activity after a warning (the wipe has moved). A phase frame also means activity, so pages drop a shown warning on one. |
+| `notice` | `code: "pin_limited", retryAfterMs, serverNow` — lookups for this PIN from some network are being refused because of the PIN-guess limit (§9), so typing the PIN does not work there for about `retryAfterMs`; scanning the QR code still does. At most once a minute. |
 | `intro` | `question` (with text and options), `serverNow` |
 | `open` | `q, deadline, serverNow` |
 | `tally` | `q, counts:int[], answered, expected` (coalesced, ≤ 4/s while open) |
@@ -267,15 +286,15 @@ Players never receive `correct` before `closed`. The Room never sends the quiz's
 
 ## 5. Reconnect and resume
 
-- **Player:** keeps `{pin, token, pid, nick}` in localStorage. On socket close (except the no-retry codes), on `visibilitychange` → visible, and on `online`, reconnect to `/api/room/<pin>/ws?role=player&token=<token>` with backoff 500 ms → 8 s (×2, ±30 % jitter). The server replies `sync`. Older sockets for the same `pid` (a second tab) keep receiving frames; answers are de-duplicated per player, so a second tab cannot answer twice. A student offline for a whole question scores 0 for it. Players also request a Screen Wake Lock after joining (ignored where unsupported).
+- **Player:** keeps `{pin, token, pid, nick}` in localStorage. On socket close (except the no-retry codes), on `visibilitychange` → visible, and on `online`, reconnect to `/api/room/<pin>/ws?role=player&token=<token>` with backoff 500 ms → 8 s (×2, ±30 % jitter). The server replies `sync`. One page per player plays at a time (version 2: §4.1, `4012`); answers are de-duplicated per player in any case, so two tabs cannot answer twice. A student offline for a whole question scores 0 for it. Players also request a Screen Wake Lock after joining (ignored where unsupported).
 - **Unknown or stale player token** (the room was wiped and the PIN reused, or storage is from another deployment): the server accepts the socket and closes it with `4004` and reason `Unknown player token; join again`. The player page clears its stored entry for that PIN and shows the join screen.
-- **Host:** keeps `{pin, hostToken, title}` in localStorage key `hompub-quiz:host`. After a reload the page goes straight back to the stage (with "Not now"). Another signed-in browser or device lists the library's live games (`GET /api/rooms`) and can take over without the host token: the Worker vouches for its session. While the host is disconnected the server timers still close questions; phones show "Waiting for the host" only in `closed`. A host that connects while the phase is `ended` receives `sync` and then `results_csv` again, so the results file is never lost to a reload. A host socket closed with `4011` keeps its key: the page asks for the passcode over the stage and reconnects.
+- **Host:** keeps `{pin, hostToken, title}` in localStorage key `hompub-quiz:host`. After a reload the page goes straight back to the stage (with "Not now"). Another signed-in browser or device lists the library's live games (`GET /api/rooms`) and can take over without the host token: the Worker vouches for its session. While the host is disconnected the server timers still close questions; phones show "Waiting for the host" only in `closed`. A host that connects while the phase is `ended` receives `sync` and then `results_csv` again, so the results file is never lost to a reload. A host socket closed with `4011` keeps its key: if the page's session is still valid (it was renewed since the socket opened) it reconnects at once, otherwise it asks for the passcode over the stage, still offering a results file it holds, and reconnects after sign-in. On a shared-computer session that has lapsed, and on "Sign out on this device", the page forgets the game screen and any results file it holds (asking first if the file was not downloaded); the game keeps running and can be resumed after signing in.
 - **Deploys** restart every Durable Object and drop every socket; clients reconnect and resync within seconds. Deploy outside school hours.
 
 ## 6. Timers, hibernation, TTL (Room internals)
 
 - `intro → open` and `open → closed` use `setTimeout` inside the Room plus `ctx.storage.setAlarm(deadline + 1500)` as a durable backstop. The alarm handler re-reads the room row and closes the question if it is still open and past its deadline; otherwise it handles TTL below.
-- Between questions the Room has no pending timers and hibernates (WebSocket Hibernation API; sockets stay attached at the edge). Each socket's attachment is `{pid, role}` only; all authoritative state is in SQLite and reloaded in the constructor.
+- Between questions the Room has no pending timers and hibernates (WebSocket Hibernation API; sockets stay attached at the edge). Each socket's attachment holds only connection facts (`role, pid`, protocol version, whether a host socket is authenticated and when its sign-in expires, when it connected, a pending socket's last join attempt, a phone page's tab id and `seq`); all game state is in SQLite and reloaded in the constructor.
 - TTL (alarm): wipe the room 2 h after the last frame (any direction; keepalive `ping`s do not count, and idle attached sockets do not extend it), or 30 min after `ended` without `ack_results`. Once a question has been played, connected hosts get `expiry` 15 minutes before an idle wipe ("Results deleted at HH:MM — Keep 2 more hours", which sends `keep`), and `results_csv` immediately before it, in any phase. "Wipe" = `deleteAll()`, release the PIN in the Directory (only if it still maps to this room), close all sockets with 4004.
 - Auto-response: `ping` → `pong` is registered with `setWebSocketAutoResponse` so keepalives never wake the object.
 
@@ -285,10 +304,14 @@ A single `Directory` Durable Object (`idFromName("global")`) owns the PIN
 table, so rooms can use `newUniqueId()` and therefore live in the data
 center nearest the host that created them (a Durable Object never moves).
 
-- `POST /allocate {"roomId": "<hex>", "ipHash": "<hex>"}` → `200 {"pin":"123456"}` · `429 {"error":"too_many_rooms"}` (per-IP cap `ROOM_CREATE_PER_IP_PER_DAY`, default 30, or global cap `ROOM_CREATE_PER_DAY`, default 300) · `503` no free PIN after 20 tries.
-- `GET /lookup/:pin` → `200 {"roomId": "<hex>"}` · `404`. Entries older than 24 h are treated as expired.
-- `POST /release {"pin": "123456", "roomId": "<hex>"}` → `200`; a no-op if the PIN has since been re-issued to another room.
-- Housekeeping: expired PINs and creation counters older than yesterday are deleted at most hourly on traffic and from a daily alarm just after 00:00 UTC, so a counter written on day D is gone by 00:05 UTC on D+2.
+The Worker calls it over RPC; every newer parameter is optional, so either side
+may run the previous version for a few seconds during a deploy.
+
+- `allocate(roomId, ipHash, {library, skipPerIp}?)` → `{ok: true, pin}` · `{ok: false, status: 429, error: "too_many_rooms"}` (per-network cap `ROOM_CREATE_PER_IP_PER_DAY`, default 30, which signed-in hosts skip, so since protocol 2 it is never counted; and the whole-deployment cap `ROOM_CREATE_PER_DAY`, default 300) · `{ok: false, status: 503, error: "no_pin_available"}` after 20 tries.
+- `lookup(pin, {ipKey, tokenless, bypass, missLimit, joinLimit}?)` → `{roomId, library}` · `{limited: true, retryAfterMs, notifyRoom?}` (§9; `notifyRoom` asks the Worker to send that room's hosts `notice`) · `null` (unknown or expired; entries older than 24 h count as expired).
+- `noteMiss(ipKey)`: a miss found by a Room (an unknown token without a valid MAC). `liveRooms(library)`: the library's PINs for "Resume game". `authAttempt(ipKey, passcode)`: the passcode check with its limit (§9).
+- `release(pin, roomId)`; a no-op if the PIN has since been re-issued to another room.
+- Housekeeping: expired PINs, creation counters older than yesterday and passcode rows past their 15 minutes are deleted at most hourly on traffic and from an alarm: daily just after 00:00 UTC (so a counter written on day D is gone by 00:05 UTC on D+2), and when the earliest passcode row expires.
 
 ## 8. CSV
 
@@ -305,10 +328,10 @@ Filename: `hompub-quiz-<pin>-<YYYYMMDD>.csv`.
 | Thing | Limit |
 |---|---|
 | Players per room | `MAX_PLAYERS` = 400 joined players (→ 4009); at most 2 × that many player sockets including not-yet-joined ones, plus 50 for reconnects |
-| Sockets per player | version 2: one (an older one is closed with 4012); version 1: at most 3 (→ 4009) |
-| Wrong host passcodes | 5 per network (IPv4 address, or IPv6 /64) per 15 minutes, then 15 minutes locked (→ 429). Checked in the Directory, reserved before the check, so parallel guesses cannot exceed it. |
-| PIN guesses | per network per 10 minutes: `PIN_MISS_LIMIT` (100) lookups or joins of PINs that do not exist, unknown player tokens, or ended games; and 2 × `MAX_PLAYERS` + 100 new joins. Over either limit, every lookup and new join from that network is refused (→ 429 / 4014, or 4010 for version-1 pages) unless it carries the room key (`k`) or a valid player token for that PIN. |
-| Join timeout | a player socket that sends no `join` within 60 s is closed with 4000 |
+| Sockets per player | version 2: one (another tab's is closed with 4012, the same tab's with 4013); version 1: at most 3 (the oldest is closed with 4009) |
+| Not-yet-joined sockets | at most `MAX_PLAYERS` at once (→ 4009); each is closed 60 s after its last `join` attempt and 3 minutes after it connected (→ `join_timeout`, 4000) |
+| Wrong host passcodes | 5 per network (IPv4 address, or IPv6 /64) per 15 minutes, then 15 minutes locked (→ 429). Checked in the Directory, reserved before the check, so parallel guesses cannot exceed it. The count is saved at the 4th wrong passcode and the lockout at the 5th, so a restart of the Directory does not reset them (up to 500 such rows a day; beyond that, memory only). There is no limit across all networks: one person could then block sign-in for everyone. |
+| PIN guesses | per network per 10 minutes: `PIN_MISS_LIMIT` (100) lookups or joins of PINs that do not exist, unknown player tokens, or ended games; and 2 × `MAX_PLAYERS` + 100 new joins. Over either limit, every lookup and new join from that network is refused (→ 429 / 4014, or 4010 for version-1 pages) unless it carries the room key (`k`) or a valid player token for that PIN; such callers are not counted either (a phone reconnecting with its token after the game was wiped is not guessing). The host of a PIN whose lookups were refused gets `notice` `pin_limited`. |
 | Quiz body | 200 KB, 100 questions, text 200 chars, option 80 chars, title 80 chars |
 | Nickname | 20 characters after trim; a leading `= + - @` is removed |
 | Name changes | 3 student renames per player; host renames unlimited |
@@ -332,22 +355,27 @@ Nothing else. No IPs, no user agents, no logs (observability stays off in
 `wrangler.jsonc`). Everything is deleted at `ack_results` or by TTL. The
 only lasting copy is the CSV the host downloads.
 
-The Directory keeps one IP-derived value for abuse limiting: a truncated
-SHA-256 of `<IP_HASH_KEY secret>|<UTC date>|<client IP>`, with a per-day
-creation count. With the optional `IP_HASH_KEY` secret set (`wrangler secret
-put IP_HASH_KEY`) it cannot be brute-forced back to an address; without it,
-it is a pseudonym that HomPub never links back. It cannot be linked across
-days, and counters are deleted within 48 hours (see §7). Nothing about
-players is ever hashed or kept.
+The Directory counts rooms created per UTC day for the whole deployment,
+deleted within 48 hours (see §7). Before protocol 2 it also kept a per-network
+count under a truncated SHA-256 of `<IP_HASH_KEY>|<UTC date>|<client IP>`;
+creating a room now needs the passcode and signed-in hosts skip that cap, so
+no such row is written any more. Nothing about players is ever hashed or kept.
 
 Since protocol 2 the Directory also keeps, per PIN, which library (host
-passcode) created the room, and, only while a wrong-passcode lockout lasts
-(15 minutes), one row with a keyed hash of the network (IPv4 address or
-IPv6 /64) and the lockout end. Wrong-passcode and PIN-guess counters are held
-in memory only and vanish when the object restarts. The host's session is an
-HttpOnly cookie on the host's browser (30 days, renewed while used, at most 90
-days; or until the browser closes on a shared computer); the server stores no
-sessions.
+passcode) created the room. For wrong passcodes it keeps, only from the 4th
+wrong passcode from one network until 15 minutes later, one row with a keyed
+hash of the network (IPv4 address or IPv6 /64, keyed with `IP_HASH_KEY`, or
+`SESSION_KEY` when that is not set, so it cannot be reversed by trying every
+address) and the count or lockout end. An alarm deletes each row when its
+15 minutes are over. PIN-guess counters are held in memory only and vanish
+when the object restarts. The host's session is an HttpOnly cookie on the
+host's browser (30 days, renewed while used, at most 90 days; or, on a shared
+computer, until the browser closes, after 4 hours without use, or after 12
+hours in all); the server stores no sessions.
+
+Once a day, just after the free daily allowance resets (00:05 UTC), the
+Directory asks every room that still holds a PIN to re-arm its idle-wipe
+alarm if a failed save lost it, so the wipe still happens.
 
 ## 11. Protocol 2 and compatibility
 
@@ -364,10 +392,17 @@ keep working until the fallbacks are removed in Phase 2:
   with 4010 and a reason that tells the teacher to reload. The page keeps its
   host key (it deletes the key only on 4001 or 4004).
 - **A version-2 page meeting an older server** (a rolled-back deployment) sees
-  a `sync` without `proto` or a 404 from `/api/session`: it keeps the
-  full-`roster` handler, hides renames, and says the server is older and to
-  reload. A version-2 host page closed with 4001 after its `auth` frame tries
-  once more with the token in the URL.
+  a `sync` without `proto` or a 404 from `/api/session`. The host page keeps
+  the full-`roster` handler, hides Rename, "Remove and lock" and "Students can
+  change their name", and says the server is older and to reload; closed with
+  4001 after its `auth` frame, it tries once more with the token in the URL.
+  The phone page shows no notice: it hides "Change my name" and offers the old
+  re-spin instead.
+- **What version 1 means for name settings:** the version is what the page
+  says (`v=2`). Until Phase 2 removes the fallbacks, a client that claims
+  version 1 can still spin a name in a "Typed names only" room and re-spin
+  before its first answer, so `nameMode` and `allowRename` hold for version-2
+  pages only. The host can rename or remove anyone at any time.
 - **New error codes and messages** read sensibly on old pages (old pages toast
   the message of an unknown `error`).
 - **Deploys and rollbacks** use `--durable-objects-code-update-mode immediate`

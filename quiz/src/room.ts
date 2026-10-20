@@ -6,7 +6,7 @@
 // It uses the WebSocket Hibernation API, so between questions (no pending
 // timers) the object is evicted from memory while the sockets stay attached
 // at the edge; the next frame re-runs the constructor, which reloads state
-// from SQLite. Per-socket attachments carry only {role, pid, v, authed, joinAt}.
+// from SQLite. Per-socket attachments carry only {role, pid, v, authed, sx, at, joinAt, wid}.
 //
 // Protocol 2 (PROTOCOL.md §11): pages say `v=2`. Version-1 pages (cached before
 // the deploy) keep receiving the frames they understand.
@@ -106,12 +106,18 @@ interface RoomState {
 /**
  * v: protocol version the page speaks (missing = 1). authed: false only for a
  * host socket still waiting for its `auth` frame (missing = authenticated, as
- * every host socket was before protocol 2). joinAt: last join attempt of a
- * player socket that has not joined yet. wid: id of a socket that is still
- * pending, so a timer can find it again through ctx.getWebSockets() (the
- * WebSocket object from the upgrade cannot be closed once it is accepted).
+ * every host socket was before protocol 2). sx: when the host's sign-in
+ * expires, as vouched by the Worker (the socket then closes with 4011). at:
+ * when the socket was accepted. joinAt: last join attempt of a player socket
+ * that has not joined yet. wid: id of a socket that is still pending, so a
+ * timer can find it again through ctx.getWebSockets() (the WebSocket object
+ * from the upgrade cannot be closed once it is accepted).
  */
-interface Attachment { role: 'host' | 'player'; pid: string | null; v?: number; authed?: boolean; joinAt?: number; wid?: string }
+interface Attachment {
+  role: 'host' | 'player'; pid: string | null; v?: number; authed?: boolean; sx?: number; at?: number; joinAt?: number; wid?: string;
+  /** Version-2 phone pages: a per-tab id and the page's connection count, so a reconnect is not taken for a second tab. */
+  tab?: string; seq?: number;
+}
 
 interface RosterEntry { pid: string; nick: string; connected: boolean; score: number; answered: boolean }
 interface Keys { host: CryptoKey; token: CryptoKey; room: CryptoKey }
@@ -123,10 +129,13 @@ const PROTO = 2;
 /** What a player_updated delta is about: the name and whether the phone is connected. */
 const rosterSig = (e: RosterEntry) => `${e.connected ? 1 : 0}|${e.nick}`;
 const ACTIVITY_PERSIST_MS = 60_000;
-/** A socket that connects as a player but never sends a successful `join` is closed after this long. */
+/** A socket that connects as a player but never sends a successful `join` is closed after this long without trying... */
 const PENDING_JOIN_MS = 60_000;
+/** ...and after this long in any case, so refused joins cannot keep sockets open to fill the room. */
+const PENDING_MAX_MS = 3 * 60_000;
 /** Extra player sockets allowed above 2 × MAX_PLAYERS, so reconnects still fit in a full room. */
 const SOCKET_HEADROOM = 50;
+const SESSION_ENDED = 'Your sign-in has expired. Sign in again to continue this game.';
 const STORAGE_MESSAGE =
   "The server could not save the game. Cloudflare's free daily limit is probably used up; it resets at 05:30 IST (00:00 UTC). The game cannot continue until then.";
 
@@ -250,6 +259,27 @@ export class Room extends DurableObject<Env> {
     };
   }
 
+  /**
+   * The Worker refused PIN lookups for this game from a network over the
+   * PIN-guess limit. Typing the PIN does not work there for a while; scanning
+   * the QR code (which carries the room key) still does, so tell the host.
+   */
+  async limitNotice(retryAfterMs: number): Promise<void> {
+    if (!this.state) return;
+    const ms = Math.max(0, Math.min(Number(retryAfterMs) || 0, 60 * 60_000));
+    this.broadcast('host', { t: 'notice', code: 'pin_limited', retryAfterMs: ms, serverNow: Date.now() });
+  }
+
+  /**
+   * Daily safety net from the Directory: a room whose alarm was lost (a save
+   * failed while it was being re-armed) gets one again, so the idle wipe still
+   * happens once saving works.
+   */
+  async checkAlarm(): Promise<void> {
+    if (!this.state) return;
+    if ((await this.ctx.storage.getAlarm()) == null) await this.armAlarm();
+  }
+
   /** For the signed-in host's "Resume game" list. */
   async hostSummary(): Promise<{ pin: string; title: string; phase: Phase; playerCount: number } | null> {
     const s = this.state;
@@ -267,6 +297,10 @@ export class Room extends DurableObject<Env> {
     const role = url.searchParams.get('role');
     const token = url.searchParams.get('token') || '';
     const v = Number(url.searchParams.get('v')) >= 2 ? 2 : 1;
+    const tabParam = url.searchParams.get('tab') || '';
+    const tab = /^[0-9a-f]{16,32}$/.test(tabParam) ? tabParam : undefined;
+    const seqParam = Number(url.searchParams.get('seq'));
+    const seq = Number.isInteger(seqParam) && seqParam >= 0 && seqParam < 1e9 ? seqParam : undefined;
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
@@ -284,9 +318,9 @@ export class Room extends DurableObject<Env> {
       const s = this.state;
       if (!s) return reject(4004, 'Room not found');
       // The Worker vouches for a signed-in host with a short-lived signed header; a client cannot forge it.
-      const vouched = keys ? await verifyHostHeader(keys.host, request.headers.get('X-HQ-Host'), s.pin, Date.now()) : false;
+      const sx = keys ? await verifyHostHeader(keys.host, request.headers.get('X-HQ-Host'), s.pin, Date.now()) : null;
       let authed: boolean;
-      if (vouched) authed = true;
+      if (sx !== null) authed = true;
       else if (token) {
         if (token !== s.hostToken) return reject(4001, 'Bad host token');
         authed = true;
@@ -294,7 +328,7 @@ export class Room extends DurableObject<Env> {
       else return reject(4001, 'Bad host token');
       if (!authed && this.pendingHosts() >= LIMITS.pendingHosts) return reject(4000, 'Too many host connections are waiting');
       const wid = authed ? undefined : randomHex(8);
-      this.accept(server, { role: 'host', pid: null, v, authed, ...(wid ? { wid } : {}) });
+      this.accept(server, { role: 'host', pid: null, v, authed, ...(sx !== null ? { sx } : {}), ...(wid ? { wid } : {}) });
       if (authed) this.hostReady(server);
       else {
         setTimeout(() => {
@@ -302,6 +336,8 @@ export class Room extends DurableObject<Env> {
           if (ws) this.closeFromTimer(ws, 4001, 'Host sign-in timed out', 'auth_timeout');
         }, LIMITS.hostAuthMs);
       }
+      // Wake up when this sign-in expires, to close the socket then (armAlarm takes the earliest).
+      if (sx !== null) this.armAlarm().catch(() => { /* re-armed by the next transition */ });
       return respond();
     }
 
@@ -321,22 +357,37 @@ export class Room extends DurableObject<Env> {
         return respond();
       }
       const mine = this.socketsOf(pid);
+      // Sockets this connection replaces. Version 2: one live page per player, so every
+      // other open version-2 socket (one the page is already closing is left to finish).
+      // Version 1: pages are never evicted for a second tab (two old tabs would evict each
+      // other forever), but at the 3-socket cap the oldest goes, since it is usually a
+      // half-open socket a phone abandoned when it woke up.
+      let replaced: WebSocket[];
       if (v >= 2) {
-        // One live page per player: the older version-2 socket is told why it closes and does not retry.
-        // A page reconnecting its own socket ignores the close of the socket it already abandoned.
-        for (const old of mine) {
+        replaced = mine.filter(old => ((old.deserializeAttachment() as Attachment | null)?.v ?? 1) >= 2 && old.readyState === 1 /* OPEN */);
+        // The same tab already holds a newer connection: this upgrade is one the page abandoned
+        // (it reconnected again while the request was in flight), so it must not evict the newer one.
+        for (const old of replaced) {
           const a = old.deserializeAttachment() as Attachment | null;
-          // A socket the page is already closing (its own reconnect) is left to finish closing.
-          if ((a?.v ?? 1) >= 2 && old.readyState === 1 /* OPEN */) {
-            try { old.close(4012, 'This game is open in another tab or device'); } catch { /* gone */ }
-          }
+          if (tab && a?.tab === tab && seq !== undefined && a.seq !== undefined && a.seq > seq) return reject(4013, 'Replaced by a newer connection from this page');
         }
-      } else if (mine.length >= LIMITS.socketsPerPlayer) {
-        // Version-1 pages are never evicted (two old tabs would evict each other forever), only capped.
-        return reject(4009, 'Too many tabs are open for this player. Close the others, then tap Try again.');
+      } else {
+        const byAge = mine.map(ws => ({ ws, at: (ws.deserializeAttachment() as Attachment | null)?.at ?? 0 })).sort((a, b) => a.at - b.at);
+        replaced = byAge.slice(0, Math.max(0, mine.length - (LIMITS.socketsPerPlayer - 1))).map(x => x.ws);
       }
-      if (this.ctx.getWebSockets('player').length >= this.maxPlayers() * 2 + SOCKET_HEADROOM) return reject(4009, 'This game is full');
-      this.accept(server, { role: 'player', pid, v });
+      // Check the room-wide cap first, so a refused connection never costs the player a working one.
+      if (this.ctx.getWebSockets('player').length - replaced.length >= this.maxPlayers() * 2 + SOCKET_HEADROOM) return reject(4009, 'This game is full');
+      for (const old of replaced) {
+        const a = old.deserializeAttachment() as Attachment | null;
+        // Same tab: the page's own older socket (it ignores this close). Another tab or device: 4012, no retry.
+        const [code, why] = (a?.v ?? 1) < 2
+          ? [4009, 'Too many tabs are open for this player. Close the others, then tap Try again.']
+          : tab && a?.tab === tab
+            ? [4013, 'Replaced by a newer connection from this page']
+            : [4012, 'This game is open in another tab or device'];
+        this.closeWith(old, code, why);
+      }
+      this.accept(server, { role: 'player', pid, v, ...(tab ? { tab } : {}), ...(seq !== undefined ? { seq } : {}) });
       this.touch();
       this.send(server, this.buildSync('player', pid));
       this.scheduleRoster();
@@ -345,9 +396,10 @@ export class Room extends DurableObject<Env> {
 
     const refusal = this.joinRefusal();
     if (refusal) return reject(refusal.code, refusal.reason);
-    // Pending player: joins with a `join` frame, or is dropped after a minute without a join attempt.
+    // Pending player: joins with a `join` frame, or is dropped after a minute without a join
+    // attempt, and after 3 minutes in any case.
     const wid = randomHex(8);
-    this.accept(server, { role: 'player', pid: null, v, joinAt: Date.now(), wid });
+    this.accept(server, { role: 'player', pid: null, v, joinAt: Date.now(), wid, ...(tab ? { tab } : {}), ...(seq !== undefined ? { seq } : {}) });
     this.touch();
     this.armPendingTimer(wid, PENDING_JOIN_MS);
     return respond();
@@ -355,13 +407,19 @@ export class Room extends DurableObject<Env> {
 
   private accept(ws: WebSocket, att: Attachment): void {
     this.ctx.acceptWebSocket(ws, [att.role]);
-    ws.serializeAttachment(att);
+    ws.serializeAttachment({ ...att, at: Date.now() });
   }
 
   /** An authenticated host socket: snapshot, results if the game is over, and the host count. */
   private hostReady(ws: WebSocket): void {
     const s = this.state!;
     this.touch();
+    // Bring the other hosts and the delta baseline up to date first, so the snapshot
+    // below is exactly what later deltas are computed against.
+    if (this.rosterTimer || !this.rosterBaseline) {
+      if (this.rosterTimer) { clearTimeout(this.rosterTimer); this.rosterTimer = null; }
+      this.flushRoster(ws);
+    }
     this.send(ws, this.buildSync('host', null));
     // A host taking over after the game ended still needs the results file.
     if (s.phase === 'ended') this.send(ws, this.resultsFrame());
@@ -374,7 +432,8 @@ export class Room extends DurableObject<Env> {
       if (!ws) return;
       try {
         const a = ws.deserializeAttachment() as Attachment | null;
-        const left = (a?.joinAt ?? 0) + PENDING_JOIN_MS - Date.now();
+        const now = Date.now();
+        const left = Math.min((a?.joinAt ?? 0) + PENDING_JOIN_MS, (a?.at ?? 0) + PENDING_MAX_MS) - now;
         if (left > 500) { this.armPendingTimer(wid, left); return; }
         this.closeFromTimer(ws, 4000, 'Join timed out', 'join_timeout');
       } catch { /* socket already gone */ }
@@ -388,6 +447,17 @@ export class Room extends DurableObject<Env> {
    */
   private closeFromTimer(ws: WebSocket, code: number, reason: string, errorCode: string): void {
     this.sendError(ws, errorCode, reason);
+    try { ws.close(code, reason); } catch { /* already gone */ }
+  }
+
+  /**
+   * Close a socket, saying so in a `closing` frame first. In local workerd the
+   * close handshake of a socket that has not sent a frame yet stalls when another
+   * socket's event closes it (a phone that reconnected and has not answered yet),
+   * so version-2 pages act on this frame as on the close itself.
+   */
+  private closeWith(ws: WebSocket, code: number, reason: string): void {
+    this.send(ws, { t: 'closing', code, reason });
     try { ws.close(code, reason); } catch { /* already gone */ }
   }
 
@@ -408,8 +478,15 @@ export class Room extends DurableObject<Env> {
     if (s.phase !== 'lobby' && !s.settings.lateJoin) return { code: 4010, reason: 'Late joining is off for this game' };
     const max = this.maxPlayers();
     if (this.activePlayers().length >= max) return { code: 4009, reason: 'This game is full' };
-    // Sockets that have not joined yet (and second tabs) also count, against a looser cap.
-    if (this.ctx.getWebSockets('player').length >= max * 2) return { code: 4009, reason: 'This game is full' };
+    // Sockets that have not joined yet (and second tabs) also count, against a looser cap,
+    // and sockets that have not joined yet may not take more than half of it.
+    const sockets = this.ctx.getWebSockets('player');
+    if (sockets.length >= max * 2) return { code: 4009, reason: 'This game is full' };
+    if (sockets.length >= max) {
+      let pending = 0;
+      for (const ws of sockets) if (!(ws.deserializeAttachment() as Attachment | null)?.pid) pending += 1;
+      if (pending >= max) return { code: 4009, reason: 'This game is full' };
+    }
     return null;
   }
 
@@ -442,6 +519,7 @@ export class Room extends DurableObject<Env> {
     }
     if (!this.state) { ws.close(4004, 'Room not found'); return; }
     if (att.role === 'host' && att.authed === false) { this.hostAuth(ws, att, frame); return; }
+    if (att.role === 'host' && att.sx !== undefined && Date.now() >= att.sx) { this.closeWith(ws, 4011, SESSION_ENDED); this.broadcastHostCount(ws); return; }
     this.touch();
 
     try {
@@ -484,10 +562,10 @@ export class Room extends DurableObject<Env> {
     switch (frame.t) {
       case 'join': {
         if (att.pid) {
-          // Already joined: allow re-spinning the name before the first answer (max 3 spins).
-          // Version-1 pages use this; version-2 pages use `rename`.
+          // Already joined: a version-1 page may re-spin its name before the first answer (max 3
+          // spins). Version-2 pages use `rename`, which follows the host's name settings.
           const p = this.players.get(att.pid);
-          if (p && frame.spin === true && Object.keys(p.answers).length === 0 && p.spins < 3) {
+          if (p && (att.v ?? 1) < 2 && frame.spin === true && Object.keys(p.answers).length === 0 && p.spins < 3) {
             const before = { nick: p.nick, spins: p.spins };
             p.nick = this.uniqueNick(spinName(), p.pid);
             p.spins += 1;
@@ -506,7 +584,13 @@ export class Room extends DurableObject<Env> {
         const joinId = typeof frame.joinId === 'string' && /^[0-9a-f]{32}$/.test(frame.joinId) ? frame.joinId : null;
         if (joinId) {
           const prev = this.players.get(this.joinIds.get(joinId) ?? '');
-          if (prev && !prev.kicked && Date.now() - prev.joinedAt <= LIMITS.joinIdMs) {
+          if (prev && prev.kicked) {
+            // The same page joined, was removed, and is now retrying the join: it stays removed.
+            this.send(ws, { t: 'kicked' });
+            ws.close(4003, 'Removed by the host');
+            return;
+          }
+          if (prev && Date.now() - prev.joinedAt <= LIMITS.joinIdMs) {
             // The same page joined a moment ago and missed its `welcome`: reattach, do not create a ghost.
             att.pid = prev.pid;
             delete att.joinAt;
@@ -526,7 +610,8 @@ export class Room extends DurableObject<Env> {
           // The student stays on the form and tries again; the pending-socket clock restarts.
           att.joinAt = Date.now();
           ws.serializeAttachment(att);
-          this.send(ws, { t: 'join_rejected', reason: choice.reason, message: choice.message });
+          // nameMode: the join form may have been drawn before the host changed it.
+          this.send(ws, { t: 'join_rejected', reason: choice.reason, message: choice.message, nameMode: s.settings.nameMode });
           return;
         }
         const wanted = choice.kind === 'random' ? spinName() : choice.nick;
@@ -536,11 +621,17 @@ export class Room extends DurableObject<Env> {
         const nick = this.uniqueNick(wanted, pid);
         let note: NameNote | null = choice.kind === 'typed' ? choice.note : null;
         if (choice.kind === 'typed' && nick !== wanted) note = { reason: 'duplicate', message: `Someone is already ${wanted}, so you are ${nick}.` };
+        if (choice.kind === 'random' && choice.replaced) note = { reason: 'random', message: `This game gives everyone a random name, so you are ${nick}.` };
         const now = Date.now();
-        this.write(
-          'INSERT INTO players (pid, token, nick, joined_at, kicked, spins, score, elapsed_total, streak, answers, renames, join_id) VALUES (?, ?, ?, ?, 0, ?, 0, 0, 0, ?, 0, ?)',
-          pid, token, nick, now, spins, '{}', joinId,
-        );
+        try {
+          this.write(
+            'INSERT INTO players (pid, token, nick, joined_at, kicked, spins, score, elapsed_total, streak, answers, renames, join_id) VALUES (?, ?, ?, ?, 0, ?, 0, 0, 0, ?, 0, ?)',
+            pid, token, nick, now, spins, '{}', joinId,
+          );
+        } catch (e) {
+          this.send(ws, { t: 'join_rejected', reason: 'unavailable', message: 'The game cannot take new players right now. Ask your teacher.' });
+          throw e;
+        }
         const p: Player = { pid, token, nick, joinedAt: now, kicked: false, spins, score: 0, elapsedTotal: 0, streak: 0, answers: {}, renames: 0, joinId };
         this.players.set(pid, p);
         this.byToken.set(token, pid);
@@ -571,7 +662,7 @@ export class Room extends DurableObject<Env> {
         p.renames += 1;
         try { this.persistPlayer(p); } catch (e) { Object.assign(p, before); throw e; }
         this.sendToPlayer(p.pid, { t: 'renamed', nick: p.nick, renamesLeft: left(), ...(note ? { note } : {}) });
-        this.scheduleRoster();
+        this.rosterChanged();
         return;
       }
       case 'answer': {
@@ -643,8 +734,9 @@ export class Room extends DurableObject<Env> {
         if (s.phase !== 'lobby') return badPhase('The game has already started.');
         // Students may rename themselves in the lobby only, unless the host turns it on again.
         const renameWasOn = s.settings.allowRename;
+        const restore = this.snapshot();
         if (renameWasOn) s.settings = mergeSettings(s.settings, { allowRename: false }, false);
-        await this.startQuestion(0);
+        try { await this.startQuestion(0); } catch (e) { restore(); throw e; }
         if (renameWasOn) this.settingsChanged(true);
         return;
       }
@@ -671,16 +763,22 @@ export class Room extends DurableObject<Env> {
         if (!p) return this.sendError(ws, 'unknown_player', 'No such player');
         const lock = frame.lock === true && !s.locked;
         p.kicked = true;
-        this.persistPlayer(p);
-        if (lock) { s.locked = true; this.persistRoom(); }
+        try { this.persistPlayer(p); } catch (e) { p.kicked = false; throw e; }
+        // The removal is saved; if the lock cannot be, the player is still removed and the host told.
+        let lockFailed: unknown = null;
+        if (lock) {
+          s.locked = true;
+          try { this.persistRoom(); } catch (e) { s.locked = false; lockFailed = e; }
+        }
         this.answered.delete(pid);
         this.eligible?.delete(pid);
         for (const sock of this.socketsOf(pid)) {
           this.send(sock, { t: 'kicked' });
           try { sock.close(4003, 'Removed by the host'); } catch { /* ignore */ }
         }
-        if (lock) this.broadcast('host', { t: 'settings', settings: s.settings, locked: s.locked });
+        if (lock && !lockFailed) this.broadcast('host', { t: 'settings', settings: s.settings, locked: s.locked });
         this.scheduleRoster();
+        if (lockFailed) throw lockFailed;
         return;
       }
       case 'rename_player': {
@@ -694,22 +792,23 @@ export class Room extends DurableObject<Env> {
         p.nick = this.uniqueNick(wanted, p.pid);
         try { this.persistPlayer(p); } catch (e) { p.nick = before; throw e; }
         this.sendToPlayer(p.pid, { t: 'renamed', nick: p.nick, byHost: true, renamesLeft: Math.max(0, LIMITS.maxRenames - p.renames) });
-        this.scheduleRoster();
-        if (s.phase === 'closed' || s.phase === 'podium') this.broadcast('host', this.buildSync('host', null));
+        this.rosterChanged();
         // After End the results file changes; `update` tells the host page not to download it again.
         if (s.phase === 'ended') this.broadcast('host', { ...this.resultsFrame(), update: true });
         return;
       }
-      case 'lock':
+      case 'lock': {
+        const was = s.locked;
         s.locked = frame.on === true;
-        this.persistRoom();
+        try { this.persistRoom(); } catch (e) { s.locked = was; throw e; }
         this.broadcast('host', { t: 'settings', settings: s.settings, locked: s.locked });
         this.scheduleRoster();
         return;
+      }
       case 'settings': {
         const before = s.settings;
         s.settings = mergeSettings(before, frame.settings, s.phase === 'lobby');
-        this.persistRoom();
+        try { this.persistRoom(); } catch (e) { s.settings = before; throw e; }
         this.settingsChanged(
           before.nameMode !== s.settings.nameMode || before.allowRename !== s.settings.allowRename,
           before.showOnDevices !== s.settings.showOnDevices,
@@ -756,10 +855,27 @@ export class Room extends DurableObject<Env> {
 
   // ---------------------------------------------------------- game machine
 
+  /**
+   * Remember the room's phase fields so a transition whose save fails can be
+   * undone: memory then still matches SQLite, and the host can try again.
+   */
+  private snapshot(): () => void {
+    const s = this.state!;
+    const room = { ...s };
+    const answered = new Set(this.answered);
+    const eligible = this.eligible;
+    return () => {
+      Object.assign(s, room);
+      this.answered = answered;
+      this.eligible = eligible;
+    };
+  }
+
   private async startQuestion(q: number): Promise<void> {
     const s = this.state!;
     const question = s.quiz.questions[q];
     const now = Date.now();
+    const restore = this.snapshot();
     this.clearTimers();
     s.phase = 'intro';
     s.q = q;
@@ -767,9 +883,9 @@ export class Room extends DurableObject<Env> {
     s.deadline = s.opensAt + question.timeLimit * 1000;
     s.phaseAt = now;
     s.lastActivity = now;
-    this.answered.clear();
+    this.answered = new Set();
     this.eligible = null;
-    this.persistRoom();
+    try { this.persistRoom(); } catch (e) { restore(); throw e; }
 
     this.broadcast('host', { t: 'intro', question: this.questionView(true), serverNow: now });
     this.broadcast('player', { t: 'intro', question: this.questionView(s.settings.showOnDevices), serverNow: now });
@@ -783,10 +899,11 @@ export class Room extends DurableObject<Env> {
     if (this.openTimer) clearTimeout(this.openTimer);
     this.openTimer = null;
     const now = Date.now();
+    const restore = this.snapshot();
     s.phase = 'open';
     s.phaseAt = now;
     s.lastActivity = now;
-    this.persistRoom();
+    try { this.persistRoom(); } catch (e) { restore(); throw e; }
     this.eligible = this.connectedPids();
     const frame = { t: 'open', q: s.q, deadline: s.deadline, serverNow: now };
     this.broadcast('player', frame);
@@ -802,10 +919,11 @@ export class Room extends DurableObject<Env> {
     if (!s || s.phase !== 'open') return;
     this.clearTimers();
     const now = Date.now();
+    const restore = this.snapshot();
     s.phase = 'closed';
     s.phaseAt = now;
     s.lastActivity = now;
-    this.persistRoom();
+    try { this.persistRoom(); } catch (e) { restore(); throw e; }
 
     const ranks = this.rankMap();
     const question = s.quiz.questions[s.q];
@@ -827,6 +945,11 @@ export class Room extends DurableObject<Env> {
     await this.armAlarm();
   }
 
+  /**
+   * The podium and End are sent before they are saved: every answer they show
+   * is already saved, and a host whose daily write allowance has run out must
+   * still get the results. A failed save is then reported (storage_full).
+   */
   private async podium(): Promise<void> {
     const s = this.state!;
     this.clearTimers();
@@ -834,7 +957,6 @@ export class Room extends DurableObject<Env> {
     s.phase = 'podium';
     s.phaseAt = now;
     s.lastActivity = now;
-    this.persistRoom();
     const ranks = this.rankMap();
     const sorted = this.sortedPlayers();
     const playerCount = sorted.length;
@@ -852,6 +974,7 @@ export class Room extends DurableObject<Env> {
       leaderboard: this.leaderboard(sorted),
       playerCount,
     });
+    this.persistRoom();
     await this.armAlarm();
   }
 
@@ -862,9 +985,9 @@ export class Room extends DurableObject<Env> {
     s.phase = 'ended';
     s.phaseAt = now;
     s.lastActivity = now;
-    this.persistRoom();
     this.broadcast('player', { t: 'ended' });
     this.broadcast('host', this.resultsFrame());
+    this.persistRoom();
     await this.armAlarm();
   }
 
@@ -880,9 +1003,7 @@ export class Room extends DurableObject<Env> {
     const s = this.state;
     this.clearTimers();
     this.broadcast('host', { t: 'wiped' });
-    for (const sock of this.ctx.getWebSockets()) {
-      try { sock.close(4004, 'Game over'); } catch { /* ignore */ }
-    }
+    for (const sock of this.ctx.getWebSockets()) this.closeWith(sock, 4004, 'Game over');
     this.state = null;
     this.players.clear();
     this.byToken.clear();
@@ -906,6 +1027,7 @@ export class Room extends DurableObject<Env> {
     const s = this.state;
     if (!s) return;
     const now = Date.now();
+    this.closeExpiredHosts(now);
     try {
       if (s.phase === 'intro' && s.opensAt != null && now >= s.opensAt) await this.openQuestion();
       if (s.phase === 'open' && s.deadline != null && now >= s.deadline + LIMITS.graceMs) await this.closeQuestion();
@@ -925,9 +1047,25 @@ export class Room extends DurableObject<Env> {
       }
       await this.armAlarm();
     } catch (err) {
-      if (err instanceof StorageError) { this.storageFailed(); return; }
+      if (err instanceof StorageError) {
+        this.storageFailed();
+        // Try again later; if saving is impossible for now, the Directory's daily sweep re-arms it.
+        try { await this.ctx.storage.setAlarm(now + 15 * 60_000); } catch { /* checkAlarm() */ }
+        return;
+      }
       throw err;
     }
+  }
+
+  /** Host sockets whose sign-in has expired are closed with 4011 (the page asks for the passcode). */
+  private closeExpiredHosts(now: number): void {
+    let closed = false;
+    for (const h of this.authedHosts()) {
+      if (h.att.sx === undefined || now < h.att.sx) continue;
+      this.closeWith(h.ws, 4011, SESSION_ENDED);
+      closed = true;
+    }
+    if (closed) this.broadcastHostCount();
   }
 
   private plan(): { wipeAt: number; warnAt: number | null } {
@@ -951,6 +1089,8 @@ export class Room extends DurableObject<Env> {
     if (plan.warnAt !== null && now < plan.warnAt && hasResults(s.phase, s.q)) next = Math.min(next, plan.warnAt);
     if (s.phase === 'intro' && s.opensAt != null) next = Math.min(next, s.opensAt + 500);
     if (s.phase === 'open' && s.deadline != null) next = Math.min(next, s.deadline + LIMITS.graceMs + 500);
+    // Wake when the earliest host sign-in expires, to close that socket.
+    for (const h of this.authedHosts()) if (h.att.sx !== undefined) next = Math.min(next, h.att.sx + 1000);
     this.dev.alarms += 1;
     await this.ctx.storage.setAlarm(Math.max(next, now + 1000));
   }
@@ -1150,10 +1290,11 @@ export class Room extends DurableObject<Env> {
     }
   }
 
+  /** Open, authenticated host sockets (one the server has just closed is no longer counted). */
   private authedHosts(exclude?: WebSocket): { ws: WebSocket; att: Attachment }[] {
     const out: { ws: WebSocket; att: Attachment }[] = [];
     for (const ws of this.ctx.getWebSockets('host')) {
-      if (ws === exclude) continue;
+      if (ws === exclude || ws.readyState !== 1 /* OPEN */) continue;
       const att = ws.deserializeAttachment() as Attachment | null;
       if (att && att.authed !== false) out.push({ ws, att });
     }
@@ -1227,6 +1368,18 @@ export class Room extends DurableObject<Env> {
     }, LIMITS.tallyIntervalMs);
   }
 
+  /**
+   * A name changed. In the reveal and on the podium the projector also shows names in
+   * the leaderboard and the top three, so hosts get a fresh sync; otherwise a delta.
+   */
+  private rosterChanged(): void {
+    const s = this.state!;
+    if (s.phase !== 'closed' && s.phase !== 'podium') { this.scheduleRoster(); return; }
+    if (this.rosterTimer) { clearTimeout(this.rosterTimer); this.rosterTimer = null; }
+    this.broadcast('host', this.buildSync('host', null));
+    this.rosterBaseline = new Map(this.roster().map(e => [e.pid, rosterSig(e)]));
+  }
+
   private scheduleRoster(): void {
     if (this.rosterTimer) return;
     this.rosterTimer = setTimeout(() => {
@@ -1243,11 +1396,11 @@ export class Room extends DurableObject<Env> {
    * flags move for everyone on every question and reach the host through
    * tally, reveal and leaderboard instead, so they would only bloat the deltas.
    */
-  private flushRoster(): void {
+  private flushRoster(exclude?: WebSocket): void {
     const s = this.state!;
     const entries = this.roster();
     const playerCount = entries.length;
-    const hosts = this.authedHosts();
+    const hosts = this.authedHosts(exclude);
     const v1 = hosts.filter(h => (h.att.v ?? 1) < 2);
     const v2 = hosts.filter(h => (h.att.v ?? 1) >= 2);
     if (v1.length) {
@@ -1344,7 +1497,14 @@ export class Room extends DurableObject<Env> {
     const s = this.state;
     if (!s) return;
     const now = Date.now();
+    // Activity once the idle-wipe warning is due moves the wipe: hosts get the new times and drop
+    // the warning. Worked out from the times, not a flag, because hibernation clears memory.
+    const before = hasResults(s.phase, s.q) ? this.plan() : null;
     s.lastActivity = now;
+    if (before && before.warnAt !== null && now >= before.warnAt) {
+      this.warnedWipeAt = 0;
+      this.broadcast('host', { t: 'expiry', ...this.expiry(), serverNow: now });
+    }
     if (now - this.lastPersistedActivity > ACTIVITY_PERSIST_MS) {
       try { this.persistActivity(now); } catch { /* reported by the write that matters */ }
     }
@@ -1390,7 +1550,7 @@ export class Room extends DurableObject<Env> {
     const r = rows[0];
     this.state = {
       pin: r.pin, hostToken: r.host_token, phase: r.phase, q: r.q, opensAt: r.opens_at, deadline: r.deadline,
-      settings: normalizeSettings(JSON.parse(r.settings)), quiz: JSON.parse(r.quiz) as Quiz, locked: r.locked === 1,
+      settings: normalizeSettings(JSON.parse(r.settings), r.phase), quiz: JSON.parse(r.quiz) as Quiz, locked: r.locked === 1,
       createdAt: r.created_at, lastActivity: r.last_activity, phaseAt: r.phase_at,
     };
     this.lastPersistedActivity = r.last_activity;

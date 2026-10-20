@@ -172,6 +172,9 @@ test('joinName: version-2 pages are told why; version-1 pages keep the old silen
   assert.equal(joinName({ nameMode: 'typed', v2: false, nick: '', spin: true }).kind, 'random');  // old Spin honoured
   assert.equal(joinName({ nameMode: 'either', v2: true, nick: '', spin: true }).kind, 'random');
   assert.equal(joinName({ nameMode: 'random', v2: true, nick: 'Priya', spin: false }).kind, 'random');
+  assert.deepEqual(joinName({ nameMode: 'random', v2: true, nick: 'Priya', spin: false }), { kind: 'random', replaced: true });   // told why
+  assert.deepEqual(joinName({ nameMode: 'random', v2: true, nick: '', spin: true }), { kind: 'random' });
+  assert.deepEqual(joinName({ nameMode: 'random', v2: false, nick: 'Priya', spin: false }), { kind: 'random' });
   const stripped = joinName({ nameMode: 'typed', v2: true, nick: '+91 Priya', spin: false });
   assert.ok(stripped.kind === 'typed' && stripped.nick === '91 Priya' && stripped.note?.reason === 'stripped');
   const long = joinName({ nameMode: 'typed', v2: true, nick: 'Abcdefghijklmnopqrstuvwxyz', spin: false });
@@ -207,4 +210,24 @@ test('hasResults: an idle wipe destroys results once a question has been played'
   assert.equal(hasResults('intro', 1), true);
   assert.equal(hasResults('podium', 4), true);
   assert.equal(hasResults('ended', 4), false);   // already sent at End
+});
+
+test('invisible characters cannot split a filtered word, and are removed from the name shown', () => {
+  for (const raw of ['fu⁠ck', 'nig­ger', 'sh​it', 'b᠎itch', 'f\u{E0020}uck', 'cuㅤnt']) {
+    const nick = sanitizeNick(raw);
+    assert.equal(isProfane(nick), true, JSON.stringify(raw));
+    assert.equal(renameCheck({ allowRename: true, nameMode: 'typed', renames: 0, current: 'Priya', nick: raw }).ok, false, JSON.stringify(raw));
+  }
+  assert.equal(sanitizeNick('Pri­ya'), 'Priya');
+  assert.equal(sanitizeNick('ㅤ'), '');                         // a blank-looking name is no name
+  assert.equal(sanitizeNick('❤️ Asha'), '❤️ Asha');                   // emoji presentation selector kept
+  assert.equal(isProfane(sanitizeNick('Dīkṣit')), false);
+});
+
+test('a room stored before allowRename existed gets it only while still in the lobby', () => {
+  const stored = { mode: 'speed', showOnDevices: false, lateJoin: true, earlyClose: true, nicknameMode: 'free' };
+  assert.equal(normalizeSettings(stored, 'lobby').allowRename, true);
+  for (const phase of ['intro', 'open', 'closed', 'podium', 'ended'] as const) assert.equal(normalizeSettings(stored, phase).allowRename, false, phase);
+  assert.equal(normalizeSettings({ ...stored, allowRename: true }, 'open').allowRename, true);   // the host turned it back on
+  assert.equal(normalizeSettings(stored).allowRename, DEFAULT_SETTINGS.allowRename);               // a new room
 });

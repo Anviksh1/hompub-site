@@ -68,9 +68,9 @@ test('changing either secret ends every session', async () => {
 test('keys are separated by purpose', async () => {
   const sessionKey = await deriveKey(SECRET, PASS, 'session');
   const hostKey = await deriveKey(SECRET, PASS, 'host');
-  const header = await signHostHeader(hostKey, '123456', T);
-  assert.equal(await verifyHostHeader(hostKey, header, '123456', T), true);
-  assert.equal(await verifyHostHeader(sessionKey, header, '123456', T), false);
+  const header = await signHostHeader(hostKey, '123456', T, T + SESSION.ttlMs);
+  assert.equal(await verifyHostHeader(hostKey, header, '123456', T), T + SESSION.ttlMs);
+  assert.equal(await verifyHostHeader(sessionKey, header, '123456', T), null);
 });
 
 test('renewSession: past half-life, never beyond the absolute cap; shared sessions slide', () => {
@@ -84,6 +84,19 @@ test('renewSession: past half-life, never beyond the absolute cap; shared sessio
   assert.equal(shared.exp, T + SESSION.sharedIdleMs);
   assert.equal(renewSession(shared, T + 60_000), null);                      // under 5 min gained
   assert.equal(renewSession(shared, T + 3_600_000)!.exp, T + 3_600_000 + SESSION.sharedIdleMs);
+});
+
+test('a shared-computer session never outlives its absolute cap, even when renewed', async () => {
+  const key = await deriveKey(SECRET, PASS, 'session');
+  let s = newSession(ORIGIN, true, T);
+  for (let t = T + 3_600_000; t <= T + 20 * 3_600_000; t += 3_600_000) {
+    const next = renewSession(s, t);
+    if (next) s = next;
+  }
+  assert.equal(s.exp, T + SESSION.sharedMaxMs);
+  const value = await signSession(key, { ...s, exp: T + 30 * 3_600_000 });    // even with a later exp
+  assert.equal(await readSession(key, value, ORIGIN, T + SESSION.sharedMaxMs + 1), null);
+  assert.ok(await readSession(key, value, ORIGIN, T + SESSION.sharedMaxMs - 1));
 });
 
 test('cookie headers: __Host- prefix rules, shared sessions have no Max-Age', () => {
@@ -115,14 +128,19 @@ test('originOkForSession: strict on writes and upgrades, tolerant of same-origin
   assert.equal(ok('HEAD', null, 'same-origin'), true);
 });
 
-test('signed host header: bound to its PIN and short-lived', async () => {
+test('signed host header: bound to its PIN and session expiry, and short-lived', async () => {
   const key = await deriveKey(SECRET, PASS, 'host');
-  const h = await signHostHeader(key, '123456', T);
-  assert.equal(await verifyHostHeader(key, h, '123456', T + 1000), true);
-  assert.equal(await verifyHostHeader(key, h, '654321', T + 1000), false);
-  assert.equal(await verifyHostHeader(key, h, '123456', T + SESSION.hostHeaderMs + 1), false);
-  assert.equal(await verifyHostHeader(key, null, '123456', T), false);
-  assert.equal(await verifyHostHeader(key, '1.abc', '123456', T), false);
+  const sexp = T + 4 * 3_600_000;
+  const h = await signHostHeader(key, '123456', T, sexp);
+  assert.equal(await verifyHostHeader(key, h, '123456', T + 1000), sexp);
+  assert.equal(await verifyHostHeader(key, h, '654321', T + 1000), null);
+  assert.equal(await verifyHostHeader(key, h, '123456', T + SESSION.hostHeaderMs + 1), null);
+  assert.equal(await verifyHostHeader(key, null, '123456', T), null);
+  assert.equal(await verifyHostHeader(key, '1.abc', '123456', T), null);
+  const [exp, , mac] = h.split('.');
+  assert.equal(await verifyHostHeader(key, `${exp}.${sexp + 3_600_000}.${mac}`, '123456', T), null);   // a later expiry is forged
+  assert.equal(await verifyHostHeader(key, `${exp}.${mac}`, '123456', T), null);                        // the old two-part form
+  assert.equal(await verifyHostHeader(key, await signHostHeader(key, '123456', T, T - 1), '123456', T), null);   // already expired
 });
 
 test('self-verifying player tokens and room keys', async () => {
@@ -166,6 +184,16 @@ test('AttemptLimiter: parallel guesses never exceed the limit', () => {
   const r = lim.reserve('ip', T + 1000);
   assert.ok(!r.ok && r.retryAfterMs > 14 * 60_000);
   assert.ok(lim.reserve('ip', T + LOCKOUT.windowMs + 1).ok);                    // lockout over
+});
+
+test('AttemptLimiter: a count restored after a restart still locks at the 5th wrong passcode', () => {
+  const lim = new AttemptLimiter();
+  lim.restoreFailures('ip', LOCKOUT.maxFailures - 1, T);
+  assert.ok(lim.reserve('ip', T + 1000).ok);
+  const s = lim.settle('ip', false, T + 1000);
+  assert.equal(s.lockedUntil, T + 1000 + LOCKOUT.windowMs);
+  assert.ok(!lim.reserve('ip', T + 2000).ok);
+  assert.ok(lim.reserve('other network', T + 2000).ok);
 });
 
 test('AttemptLimiter: a correct passcode clears earlier failures', () => {
