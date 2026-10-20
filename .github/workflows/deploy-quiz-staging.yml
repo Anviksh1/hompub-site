@@ -1,0 +1,70 @@
+# Deploys the HomPub Quiz referee to STAGING (Worker hompub-quiz-staging).
+#
+# Staging lives in a separate free Cloudflare account, so staging tests never spend
+# the daily free allowance a live class needs, and the staging token cannot reach
+# production. The token and account id come from the GitHub Environment "staging",
+# which only the work branch below may use.
+#
+# Runs on every push to the work branch that changes quiz/ or this file, and by hand
+# (Actions → "Deploy quiz (staging)" → Run workflow) once this file is on main.
+
+name: Deploy quiz (staging)
+
+on:
+  push:
+    branches: [claude/serene-ptolemy-2tfn9t]
+    paths:
+      - 'quiz/**'
+      - '.github/workflows/deploy-quiz-staging.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-quiz-staging
+  cancel-in-progress: false
+
+jobs:
+  staging:
+    name: Typecheck, test, deploy to staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: staging
+    defaults:
+      run:
+        working-directory: quiz
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: quiz/package-lock.json
+
+      - name: Install dependencies (exactly what package-lock.json says)
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Deploy to staging
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -eu
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "::error::The staging environment has no CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID secret."
+            exit 1
+          fi
+          npx wrangler deploy --env staging --durable-objects-code-update-mode immediate --message "staging ${GITHUB_SHA::7}" 2>&1 | tee ../wrangler-out.txt
+          VID=$(grep -Eo 'Current Version ID: [0-9a-f-]{36}' ../wrangler-out.txt | awk '{print $4}' || true)
+          URL=$(grep -Eo 'https://[a-z0-9.-]+\.workers\.dev' ../wrangler-out.txt | head -1 || true)
+          echo "Staging deployed ${GITHUB_SHA::7}. Version id: ${VID:-see log}. URL: ${URL:-see log}" >> "$GITHUB_STEP_SUMMARY"

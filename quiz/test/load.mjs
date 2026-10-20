@@ -7,8 +7,13 @@
  * running server, measures latencies and checks the server's behaviour
  * against ../PROTOCOL.md. Run the server first ("npm run dev" in quiz/).
  *
- *   node test/load.mjs --url http://localhost:8787 --players 150 --questions 20 \
- *        --time-limit 5 --answer-window 2000 --drop 0.2 --join-burst 10000 [--seed 42] [--verbose]
+ *   HQ_PASSCODE='local test passcode' node test/load.mjs --url http://localhost:8787 --players 150 \
+ *        --questions 20 --time-limit 5 --answer-window 2000 --drop 0.2 --join-burst 10000 [--seed 42] [--verbose]
+ *
+ * Protocol 2 (PROTOCOL.md §11): the harness signs in with the host passcode (--passcode, or the
+ * HQ_PASSCODE environment variable), sends the session cookie and an Origin header, receives roster
+ * deltas, and runs a share of the phones (--v1) as version-1 pages cached from before protocol 2.
+ * Against a server without /api/session it falls back to the version-1 protocol for everyone.
  *
  * Exit codes: 0 PASS, 1 FAIL (every violation is listed), 2 usage error or
  * server unreachable. stdout carries the report only; diagnostics go to stderr.
@@ -26,7 +31,8 @@ import { readFileSync } from 'node:fs';
 // ------------------------------------------------------------------- CLI
 
 const TIME_LIMITS = [5, 10, 15, 20, 30, 60, 90, 120, 240];
-const NO_RETRY = new Set([4001, 4003, 4004, 4009, 4010]); // PROTOCOL §4: never auto-reconnect after these
+const NO_RETRY = new Set([4001, 4003, 4004, 4009, 4010, 4011, 4012, 4014]); // PROTOCOL §4, §11: never auto-reconnect after these
+const MAX_PLAYERS = 400;
 const INTRO_MS = 3000;
 const GRACE_MS = 1000;
 const WIPE_CLOSE_WAIT_MS = 15000;
@@ -44,12 +50,16 @@ const DEFAULTS = {
   'join-burst': 10000,
   seed: 42,
   quiz: '',
+  passcode: process.env.HQ_PASSCODE || '',
+  v1: 0.1,
+  'ip-per-bot': false,
+  'dev-stats': false,
   verbose: false,
 };
 
 const USAGE = `Usage: node test/load.mjs [options]
   --url <http(s)://host[:port]>  server under test                         (default ${DEFAULTS.url})
-  --players <n>                  simulated phones, 1-250                   (default ${DEFAULTS.players})
+  --players <n>                  simulated phones, 1-${MAX_PLAYERS}                   (default ${DEFAULTS.players})
   --questions <n>                generated questions, 1-100                (default ${DEFAULTS.questions})
   --time-limit <s>               ${TIME_LIMITS.join('|')}                (default ${DEFAULTS['time-limit']})
   --answer-window <ms>           answers are sent uniformly within this many ms of "open" (default ${DEFAULTS['answer-window']})
@@ -57,6 +67,11 @@ const USAGE = `Usage: node test/load.mjs [options]
   --join-burst <ms>              players join uniformly over this window   (default ${DEFAULTS['join-burst']})
   --seed <n>                     PRNG seed; same seed = same decisions     (default ${DEFAULTS.seed})
   --quiz <file>                  use this Quiz JSON (e.g. test/sample-quiz.json) instead of generating one
+  --passcode <text>              host passcode (default: the HQ_PASSCODE environment variable)
+  --v1 <fraction>                share of phones that behave as version-1 pages (default ${DEFAULTS.v1})
+  --ip-per-bot                   give each phone its own client address (needs DEV_CLIENT_IP_HEADER in .dev.vars);
+                                 without it every phone shares one address, like a school network
+  --dev-stats                    ask the room for rows written at the podium (needs DEV_REPORT_ROWS in .dev.vars)
   --verbose                      log every host frame and player lifecycle event to stderr
   -h, --help                     this text
 `;
@@ -98,10 +113,15 @@ function parseCli(argv) {
     joinBurst: raw['join-burst'],
     seed: raw.seed,
     quizFile: raw.quiz,
+    passcode: raw.passcode,
+    v1: raw.v1,
+    ipPerBot: raw['ip-per-bot'],
+    devStats: raw['dev-stats'],
     verbose: raw.verbose,
   };
   if (!/^https?:\/\/[^/\s]+$/.test(o.url)) die(`--url must look like http://host:port (got "${o.url}")`);
-  if (!Number.isInteger(o.players) || o.players < 1 || o.players > 250) die('--players must be an integer from 1 to 250');
+  if (!Number.isInteger(o.players) || o.players < 1 || o.players > MAX_PLAYERS) die(`--players must be an integer from 1 to ${MAX_PLAYERS}`);
+  if (!(o.v1 >= 0 && o.v1 <= 1)) die('--v1 must be between 0 and 1');
   if (!Number.isInteger(o.questions) || o.questions < 1 || o.questions > 100) die('--questions must be an integer from 1 to 100');
   if (!TIME_LIMITS.includes(o.timeLimit)) die(`--time-limit must be one of ${TIME_LIMITS.join(', ')}`);
   if (o.answerWindow < 0) die('--answer-window must be >= 0');
@@ -232,10 +252,14 @@ const stats = {
   unexpectedCloseLog: [],   // first 20, for the report: a violation in the same question may be their consequence
   closeCodes: new Map(),
   joinMs: [], ackMs: [], resyncMs: [],
+  hostBytes: 0, hostRosterBytes: 0, hostRosterFrames: 0, hostSyncs: 0,
 };
 
 const game = {
   pin: null, hostToken: null, quiz: null, N: 0, showOnDevices: false,
+  legacy: false,        // the server has no /api/session: protocol 1 for everyone
+  cookie: '',           // host session cookie (protocol 2)
+  devStats: null,       // {statements, rowsWritten, alarms, players, wipeRows} from the room, if asked
   phase: 'lobby', q: -1,
   startedAt: 0, readyAtStart: 0, podiumAt: 0, endAt: 0, wipedAt: 0, lastCloseAt: 0, t0: 0,
   // per question (index q)
@@ -310,6 +334,7 @@ class Player {
   constructor(i) {
     this.i = i;                       // 1-based, "Student <i>"
     this.spin = i % 7 === 0;          // every 7th player asks for a spun two-word name
+    this.v1 = false;                  // behaves as a version-1 page (set in main)
     this.isDup = false;               // deliberately answers twice (set in main)
     this.ws = null;
     this.token = null; this.pid = null; this.nick = null;
@@ -341,10 +366,11 @@ class Player {
     if (game.over || this.dead) return;
     this.clear('reconnect');
     const reconnecting = this.token !== null;
-    const query = reconnecting ? `role=player&token=${encodeURIComponent(this.token)}` : 'role=player';
+    const v = this.v1 || game.legacy ? '' : '&v=2';
+    const query = reconnecting ? `role=player${v}&token=${encodeURIComponent(this.token)}` : `role=player${v}`;
     let ws;
     try {
-      ws = new WebSocket(`${WS_BASE}/api/room/${game.pin}/ws?${query}`);
+      ws = new WebSocket(`${WS_BASE}/api/room/${game.pin}/ws?${query}`, opts.ipPerBot ? { headers: { 'X-Dev-Client-IP': botAddress(this.i) } } : undefined);
     } catch (err) {
       warn(`${this.tag}: cannot open a socket: ${err.message}`);
       this.scheduleReconnect(this.nextBackoff(), false);
@@ -511,6 +537,7 @@ class Player {
           if (f.question.q === this.q && typeof f.question.deadline === 'number') this.deadline = f.question.deadline;
         }
         return undefined;
+      case 'join_rejected': violate(`${this.tag}: join refused (${f.reason}): ${f.message}`); return undefined;
       case 'error': violate(`${this.tag}: error frame ${f.code}: ${f.message}`); return undefined;
       default: violate(`${this.tag}: unknown frame type "${f.t}"`); return undefined;
     }
@@ -732,6 +759,7 @@ class Player {
 class Host {
   constructor() {
     this.ws = null;
+    this.roster = new Map();          // pid -> entry, rebuilt from sync plus player_* deltas (protocol 2)
     this.offset = 0;
     this.phase = 'lobby'; this.q = -1;
     this.opensAt = 0; this.deadline = 0;
@@ -768,9 +796,14 @@ class Host {
   }
 
   open() {
-    const ws = new WebSocket(`${WS_BASE}/api/room/${game.pin}/ws?role=host&token=${encodeURIComponent(game.hostToken)}`);
+    // Protocol 2: no token in the URL; the cookie and Origin go in headers, the token in a first auth frame.
+    const url = game.legacy
+      ? `${WS_BASE}/api/room/${game.pin}/ws?role=host&token=${encodeURIComponent(game.hostToken)}`
+      : `${WS_BASE}/api/room/${game.pin}/ws?role=host&v=2`;
+    const ws = new WebSocket(url, game.legacy ? undefined : { headers: { Origin: opts.url, Cookie: game.cookie } });
     this.ws = ws;
     ws.addEventListener('open', () => {
+      if (!game.legacy) send(ws, { t: 'auth', token: game.hostToken });
       this.clear('ping');
       this.timers.ping = setInterval(() => { if (send(this.ws, 'ping')) stats.pings += 1; }, 25000);
     });
@@ -813,10 +846,13 @@ class Host {
   onMessage(ws, data) {
     if (ws !== this.ws) return;
     stats.framesRecv += 1;
-    stats.bytesRecv += Buffer.byteLength(data);
+    const bytes = Buffer.byteLength(data);
+    stats.bytesRecv += bytes;
+    stats.hostBytes += bytes;
     if (data === 'pong') { stats.pongs += 1; return; }
     let f;
     try { f = JSON.parse(data); } catch { violate(`host: non-JSON frame: ${String(data).slice(0, 80)}`); return; }
+    if (f && /^(roster|player_joined|player_updated|player_left)$/.test(f.t)) { stats.hostRosterBytes += bytes; stats.hostRosterFrames += 1; }
     if (!f || typeof f.t !== 'string') { violate('host: frame without a string field t'); return; }
     if (typeof f.serverNow === 'number') this.offset = f.serverNow - Date.now();
     this.armWatchdog();
@@ -824,9 +860,27 @@ class Host {
     switch (f.t) {
       case 'sync': return this.onSync(f);
       case 'roster':
+        if (!game.legacy) violate('host: a version-2 host received a full roster frame (expected deltas)');
         if (!Array.isArray(f.players) || f.players.length !== f.playerCount) violate(`host: roster.players has ${f.players?.length} entries but playerCount is ${f.playerCount}`);
         if (f.playerCount > opts.players) violate(`host: roster playerCount ${f.playerCount} > ${opts.players} players spawned`);
+        this.roster = new Map((f.players || []).map((p) => [p.pid, p]));
         return undefined;
+      case 'player_joined':
+      case 'player_updated':
+        if (!Array.isArray(f.players)) { violate(`host: ${f.t} without a players list`); return undefined; }
+        for (const p of f.players) this.roster.set(p.pid, p);
+        this.checkRosterCount(f);
+        return undefined;
+      case 'player_left':
+        if (!Array.isArray(f.pids)) { violate('host: player_left without pids'); return undefined; }
+        for (const pid of f.pids) this.roster.delete(pid);
+        this.checkRosterCount(f);
+        return undefined;
+      case 'hosts':
+        if (f.count !== 1) violate(`host: hosts.count is ${f.count}, but the harness runs one host`);
+        return undefined;
+      case 'expiry': warn(`host: idle-wipe warning (wipeAt ${f.wipeAt})`); return undefined;
+      case 'dev_stats': game.devStats = f; return undefined;
       case 'intro': return this.onIntro(f);
       case 'open': return this.onOpen(f);
       case 'tally': return this.onTally(f);
@@ -840,7 +894,17 @@ class Host {
     }
   }
 
+  /** The roster rebuilt from deltas must always match the count the server sends with them. */
+  checkRosterCount(f) {
+    if (typeof f.playerCount === 'number' && f.playerCount !== this.roster.size) {
+      violate(`host: roster rebuilt from deltas has ${this.roster.size} players, ${f.t}.playerCount says ${f.playerCount}`);
+    }
+  }
+
   onSync(s) {
+    stats.hostSyncs += 1;
+    if (!game.legacy && s.proto !== 2) violate(`host: sync.proto is ${s.proto}, expected 2`);
+    this.roster = new Map((Array.isArray(s.roster) ? s.roster : []).map((p) => [p.pid, p]));
     if (s.role !== 'host') violate(`host: sync.role is "${s.role}"`);
     if (s.hostToken !== game.hostToken) violate('host: sync.hostToken differs from the token returned by POST /api/room');
     if (!Array.isArray(s.roster)) violate('host: sync without roster');
@@ -978,6 +1042,7 @@ class Host {
         if (f.top[i].pid !== f.leaderboard[i].pid) { violate('host: podium.top does not match the head of podium.leaderboard'); break; }
       }
     }
+    if (opts.devStats) send(this.ws, { t: 'dev_stats' });
     this.maybeEnd();
   }
 
@@ -1269,6 +1334,8 @@ function checkCsv(joined) {
 
 // --------------------------------------------------------------- report
 
+function botAddress(i) { return `10.${100 + Math.floor(i / 60000)}.${Math.floor(i / 250) % 240}.${(i % 250) + 1}`; }
+
 function printReport() {
   const out = [];
   const joined = players.filter((p) => p.pid).length;
@@ -1282,6 +1349,8 @@ function printReport() {
   out.push(`resync (reconnect -> sync)       ${fmtStat(summarize(stats.resyncMs))}`);
   out.push(`frames sent ${stats.framesSent}   frames received ${stats.framesRecv}   bytes received ${fmtBytes(stats.bytesRecv)}   bytes sent ${fmtBytes(stats.bytesSent)}`);
   out.push(`pings ${stats.pings}   pongs ${stats.pongs}   host tally frames ${game.tallies}`);
+  out.push(`host: ${fmtBytes(stats.hostBytes)} received in all; roster ${stats.hostRosterFrames} frames, ${fmtBytes(stats.hostRosterBytes)} (${game.legacy ? 'full roster' : 'deltas'}); ${stats.hostSyncs} syncs`);
+  if (game.devStats) out.push(`room storage (DEV_REPORT_ROWS): ${game.devStats.statements} write statements, ${game.devStats.rowsWritten} rows written, ${game.devStats.alarms} alarms set, until the podium; the wipe deletes about ${game.devStats.wipeRows} more rows`);
   out.push(`reconnects performed ${stats.reconnects} (after simulated drops ${stats.reconnectsAfterDrop}, after unexpected closes ${stats.reconnects - stats.reconnectsAfterDrop})   drops ${stats.deliberateDrops}   unexpected closes ${stats.unexpectedCloses}`);
   const dupNote = game.dupsLate || game.dupsLost ? ` (refused as late ${game.dupsLate}, ack lost in a drop ${game.dupsLost})` : '';
   out.push(`players joined ${joined}/${opts.players}   in lobby at start ${game.readyAtStart}   duplicate answers sent ${game.dupsSent}, refused as duplicate ${game.dupsRejected}${dupNote}   ended frames ${players.filter((p) => p.gotEnded).length}/${game.expectEnded.length} expected`);
@@ -1356,14 +1425,35 @@ async function main() {
   if (opts.answerWindow > minLimit * 1000) warn(`answer window ${opts.answerWindow} ms exceeds the ${minLimit} s time limit: some answers will be late by design`);
   STALL_MS = Math.max(INTRO_MS + maxLimit * 1000 + GRACE_MS + 15000, opts.joinBurst + 20000);
 
-  // 3. Create the room.
+  // 3. Sign in (protocol 2), then create the room.
   game.t0 = performance.now();
   let res; let body;
   try {
+    res = await fetch(`${opts.url}/api/session`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', Origin: opts.url },
+      body: JSON.stringify({ passcode: opts.passcode }),
+      signal: AbortSignal.timeout(10000),
+    });
+    body = await res.json().catch(() => ({}));
+  } catch (err) {
+    die(`POST /api/session failed: ${err.message}`);
+  }
+  if (res.status === 404) {
+    game.legacy = true;
+    log('server has no /api/session: running everyone as version-1 pages');
+  } else if (!res.ok) {
+    die(`sign-in failed: HTTP ${res.status} ${body.message || JSON.stringify(body)}${opts.passcode ? '' : '\n  Pass --passcode or set HQ_PASSCODE (the HOST_PASSCODE in .dev.vars).'}`);
+  } else {
+    game.cookie = (res.headers.get('set-cookie') || '').split(';')[0];
+    if (!/^__Host-hq_session=v1\./.test(game.cookie)) die('sign-in returned no session cookie');
+  }
+  try {
     res = await fetch(`${opts.url}/api/room`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ quiz: game.quiz }),
+      headers: game.legacy ? { 'content-type': 'application/json' } : { 'content-type': 'application/json', Origin: opts.url, Cookie: game.cookie },
+      // Typed or random names: every 7th phone asks for a random one.
+      body: JSON.stringify({ quiz: game.quiz, settings: { nameMode: 'either', nicknameMode: 'free' } }),
       signal: AbortSignal.timeout(10000),
     });
     body = await res.json().catch(() => ({}));
@@ -1392,6 +1482,9 @@ async function main() {
 
   // 5. Players: who answers twice, and when each one joins.
   for (let i = 1; i <= opts.players; i++) players.push(new Player(i));
+  const v1Count = game.legacy ? opts.players : Math.round(opts.players * opts.v1);
+  for (const p of shuffle([...players], mulberry32(mix(opts.seed, 5))).slice(0, v1Count)) p.v1 = true;
+  if (!game.legacy) log(`${v1Count} of ${opts.players} phones behave as version-1 pages`);
   const dupCount = Math.max(1, Math.round(opts.players * 0.05));
   for (const p of shuffle([...players], mulberry32(mix(opts.seed, 2))).slice(0, dupCount)) p.isDup = true;
   const joinRng = mulberry32(mix(opts.seed, 3));
@@ -1407,6 +1500,7 @@ async function main() {
   const stillOpen = players.filter((p) => p.ws !== null);
   if (host.ws) stillOpen.push(host);
   if (!game.aborted && stillOpen.length) violate(`${stillOpen.length} socket(s) were still open ${WIPE_CLOSE_WAIT_MS / 1000} s after wipe (expected 4004 closes)`);
+  if (process.env.DEBUG_OPEN) for (const p of stillOpen) process.stderr.write(`OPEN: ${p.tag || 'host'} v1=${p.v1} synced=${p.synced} readyState=${p.ws && p.ws.readyState} lastDisconnect=${p.lastDisconnectAt ? Math.round((Date.now() - p.lastDisconnectAt) / 1000) + 's ago' : '-'}\n`);
   for (const s of stillOpen) { try { s.ws.close(1000, 'harness exit'); } catch { /* ignore */ } }
   if (stillOpen.length) await waitForSocketsClosed(1000);
   if (!game.aborted) finalChecks();

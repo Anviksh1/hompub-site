@@ -1,0 +1,18 @@
+# Copy to .dev.vars (git-ignored) for `npm run dev`. Never commit real values.
+# The secrets below are for local testing only; production and staging set their own in Cloudflare.
+HOST_PASSCODE="local test passcode"
+SESSION_KEY="local-session-key-change-me-0123456789abcdef"
+IP_HASH_KEY="local-ip-hash-key"
+
+# Dev-only switches (ignored unless DEV_MODE is "1"; never set them in wrangler.jsonc).
+DEV_MODE="1"
+# Shrink every idle-wipe period: 0.001 turns 2 hours into 7.2 seconds.
+DEV_TTL_SCALE="1"
+# Count rows written per room; the host can ask with {"t":"dev_stats"}.
+DEV_REPORT_ROWS="1"
+# Let the load harness pretend each bot comes from its own address.
+DEV_CLIENT_IP_HEADER="X-Dev-Client-IP"
+# Uncomment to make every write after N fail (tests the "daily limit used up" message).
+# DEV_FAIL_WRITES_AFTER="50"
+# Uncomment to test the host {t:'auth'} first-frame path.
+# DEV_SKIP_HOST_VOUCH="1"

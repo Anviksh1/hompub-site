@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Privacy Policy — HomPub Quiz</title>
-<meta name="description" content="Privacy policy for HomPub Quiz: nicknames and scores held for one lesson, then deleted. No accounts, no cookies, no analytics, no ads.">
+<meta name="description" content="Privacy policy for HomPub Quiz: nicknames and scores held for one lesson, then deleted. No student accounts, no cookies on students' phones, no analytics, no ads.">
 <meta name="theme-color" content="#1c1730">
 <link rel="icon" href="../../favicon.ico" sizes="any">
 <link rel="icon" type="image/png" sizes="32x32" href="../../favicon-32.png">
@@ -42,34 +42,40 @@
 
   <h1>Privacy Policy</h1>
   <div class="meta-row">
-    <span class="chip">Effective: Pilot — October 2026</span>
+    <span class="chip">Effective: Pilot — 20 October 2026 (host sign-in added)</span>
     <span class="chip">Applies to HomPub Quiz, pilot</span>
     <span class="chip">quiz web app</span>
   </div>
 
   <div class="tldr">
     <span class="tldr-label">The short version</span>
-    <p><strong>HomPub Quiz holds a nickname, answer choices and a score for each student for the length of one lesson, on one small server we call the referee, and then deletes them.</strong> There are no accounts, no cookies, no analytics and no ads. HomPub itself sees nothing. The only lasting copy of a game is the results file the teacher downloads.</p>
+    <p><strong>HomPub Quiz holds a nickname, answer choices and a score for each student for the length of one lesson, on one small server we call the referee, and then deletes them.</strong> There are no student accounts, no cookies on students' phones, no analytics and no ads. The teacher signs in with one host passcode, which sets a single sign-in cookie in the teacher's own browser. HomPub itself sees nothing. The only lasting copy of a game is the results file the teacher downloads.</p>
     <p>Everything below is the detail behind those sentences.</p>
   </div>
 
   <section>
     <h2>Information we collect</h2>
-    <p><strong>From students:</strong> a nickname (typed, or spun from a list of random two-word names — no real name is required or wanted), the answer chosen for each question, and the time each answer arrived at the referee.</p>
-    <p><strong>From the teacher:</strong> the quiz content — questions, options and the correct answers — for the duration of the game, plus a random host token so the game can be resumed if the laptop drops off the network.</p>
-    <p>That is the full list. There are no accounts, no email addresses, no sign-in and no cookies. The pages set no advertising ID and include no analytics or crash reporting. The student page loads no third-party scripts and fetches no fonts from third parties: a classroom of phones talks to exactly one server, the referee.</p>
+    <p><strong>From students:</strong> a nickname (typed, or, if the teacher allows it, picked from a list of random two-word names — no real name is required or wanted), the answer chosen for each question, and the time each answer arrived at the referee. A student may change the nickname up to three times while the teacher allows it, and the teacher can correct any nickname.</p>
+    <p><strong>From the teacher:</strong> the host passcode, checked at sign-in and never stored as typed; the quiz content — questions, options and the correct answers — for the duration of the game; and a random host token so the game can be resumed if the laptop drops off the network.</p>
+    <p>That is the full list. There are no student accounts and no email addresses. The only cookie is the teacher's sign-in cookie, in the teacher's browser: it says "signed in with the host passcode" and nothing else, lasts 30 days while used (at most 90), or only until the browser closes when the teacher ticks "This is a shared computer", and is removed by "Sign out on this device". Students' phones get no cookies. The pages set no advertising ID and include no analytics or crash reporting. The student page loads no third-party scripts and fetches no fonts from third parties: a classroom of phones talks to exactly one server, the referee.</p>
   </section>
 
   <section>
     <h2>Where it lives, and for how long</h2>
     <p>A game lives in one Cloudflare Durable Object — a small, single-purpose storage unit — in the Cloudflare data center nearest the teacher who created it. It holds the quiz (including the answer key), the game's settings and current phase, and one row per player: nickname, score, streak and the answers given. No IP addresses, no device details, no browser details.</p>
-    <p>One more thing exists outside the game, to stop someone creating thousands of empty games in a day: when a teacher creates a game, the referee keeps a one-way hash of that day's date and the teacher's IP address, with a count. It is a one-way hash that HomPub never links back to an address, it cannot be linked to the same person on another day, it says nothing about students, and it is deleted within 48 hours.</p>
+    <p>A few more things exist outside the game, all to stop misuse:</p>
+    <ul class="plain">
+      <li>When a teacher creates a game, the referee keeps a one-way hash of that day's date and the teacher's IP address, with a count, so nobody can create thousands of games in a day. HomPub never links it back to an address, it cannot be linked to the same person on another day, it says nothing about students, and it is deleted within 48 hours.</li>
+      <li>After five wrong host passcodes from one network in 15 minutes, sign-in from that network pauses for 15 minutes. While the pause lasts the referee keeps one keyed one-way hash of the network address and when the pause ends; it is deleted when the pause ends.</li>
+      <li>To stop people guessing game PINs, the referee counts wrong PINs per network for 10 minutes. These counts live only in the referee's memory, are never written down, and disappear when it restarts.</li>
+      <li>The list of game PINs also records which host passcode started each game, so the teacher can resume it from another signed-in device. It is deleted with the PIN.</li>
+    </ul>
     <p>It is deleted:</p>
     <ul class="plain">
       <li>when the teacher confirms the results download at the end of the game, or</li>
-      <li>automatically after 2 hours without any activity, or 30 minutes after the teacher presses End game if the download is never confirmed. If a game is left on the podium screen until that 2-hour limit, the results file is sent to the teacher's screen before the game is deleted.</li>
+      <li>automatically after 2 hours without any activity, or 30 minutes after the teacher presses End game if the download is never confirmed. Once a question has been played, the teacher's screen is warned 15 minutes before such an automatic deletion (with a button to keep the game 2 more hours), and the results file is sent to the teacher's screen just before it.</li>
     </ul>
-    <p>The only lasting copy is the CSV the teacher downloads: rank, nickname, score and the answer to each question. What the teacher does with that file is the teacher's responsibility, as with any class record.</p>
+    <p>The only lasting copy is the CSV the teacher downloads: rank, nickname, score and the answer to each question. A student the teacher removed from the game is listed too, marked "removed", with the answers given before the removal. What the teacher does with that file is the teacher's responsibility, as with any class record.</p>
     <p>On each student's phone, a random reconnect token sits in the browser's storage so a dropped connection can rejoin without losing the score. It identifies the phone to the referee for that one game only, and it is cleared when the game ends. The teacher's quizzes, and the PIN and host token of the current game, are kept in the teacher's own browser storage on the teacher's own device.</p>
   </section>
 
@@ -83,7 +89,7 @@
     <p>A web app asks the browser for access rather than installing permissions. Here is everything HomPub Quiz uses:</p>
     <dl class="permission-grid">
       <dt>Network access</dt><dd>Yes — to the quiz referee only</dd>
-      <dt>Browser storage</dt><dd>Students: one reconnect entry (PIN, token, nickname) for the current game, plus a high-contrast on/off preference. Host: your own quizzes and the current game</dd>
+      <dt>Browser storage</dt><dd>Students: one reconnect entry (PIN, token, nickname) for the current game, plus a high-contrast on/off preference. Host: your own quizzes, the current game, and the sign-in cookie</dd>
       <dt>Keep screen awake</dt><dd>Yes, during a game, so the phone does not lock mid-question</dd>
       <dt>Camera</dt><dd>Not requested — QR codes are read by the phone's camera app, not the page</dd>
       <dt>Microphone</dt><dd>Not requested</dd>

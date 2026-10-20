@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>HomPub Quiz — Host</title>
-<meta name="description" content="Host a live HomPub Quiz from your laptop: build the quiz here, show the PIN on the projector, students answer on their phones. No accounts, nothing kept after the game.">
+<meta name="description" content="Host a live HomPub Quiz from your laptop: build the quiz here, show the PIN on the projector, students answer on their phones. One host passcode, no student accounts, nothing kept after the game.">
 <meta name="theme-color" content="#1c1730">
 <meta name="robots" content="noindex">
 <!-- The host is one laptop, so loading the site's fonts here is fine. Player pages must not. -->
@@ -32,6 +32,7 @@
       <span class="sub">host</span>
     </a>
     <div class="topbar-tools">
+      <span id="auth-slot"></span>
       <span id="conn-pill" class="pill" data-status="idle" role="status" aria-live="polite">
         <span class="dot" aria-hidden="true"></span><span id="conn-text">Not connected</span>
       </span>
@@ -52,7 +53,7 @@
 
 <footer class="site-footer">
   <div class="wrap">
-    <div>HomPub Quiz — no accounts, no analytics. Quizzes live only in this browser; games are wiped when you say so.</div>
+    <div>HomPub Quiz — one host passcode, no student accounts, no analytics. Quizzes live only in this browser; games are wiped when you say so.</div>
     <div><a href="/">Join page</a></div>
   </div>
 </footer>

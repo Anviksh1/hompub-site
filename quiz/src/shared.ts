@@ -16,14 +16,19 @@ export interface Quiz {
 }
 
 export type Mode = 'speed' | 'accuracy' | 'coarse';
+/** Legacy two-way setting, still written so version-1 pages keep working (PROTOCOL.md §2). */
 export type NicknameMode = 'free' | 'spin';
+/** Who picks the name: typed names only (default), typed or random, or random only. */
+export type NameMode = 'typed' | 'either' | 'random';
 
 export interface Settings {
   mode: Mode;
   showOnDevices: boolean;
   lateJoin: boolean;
   earlyClose: boolean;
-  nicknameMode: NicknameMode;
+  nicknameMode: NicknameMode; // always legacyNicknameMode(nameMode)
+  nameMode: NameMode;
+  allowRename: boolean;       // students may change their own name (switched off at Start)
 }
 
 export type Phase = 'lobby' | 'intro' | 'open' | 'closed' | 'podium' | 'ended';
@@ -34,7 +39,13 @@ export const DEFAULT_SETTINGS: Settings = {
   lateJoin: true,
   earlyClose: false,
   nicknameMode: 'free',
+  nameMode: 'typed',
+  allowRename: true,
 };
+
+export function legacyNicknameMode(nameMode: NameMode): NicknameMode {
+  return nameMode === 'random' ? 'spin' : 'free';
+}
 
 export const TIME_LIMITS = [5, 10, 15, 20, 30, 60, 90, 120, 240];
 export const POINT_VALUES = [0, 1000, 2000];
@@ -58,6 +69,12 @@ export const LIMITS = {
   rosterIntervalMs: 500,
   ttlActiveMs: 2 * 60 * 60 * 1000,
   ttlFinishedMs: 30 * 60 * 1000,
+  expiryWarnMs: 15 * 60 * 1000, // the host is warned this long before an idle wipe
+  maxRenames: 3,                // student renames per player (re-spins are counted apart)
+  socketsPerPlayer: 3,          // open sockets one player token may hold
+  pendingHosts: 5,              // host sockets waiting for their auth frame
+  hostAuthMs: 10_000,           // a host socket must authenticate within this long
+  joinIdMs: 60_000,             // a repeated join id is honoured this long after the join
 } as const;
 
 // ---------------------------------------------------------------- validation
@@ -110,16 +127,40 @@ export function validateQuiz(input: unknown): Ok<Quiz> | Err {
  * Unknown fields and wrong types are silently dropped.
  */
 export function mergeSettings(base: Settings, patch: unknown, inLobby: boolean): Settings {
-  const out: Settings = { ...base };
+  const out: Settings = normalizeSettings(base);
   if (!patch || typeof patch !== 'object') return out;
   const p = patch as Record<string, unknown>;
   if (typeof p.showOnDevices === 'boolean') out.showOnDevices = p.showOnDevices;
   if (typeof p.lateJoin === 'boolean') out.lateJoin = p.lateJoin;
+  if (typeof p.allowRename === 'boolean') out.allowRename = p.allowRename;
   if (inLobby) {
     if (p.mode === 'speed' || p.mode === 'accuracy' || p.mode === 'coarse') out.mode = p.mode;
     if (typeof p.earlyClose === 'boolean') out.earlyClose = p.earlyClose;
-    if (p.nicknameMode === 'free' || p.nicknameMode === 'spin') out.nicknameMode = p.nicknameMode;
+    if (p.nameMode === 'typed' || p.nameMode === 'either' || p.nameMode === 'random') out.nameMode = p.nameMode;
+    else if (p.nicknameMode === 'spin') out.nameMode = 'random';      // a version-1 host page
+    else if (p.nicknameMode === 'free') out.nameMode = 'either';      // (it offered typed or spun names)
   }
+  out.nicknameMode = legacyNicknameMode(out.nameMode);
+  return out;
+}
+
+/**
+ * Fill in fields a stored settings object may lack. A room created before
+ * nameMode existed had a Spin button next to the name box, so its 'free' means
+ * 'either'.
+ */
+export function normalizeSettings(raw: unknown): Settings {
+  const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  const out: Settings = { ...DEFAULT_SETTINGS };
+  if (r.mode === 'speed' || r.mode === 'accuracy' || r.mode === 'coarse') out.mode = r.mode;
+  if (typeof r.showOnDevices === 'boolean') out.showOnDevices = r.showOnDevices;
+  if (typeof r.lateJoin === 'boolean') out.lateJoin = r.lateJoin;
+  if (typeof r.earlyClose === 'boolean') out.earlyClose = r.earlyClose;
+  if (typeof r.allowRename === 'boolean') out.allowRename = r.allowRename;
+  if (r.nameMode === 'typed' || r.nameMode === 'either' || r.nameMode === 'random') out.nameMode = r.nameMode;
+  else if (r.nicknameMode === 'spin') out.nameMode = 'random';
+  else if (r.nicknameMode === 'free') out.nameMode = 'either';
+  out.nicknameMode = legacyNicknameMode(out.nameMode);
   return out;
 }
 
@@ -171,19 +212,21 @@ export function sanitizeNick(raw: unknown): string {
   return Array.from(cleaned).slice(0, LIMITS.nickChars).join('').trim();
 }
 
-// A short, deliberately conservative deny-list. Hits are replaced with a spun
-// name and never shown to anyone. Matching is done on a lower-cased, de-leeted
-// form. Short words are matched only as whole tokens, so Akshit, Dickens,
-// Essex, Hancock, Nazir, Grape and Scunthorpe pass; a few long, unambiguous
-// words are also matched inside the letters-only form so that spacing them
-// out ("f u c k") does not evade the filter.
+// A short, deliberately conservative deny-list. Hits are never shown to anyone:
+// a typed name is refused with "Please choose another name" (a version-1 page
+// gets a spun name instead). Matching is on whole words only, after folding
+// accents (Dīkṣit → diksit), lower-casing and undoing leetspeak, so names that
+// merely contain a listed word pass: Akshit, Dickens, Essex, Hancock, Nazir,
+// Scunthorpe, and pairs like "Mohit Lerch" or "Vikas Shole" that the old
+// letters-run-together check caught. Single letters in a row are joined first,
+// so spacing a word out ("f u c k", "f.u.c.k") does not evade the filter.
+// Trade-off: words run together ("fuckface") are no longer caught.
 const DENY_TOKENS = new Set([
   'fuck', 'shit', 'cunt', 'bitch', 'asshole', 'bastard', 'dick', 'cock', 'pussy', 'whore', 'slut',
   'nigger', 'nigga', 'faggot', 'fag', 'retard', 'rape', 'nazi', 'hitler', 'penis', 'vagina', 'wank',
   'twat', 'prick', 'bollock', 'motherfucker', 'douche', 'jerkoff', 'blowjob', 'handjob', 'porn', 'sex',
   'fucker', 'fucking', 'shithead', 'dickhead', 'wanker',
 ]);
-const DENY_ANYWHERE = ['fuck', 'nigger', 'nigga', 'faggot', 'asshole', 'bastard', 'motherfucker', 'blowjob', 'handjob', 'hitler'];
 
 function deleet(text: string): string {
   return text
@@ -191,12 +234,109 @@ function deleet(text: string): string {
     .replace(/[@4]/g, 'a').replace(/[3]/g, 'e').replace(/[1!|]/g, 'i').replace(/[0]/g, 'o').replace(/[5$]/g, 's').replace(/[7]/g, 't');
 }
 
+/** Words of a name as the filter sees them: accents folded, leetspeak undone, single letters joined. */
+export function nameWords(nick: string): string[] {
+  const norm = deleet(nick.normalize('NFD').replace(/\p{M}/gu, ''));
+  const words: string[] = [];
+  let run = '';
+  for (const w of norm.split(/[^a-z]+/).filter(Boolean)) {
+    if (w.length === 1) { run += w; continue; }
+    if (run) { words.push(run); run = ''; }
+    words.push(w);
+  }
+  if (run) words.push(run);
+  return words;
+}
+
 export function isProfane(nick: string): boolean {
-  const norm = deleet(nick);
-  const tokens = norm.split(/[^a-z]+/).filter(Boolean);
-  if (tokens.some(t => DENY_TOKENS.has(t))) return true;
-  const blob = norm.replace(/[^a-z]/g, '');
-  return DENY_ANYWHERE.some(w => blob.includes(w));
+  return nameWords(nick).some(w => DENY_TOKENS.has(w));
+}
+
+// ------------------------------------------------------------ name choices
+
+export interface NameNote { reason: 'duplicate' | 'stripped' | 'shortened'; message: string }
+
+export const NAME_MESSAGES = {
+  empty: 'Type your name to join.',
+  filtered: 'Please choose another name.',
+  random_off: 'Random names are off for this game. Type your name.',
+  typed_off: 'This game uses random names only.',
+  off: 'Name changes are off right now.',
+  limit: `You have used all ${LIMITS.maxRenames} name changes.`,
+  same: 'That is already your name.',
+  stripped: "Some characters can't be used in names, so they were left out.",
+  shortened: `Names can be up to ${LIMITS.nickChars} characters, so yours was shortened.`,
+} as const;
+
+function typedNote(raw: unknown, clean: string): NameNote | null {
+  const plain = typeof raw === 'string' ? raw.replace(/\s+/g, ' ').trim() : '';
+  if (plain === clean) return null;
+  const chars = Array.from(plain);
+  if (chars.length > LIMITS.nickChars && chars.slice(0, LIMITS.nickChars).join('').trim() === clean) {
+    return { reason: 'shortened', message: NAME_MESSAGES.shortened };
+  }
+  return { reason: 'stripped', message: NAME_MESSAGES.stripped };
+}
+
+export type JoinName =
+  | { kind: 'random' }
+  | { kind: 'typed'; nick: string; note: NameNote | null }
+  | { kind: 'reject'; reason: 'empty' | 'filtered' | 'random_off'; message: string };
+
+/**
+ * The name a joining player gets. A version-1 page (v2 = false) keeps the old
+ * behaviour: its Spin is honoured in every mode, and an empty or filtered name
+ * becomes a spun one. A version-2 page is told why instead.
+ */
+export function joinName(i: { nameMode: NameMode; v2: boolean; nick: unknown; spin: boolean }): JoinName {
+  if (i.nameMode === 'random') return { kind: 'random' };
+  if (i.spin) {
+    if (i.v2 && i.nameMode === 'typed') return { kind: 'reject', reason: 'random_off', message: NAME_MESSAGES.random_off };
+    return { kind: 'random' };
+  }
+  const nick = sanitizeNick(i.nick);
+  if (nick.length === 0) return i.v2 ? { kind: 'reject', reason: 'empty', message: NAME_MESSAGES.empty } : { kind: 'random' };
+  if (isProfane(nick)) return i.v2 ? { kind: 'reject', reason: 'filtered', message: NAME_MESSAGES.filtered } : { kind: 'random' };
+  return { kind: 'typed', nick, note: typedNote(i.nick, nick) };
+}
+
+export type RenameCheck =
+  | { ok: true; kind: 'random' }
+  | { ok: true; kind: 'typed'; nick: string; note: NameNote | null }
+  | { ok: false; reason: 'off' | 'limit' | 'empty' | 'filtered' | 'random_off' | 'typed_off' | 'same'; message: string };
+
+/** A student's own rename request (`{t:'rename'}`), before duplicate numbering. */
+export function renameCheck(i: { allowRename: boolean; nameMode: NameMode; renames: number; current: string; nick?: unknown; random?: unknown }): RenameCheck {
+  const no = (reason: Exclude<RenameCheck, { ok: true }>['reason']): RenameCheck => ({ ok: false, reason, message: NAME_MESSAGES[reason] });
+  if (!i.allowRename) return no('off');
+  if (i.renames >= LIMITS.maxRenames) return no('limit');
+  if (i.random === true) return i.nameMode === 'typed' ? no('random_off') : { ok: true, kind: 'random' };
+  if (i.nameMode === 'random') return no('typed_off');
+  const nick = sanitizeNick(i.nick);
+  if (nick.length === 0) return no('empty');
+  if (isProfane(nick)) return no('filtered');
+  if (nick.toLowerCase() === i.current.toLowerCase()) return no('same');
+  return { ok: true, kind: 'typed', nick, note: typedNote(i.nick, nick) };
+}
+
+// --------------------------------------------------------------- idle wipe
+
+/**
+ * When an idle room is wiped, and when the host is warned first. Unchanged
+ * rules (PROTOCOL.md §6): 2 h after the last frame, or 30 min after `ended`.
+ * `scale` shortens every period for local tests only (DEV_TTL_SCALE).
+ */
+export function idlePlan(i: { phase: Phase; lastActivity: number; phaseAt: number; scale?: number }): { wipeAt: number; warnAt: number | null } {
+  const k = i.scale && i.scale > 0 ? i.scale : 1;
+  if (i.phase === 'ended') return { wipeAt: i.phaseAt + LIMITS.ttlFinishedMs * k, warnAt: null };
+  const wipeAt = i.lastActivity + LIMITS.ttlActiveMs * k;
+  return { wipeAt, warnAt: wipeAt - LIMITS.expiryWarnMs * k };
+}
+
+/** Has at least one question been played, so an idle wipe would destroy results? */
+export function hasResults(phase: Phase, q: number): boolean {
+  if (phase === 'lobby' || phase === 'ended') return false;
+  return q >= 1 || phase === 'open' || phase === 'closed' || phase === 'podium';
 }
 
 // --------------------------------------------------------------------- misc

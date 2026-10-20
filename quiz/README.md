@@ -3,11 +3,12 @@
 A live classroom quiz in the Kahoot style. The teacher runs it from a laptop
 plugged into the projector; students answer on their own phones, a whole class
 at once. Students join by typing a 6-digit PIN or scanning a QR code, pick a
-nickname (or spin a random two-word one), and tap one of four fixed
-shape-and-colour tiles — red triangle, blue diamond, yellow circle, green
-square — before the timer runs out. One host, up to 250 players.
+name (or take a random two-word one, if the teacher allows it), and tap one of
+four fixed shape-and-colour tiles — red triangle, blue diamond, yellow circle,
+green square — before the timer runs out. One host, up to 400 players.
 
-It follows the HomPub rule: no accounts, no ads, no analytics. A student is a
+It follows the HomPub rule: no student accounts, no ads, no analytics. The
+teacher signs in with one host passcode; a student is a
 nickname and a score for the length of one lesson; the small server that keeps
 score — we call it the referee — deletes everything when the teacher confirms
 the results download, or on a timer if the teacher forgets. The only lasting
@@ -87,19 +88,31 @@ account is needed.
   own protocol, so the same code runs over `https://` + `wss://` in production.
   If the phone cannot connect, your laptop firewall is probably blocking port
   8787 or the Wi-Fi isolates clients from each other.
-- `npm run test:load` runs `test/load.mjs`: it creates a room against the dev
+- **Secrets for local runs:** copy `.dev.vars.example` to `.dev.vars`
+  (git-ignored). It holds a local-only `HOST_PASSCODE` (`local test passcode`)
+  and `SESSION_KEY`, plus dev-only switches that are ignored unless
+  `DEV_MODE="1"`: `DEV_TTL_SCALE` (shrink the idle wipe, e.g. `0.002`),
+  `DEV_REPORT_ROWS` (count rows written), `DEV_CLIENT_IP_HEADER` (one address
+  per simulated phone), `DEV_FAIL_WRITES_AFTER` (make saving fail) and
+  `DEV_SKIP_HOST_VOUCH` (test the host `auth` frame). They never go in
+  `wrangler.jsonc`; a unit test checks.
+- `HQ_PASSCODE='local test passcode' npm run test:load` runs `test/load.mjs`:
+  it signs in, creates a room against the dev
   server and drives 150 simulated players through a 20-question game, with a
   fifth of them dropping and reconnecting during every question and a few
   deliberately answering twice. It checks one welcome per player, a result for
   every connected player on every question, the points formula, that no frame
   carries the correct answer before reveal, duplicate refusals, tally sums,
   rankings and the CSV, and exits non-zero on any violation. Flags:
-  `--url --players --questions --time-limit --answer-window --drop --join-burst
-  --seed --quiz <file> --verbose --help` (e.g. `node test/load.mjs --players 12 --questions 2` for a
-  30-second smoke run). The Directory's per-IP cap of 30 rooms per UTC day
-  applies locally too; delete `.wrangler/state/` to reset it.
+  `--url --players (up to 400) --questions --time-limit --answer-window --drop
+  --join-burst --seed --quiz <file> --passcode --v1 <share of version-1 phones>
+  --ip-per-bot --dev-stats --verbose --help` (e.g.
+  `node test/load.mjs --players 12 --questions 2` for a 30-second smoke run).
+  Delete `.wrangler/state/` to reset local rooms, counters and lockouts.
 - `npm run typecheck` runs the TypeScript compiler over `src/`.
-  `npm test` runs the unit tests for scoring, validation and the nickname filter.
+  `npm test` runs the unit tests: scoring, validation, the name filter and
+  name rules, sessions, the Origin rule, the guess limiters, the idle-wipe
+  timing, and the staging config.
   `npm run check` does both. The deploy workflow runs them before every deploy.
 
 Rooms created locally live in `.wrangler/state/` (git-ignored) and vanish when
@@ -186,91 +199,132 @@ The domain is the only cost. The referee itself stays on the Free plan.
 
 ### Configuration
 
-Four variables in `wrangler.jsonc` → `vars`, read at request time:
+Five variables in `wrangler.jsonc` → `vars`, read at request time. The
+`env.staging` block repeats them exactly (bindings and vars do not inherit;
+`test/config.test.mjs` fails if the two drift apart).
 
 | Var | Default | Meaning |
 |---|---|---|
-| `MAX_PLAYERS` | `250` | players per room; the 251st gets close code 4009 |
-| `ROOM_CREATE_PER_IP_PER_DAY` | `30` | rooms one public IP may create per UTC day. A school usually has **one** public IP shared by every teacher — raise this if several classes run on the same day. |
+| `MAX_PLAYERS` | `400` | players per room; the 401st gets close code 4009 |
+| `ROOM_CREATE_PER_IP_PER_DAY` | `30` | rooms one public IP may create per UTC day. Signed-in hosts skip this cap, so in practice only the next line applies. |
 | `ROOM_CREATE_PER_DAY` | `300` | rooms the whole deployment may create per UTC day |
+| `PIN_MISS_LIMIT` | `100` | wrong PINs (and unknown tokens) one network may try in 10 minutes before lookups from it are refused |
 | `ALLOWED_ORIGINS` | *(empty)* | extra origins allowed to call `/api/*`. Empty is correct when pages and API share a hostname, which they do here. |
 
 Change a value, redeploy. Keep `observability.enabled` at `false`; see
 [Privacy](#privacy-commitments-the-code-keeps).
 
-### Optional secret: `IP_HASH_KEY`
+### Secrets: the host passcode
 
-The per-IP room-creation cap stores a truncated SHA-256 of
-`<IP_HASH_KEY>|<UTC date>|<IP>` for up to 48 hours. Without the key that value
-is a pseudonym HomPub never links back; with it, it cannot be brute-forced
-back to an address. Set it once per deployment from a laptop:
+Hosting a game needs the **host passcode**. Editing quizzes does not. Three
+secrets live on each Worker (production and staging separately), never in the
+repository or the chat:
 
-```
-npx wrangler secret put IP_HASH_KEY     # paste any long random string
-```
-
-## Deploying through GitHub
-
-Once the secrets below are in place, every push to `main` that changes a file
-under `quiz/` (other than Markdown) deploys automatically through
-[`.github/workflows/deploy-quiz.yml`](../.github/workflows/deploy-quiz.yml).
-You can also start a deploy by hand: repository **Actions → Deploy quiz → Run
-workflow**.
-
-The workflow checks out the repository, installs Node 22, runs `npm ci` in
-`quiz/`, then `npm run typecheck` and `npm test`, and only if those pass runs
-`cloudflare/wrangler-action@v3` with `workingDirectory: quiz`, which executes
-`wrangler deploy` with your account's credentials. The Wrangler version is the
-one pinned in `package-lock.json`, so the workflow and your laptop deploy with
-the same tool.
-
-**Do the first deploy from your laptop** (previous section). It registers your
-`workers.dev` subdomain interactively, which a non-interactive workflow cannot
-do. After that the workflow handles every deploy.
-
-### Create the API token
-
-1. Open <https://dash.cloudflare.com/profile/api-tokens> (dashboard → profile
-   icon, top right → **My Profile → API Tokens**).
-2. **Create Token**, then **Use template** next to **Edit Cloudflare Workers**.
-3. Under *Account Resources* choose your account. Under *Zone Resources* choose
-   the domain you attached in step 5 above, or *All zones* — the token only
-   needs zone access to manage a custom domain; `workers.dev` alone needs none.
-4. **Continue to summary → Create Token.** Copy the token now; it is shown
-   exactly once. Treat it like a password: it can deploy and delete Workers on
-   your account.
-
-### Find the account ID
-
-In the dashboard, open **Workers & Pages**: the **Account ID** is in the
-right-hand column of the overview page. It is also the first path segment of
-every dashboard URL (`dash.cloudflare.com/<account id>/...`), and
-`npx wrangler whoami` prints it. It is an identifier, not a secret, but the
-workflow reads it from a secret for tidiness.
-
-### Add both as repository secrets
-
-GitHub repository → **Settings → Secrets and variables → Actions → New
-repository secret**:
-
-| Name | Value |
+| Secret | What it is |
 |---|---|
-| `CLOUDFLARE_API_TOKEN` | the token you copied |
-| `CLOUDFLARE_ACCOUNT_ID` | the account ID |
+| `HOST_PASSCODE` | what you type on the host page to sign in. **At least 12 characters**; sign-in refuses to work with a shorter one and says so. A good one: `openssl rand -base64 18`, or four random words. |
+| `SESSION_KEY` | 32 random bytes that sign every session cookie. Never typed. `openssl rand -base64 32` |
+| `IP_HASH_KEY` | optional: keys the hashes kept for the abuse limits, so they cannot be brute-forced back to an address. Any long random string. |
 
-Then push a change under `quiz/` to `main`, or run the workflow by hand, and
-watch it under **Actions**. If it fails on the deploy step, the message names
-which of the two is wrong.
+Set them in the Cloudflare dashboard: **Workers & Pages → the Worker →
+Settings → Variables and Secrets → Add → type Secret**. From a laptop the same
+is `npx wrangler secret put HOST_PASSCODE` (add `--env staging` for staging).
+Use a different passcode on staging.
+
+After sign-in the host page keeps an HttpOnly, Secure, SameSite=Strict cookie
+(`__Host-hq_session`) for 30 days, renewed while you use it, never longer than
+90 days. **"This is a shared computer"** at sign-in makes it last only until
+the browser closes (and 4 idle hours). **Sign out on this device** is in the
+header and on the Game over screen; it clears this browser's cookie only.
+
+**Changing the passcode** (for example after a laptop is lost):
+
+1. Outside class time: changing a secret deploys a new version, which drops
+   every live connection for a few seconds.
+2. Dashboard → **hompub-quiz → Settings → Variables and Secrets** → the
+   `HOST_PASSCODE` row → **Edit** → paste the new passcode → **Deploy**.
+3. Every device is signed out at once, because the cookie's signing key is
+   derived from the passcode. Sign in again on the host laptop.
+4. To sign out every device **without** changing the passcode, change
+   `SESSION_KEY` the same way.
+5. Write down that you rotated it. A later "rollback-version" in the
+   production workflow would bring back the secrets of that older version;
+   "redeploy-ref" keeps the current ones (see below).
+
+Five wrong passcodes from one network in 15 minutes lock sign-in from that
+network for 15 minutes. A student on the school network could trigger that;
+hosts already signed in are not affected.
+
+**Why a passcode and not Cloudflare Access.** Cloudflare Access could put an
+email one-time-code login in front of the host page, and its free tier covers
+50 users. But it protects whole hostnames or paths at the edge, so on
+`workers.dev` it would also block the WebSocket upgrades students need unless
+`/play`, `/api/room/*` and the static files are carved out by hand; it adds an
+email round trip at the projector before every class; and it needs a Zero
+Trust account set up. A single passcode checked by the Worker, with a
+wrong-guess limit and an HttpOnly cookie, covers one teacher with none of that.
+Access becomes the better choice if several staff need individual logins or an
+audit trail.
+
+## Deploying through GitHub: staging first, production on approval
+
+Two workflows, two Cloudflare accounts:
+
+| | Staging | Production |
+|---|---|---|
+| Workflow | `.github/workflows/deploy-quiz-staging.yml` | `.github/workflows/deploy-quiz.yml` |
+| Runs | on every push to the work branch that changes `quiz/` (and by hand once the file is on `main`) | **only** from Actions → *Deploy quiz (production)* → **Run workflow**, then a reviewer presses **Approve** |
+| Worker | `hompub-quiz-staging`, in a second free Cloudflare account | `hompub-quiz` |
+| Credentials | GitHub Environment `staging` (branch-restricted) | GitHub Environment `production` (branch `main`, required reviewer, administrators may not bypass) |
+
+A merge to `main` deploys nothing. The staging account is separate so staging
+tests never spend the free daily allowance a live class needs, and so the
+staging token cannot reach production. Each token is created **inside its own
+account**, or lists only that account under *Account Resources*.
+
+**Setting up** (once):
+
+1. In each Cloudflare account: **My Profile → API Tokens → Create Token →
+   Edit Cloudflare Workers**, add **Account → D1 → Edit**, restrict *Account
+   Resources* and *Zone Resources* to that account only, and check the summary
+   before creating it.
+2. A new account needs its `workers.dev` subdomain chosen once in the
+   dashboard (**Workers & Pages**); a non-interactive deploy cannot do it.
+3. GitHub → repository **Settings → Environments**: create `production`
+   (required reviewer: you; untick *Allow administrators to bypass*;
+   deployment branch `main`) and `staging` (deployment branch: the work
+   branch). Give each its own `CLOUDFLARE_API_TOKEN` and
+   `CLOUDFLARE_ACCOUNT_ID`.
+4. Delete the repository-level `CLOUDFLARE_API_TOKEN` and
+   `CLOUDFLARE_ACCOUNT_ID`: repository secrets reach every branch's workflows.
+5. Set the Worker secrets (previous section) on both Workers.
+
+**Production run.** Choose `deploy` and a release tag such as `quiz-phase-1`.
+The job type-checks, tests, deploys with
+`--durable-objects-code-update-mode immediate` (the Worker and the Durable
+Objects switch together), prints the new version id in the run summary, and
+tags the deployed commit.
+
+**Rolling back.**
+
+- `redeploy-ref` with the previous tag (or a 40-character commit id) deploys
+  that code again and **keeps the current secrets**. This is the normal way.
+  The code before Phase 1 is commit `0198fcdd705647ed59398d804d3c168f6968e47b`
+  (Cloudflare version `45648569-84ab-48b2-a6e8-dc7653045895`).
+- `rollback-version` with a version id is Cloudflare's own rollback. Each
+  version keeps the secrets it was created with, so it can bring back an old
+  passcode; it runs only with *accept_secret_revert* ticked.
+- Without GitHub: dashboard → **Workers & Pages → hompub-quiz → Deployments**
+  → the earlier version → **Rollback**.
+- Static pages roll back with the Worker version.
 
 ### Deploys interrupt live games
 
 A deploy restarts every Durable Object and drops every open WebSocket. Phones
 and the host page reconnect on their own within a few seconds and the server
 timers keep running meanwhile, but a question that was open loses those seconds
-for everyone. **Merge to `main` outside school hours.** For the same reason the
-workflow runs only on `main`, never on pull-request branches: a branch push can
-never touch the live referee. Leave `concurrency` in the workflow as it is, so
-two pushes in a row deploy one after the other rather than at once.
+for everyone. **Deploy outside school hours.** The same holds for changing a
+secret.
 
 ## What the free plan gives you
 
@@ -300,8 +354,18 @@ Our estimate for one full game, **100 students × 20 questions**:
 | SQLite rows written | ~2,500 | **~40** |
 | Durable Object duration | 160–340 GB-s | **~40–80** |
 
-So the Free plan carries **roughly 40 full games a day**, bounded by rows
-written and object duration, not by requests. Smaller classes and shorter
+So the Free plan carries **roughly 40 full games a day** of that size,
+bounded by rows written and object duration, not by requests.
+
+For a **300 × 30** lecture the binding cap is rows written: measured locally
+at 9,323 rows up to the podium (one row per answer, three per join because of
+the two indexes, one per phase change and per alarm), about **10,000–11,000
+per game** with the wipe, so **about 8–9 such games a day** (6–7 at 400
+players). Requests (~3–5k), duration (~340 GB-s) and WebSockets (at most 850
+per room, against a limit of 32,768) are far from their caps. Running out of
+writes stops the game until 00:00 UTC (05:30 IST); the host page then says so
+in words instead of freezing. Staging is in its own account, so its tests do
+not count against these. Smaller classes and shorter
 quizzes cost proportionally less. Keepalive `ping`s are answered at the edge
 without waking the room, and the static pages are not metered at all.
 
@@ -315,7 +379,18 @@ harness. After the first real sessions, replace them with the numbers under
 **Workers & Pages → hompub-quiz → Metrics** and **Durable Objects → Metrics**
 in the dashboard.
 
-### Measured in the load harness (local Wrangler runtime, 2026-10-19)
+### Measured in the load harness (local Wrangler runtime)
+
+Phase 1, 2026-10-20 (`HQ_PASSCODE=… node test/load.mjs …`, 10 % of phones as
+version-1 pages):
+
+| Run | Result |
+|---|---|
+| 300 phones × 30 questions, 20 % drop per question, `--dev-stats` | PASS. Join p50 14 ms; ack p50 2.5 ms (8,329 answers); 1,798 reconnects; 9,323 rows written up to the podium; host roster deltas 364 KB |
+| 400 phones from one address (a school network), 2 questions, no drops | PASS: no PIN-guess limit hit |
+| 200 joins, host roster traffic | 10 frames, 17.2 KB with deltas, against 10 frames, 99.9 KB for the full roster before Phase 1 |
+
+The 2026-10-19 figures below are for the code before Phase 1.
 
 `node test/load.mjs --players 150 --questions 20 --time-limit 5 --drop 0.2`,
 150 simulated phones against `wrangler dev` on one laptop-class machine:
@@ -340,13 +415,17 @@ The policy students and parents read is
 holds it up as follows:
 
 - **Observability off.** `wrangler.jsonc` sets `observability.enabled: false`,
-  so Cloudflare keeps no request logs or traces for this Worker. Nothing in
-  `src/` calls `console.log`.
+  so Cloudflare keeps no request logs or traces for this Worker. The only
+  console output in `src/` is an unexpected-error message from a Room timer,
+  which carries no player data and is kept nowhere.
 - **No IPs, no nicknames logged.** The Room stores no IP address, user agent or
-  device detail. The only IP-derived value anywhere is the one the
-  room-creation cap needs: a truncated SHA-256 of `<UTC day>|<host's IP>`,
-  kept by the Directory and deleted after 48 hours. Students' IPs are never
-  read.
+  device detail. IP-derived values: the room-creation counter (a truncated
+  SHA-256 of `<key>|<UTC day>|<host's IP>`, deleted after 48 hours); during a
+  wrong-passcode lockout only, one keyed hash of the network, deleted when the
+  15-minute lockout ends; and the PIN-guess counters, which live in memory
+  only and are never written down.
+- **The host's session** is an HttpOnly cookie in the host's own browser; the
+  server stores no sessions and students get no cookies.
 - **Wipe on ack or TTL.** The room is `deleteAll()`-ed when the host confirms
   the CSV (`ack_results`), or 2 h after the last frame (idle sockets do not
   extend it), or 30 min after End game if the host never confirms. A room left
@@ -396,12 +475,23 @@ holds it up as follows:
   after End game; the file has already been downloaded by then. A room left on
   the podium screen is kept for 2 hours, and the CSV is sent to the host page
   before it is deleted.
-- **If the laptop dies mid-game**, open the host page in any browser and press
-  **Resume game**; the room keeps closing questions on its own timers
-  meanwhile. Students see "Waiting for the host" only between questions.
-- **Several teachers, one school:** the per-IP cap of 30 rooms per day is
-  shared by everyone behind the school's public IP. Raise
-  `ROOM_CREATE_PER_IP_PER_DAY` if that bites.
+- **If the laptop dies mid-game**, open the host page on any device, sign in,
+  and press **Resume game NNNNNN** under "A game you started is still live";
+  the room keeps closing questions on its own timers meanwhile. A refreshed
+  host tab goes straight back to the stage on its own. Students see "Waiting
+  for the host" only between questions.
+- **Names.** "Typed names only" is the default; "Typed or random" and "Random
+  only" are the alternatives, changeable in the lobby (Options). Students can
+  change their own name up to three times in the lobby; it switches off at
+  Start, and you can switch it on again from Options. You can rename anyone at
+  any time from **All players**, including after End game, so the CSV has the
+  right names.
+- **Removing a student** keeps their answers so far in the CSV, marked
+  `removed`. They could join again under another name unless you lock the
+  room: use **Remove and lock**.
+- **Several teachers, one school:** hosting needs the passcode, and signed-in
+  hosts skip the per-IP cap, so only the whole-site cap of 300 rooms a day
+  applies.
 
 ## Writing questions in Word
 

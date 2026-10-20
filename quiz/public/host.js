@@ -9,8 +9,8 @@
     3. state                ONE state object; currentPhase() picks the screen
     4. render()             a single switch on phase → one function per screen
     5. actions              click / input / change delegation via data-action / data-field
-    6. hosting              POST /api/room, the host WebSocket, applyFrame()
-    7. socket wrapper       backoff 500 ms → 8 s ×2 ±30 %, "ping" every 25 s, no-retry codes
+    6. hosting              sign-in, POST /api/room, the host WebSocket, applyFrame()
+    7. socket wrapper       backoff 500 ms → 8 s ×2 ±30 %, "ping" every 10 s, no pong in 10 s → reconnect
     8. clock + countdown    offset = serverNow - Date.now(); ring animates deadline - (now + offset)
     9. misc                 wake lock, fullscreen, keyboard, contrast, toast, downloads
 */
@@ -32,15 +32,40 @@ const POINTS = [0, 1000, 2000];
 const INTRO_MS = 3000;
 const LETTERS = ['A', 'B', 'C', 'D'];
 const PIN_RE = /^[1-9][0-9]{5}$/;
-const NO_RETRY_CODES = new Set([4001, 4003, 4004, 4009, 4010]);
+const PROTO = 2;                 // protocol version this page speaks (PROTOCOL §11)
+const NO_RETRY_CODES = new Set([4001, 4003, 4004, 4009, 4010, 4011]);
+const PING_EVERY_MS = 10000;     // keepalive; answered at the edge without waking the Room, and not billed
+const PONG_TIMEOUT_MS = 10000;   // no pong (or any frame) this long after a ping: the connection is dead
+const BLOCKED_AFTER_FAILS = 3;   // handshakes that never opened before the page says WebSockets look blocked
 const DEFAULT_CLOSE_MSG = {
+  4011: 'Your sign-in has expired. Sign in again to continue this game.',
   4001: 'The host key for this game was rejected. It cannot be resumed from here.',
   4003: 'This connection was removed from the game.',
   4004: 'This game has ended or no longer exists.',
   4009: 'The room is full.',
   4010: 'The room is locked.',
 };
-const DEFAULT_SETTINGS = { mode: 'speed', showOnDevices: false, lateJoin: true, earlyClose: false, nicknameMode: 'free' };
+const DEFAULT_SETTINGS = { mode: 'speed', showOnDevices: false, lateJoin: true, earlyClose: false, nameMode: 'typed', allowRename: true, nicknameMode: 'free' };
+const NAME_MODES = [
+  { id: 'typed', label: 'Typed names only', desc: 'Students type their name. Rude words are refused; duplicates get a number. No random-name button.' },
+  { id: 'either', label: 'Typed or random', desc: 'Students type a name, or tap for a random two-word name such as “Brave Otter”.' },
+  { id: 'random', label: 'Random only', desc: 'Every student gets a random two-word name. Nothing to type, nothing to moderate.' },
+];
+// The legacy two-way field is still sent, so a server rolled back to before protocol 2 understands it.
+function legacyNick(nameMode) { return nameMode === 'random' ? 'spin' : 'free'; }
+// Saved prefs from before the three-way setting: 'spin' was a deliberate choice; 'free' was only the old
+// default (every setting is saved whenever any one changes), so it becomes the new default, typed names only.
+function prefSettings(raw) {
+  const r = raw && typeof raw === 'object' ? raw : {};
+  const out = Object.assign({}, DEFAULT_SETTINGS);
+  if (MODES_IDS.includes(r.mode)) out.mode = r.mode;
+  ['showOnDevices', 'lateJoin', 'earlyClose', 'allowRename'].forEach((k) => { if (typeof r[k] === 'boolean') out[k] = r[k]; });
+  if (NAME_MODES.some((m) => m.id === r.nameMode)) out.nameMode = r.nameMode;
+  else if (r.nicknameMode === 'spin') out.nameMode = 'random';
+  out.nicknameMode = legacyNick(out.nameMode);
+  return out;
+}
+const MODES_IDS = ['speed', 'accuracy', 'coarse'];
 const MODES = [
   { id: 'speed', label: 'Speed', desc: 'Kahoot-style: a correct answer earns the full points if instant, about half at the buzzer.' },
   { id: 'accuracy', label: 'Accuracy', desc: '1 point per correct answer. Speed does not matter.' },
@@ -187,7 +212,7 @@ function loadHostKey() {
   const k = loadJSON(KEYS.host, null);
   return k && typeof k === 'object' && PIN_RE.test(String(k.pin)) && typeof k.hostToken === 'string' ? k : null;
 }
-function saveHostKey(k) { saveJSON(KEYS.host, { pin: k.pin, hostToken: k.hostToken, title: k.title || '' }); }
+function saveHostKey(k) { return saveJSON(KEYS.host, { pin: k.pin, hostToken: k.hostToken, title: k.title || '' }); }
 
 function loadQuizzes() {
   const list = loadJSON(KEYS.quizzes, []);
@@ -302,11 +327,26 @@ const state = {
   allTimers: null,         // last value chosen in the editor's "Set all timers to…" select
   storageBlocked: false,   // the last persistQuizzes() failed (private window, site data blocked)
   importer: null,          // Word/text import dialog over the home screen: null | {mode: 'paste'|'preview', source: 'paste'|'file', sourceName, text, preview, error, busy}
+  // Host sign-in (PROTOCOL §11). status: 'checking' | 'in' | 'out' | 'offline'. The session cookie is HttpOnly,
+  // so the page learns its state only from GET /api/session.
+  auth: { status: 'checking', shared: false, problem: '', message: '', busy: false, error: '' },
+  liveRooms: [],           // this library's live games, from GET /api/rooms (resume on another device)
+  reauth: false,           // the host socket closed with 4011: sign in again over the stage, then reconnect
+  panel: null,             // "All players" panel: null | {q: search text, editPid: pid being renamed}
+  serverNote: '',          // '' | 'old' (server rolled back to before protocol 2) | 'new' (a newer protocol)
+  storageError: '',        // the server could not save (daily limit): shown until the page is reloaded
+  pending: null,           // {action, at}: a start/close/next/end that was sent and awaits the next phase frame
+  phaseChangedAt: 0,       // when the last phase frame arrived (double-click guard, P0-51)
+  confirmEndAt: 0,         // first Space on the podium; a second within 3 s ends the game (P0-65)
+  autoResume: false,       // this connection was opened automatically on page load
+  urlTokenTried: false,    // after a 4001 on the first-frame token, try the URL form once (older servers)
+  keyNotSaved: false,      // the host key could not be stored: resuming must happen from another device
   prefs: {
     highContrast: !!storedPrefs.highContrast,
-    settings: Object.assign({}, DEFAULT_SETTINGS, storedPrefs.settings || {}),
+    settings: prefSettings(storedPrefs.settings),
   },
 };
+let passcodeDraft = '';   // the passcode being typed survives a re-render; cleared after sign-in
 let socket = null;        // reconnect wrapper (section 7)
 let clockOffset = 0;      // serverNow - Date.now(), refreshed by every frame that carries serverNow
 let wakeLock = null;
@@ -317,7 +357,10 @@ let shortcutMuteUntil = 0; // Date.now() before which the Space/Enter primary sh
 let lastPasteText = '';   // what was in the paste box when the dialog was closed, so an accidental Escape loses nothing
 let importerOpener = '';  // id of the home-screen button that opened the import dialog; focus goes back there on close
 
-function savePrefs() { saveJSON(KEYS.prefs, state.prefs); }
+function savePrefs() {
+  state.prefs.settings.nicknameMode = legacyNick(state.prefs.settings.nameMode);
+  saveJSON(KEYS.prefs, state.prefs);
+}
 
 // The one key the render switch turns on. Server phases win; local pseudo-phases fill the gaps.
 function currentPhase() {
@@ -331,6 +374,10 @@ function emptyTally(optionCount, expected) {
   return { counts: new Array(Math.max(0, optionCount | 0)).fill(0), answered: 0, expected: expected | 0 };
 }
 function joinUrl(pin) { return location.origin + '/play?pin=' + (PIN_RE.test(String(pin)) ? pin : ''); }
+// The QR code also carries the room key (&k=…): scanned joins skip the per-network guess limit (PROTOCOL §11).
+function qrUrl(pin, roomKey) { return joinUrl(pin) + (/^[0-9a-f]{16}$/.test(String(roomKey || '')) ? '&k=' + roomKey : ''); }
+function serverNow() { return Date.now() + clockOffset; }
+function fmtClock(ts) { try { return new Date(ts - clockOffset).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); } catch (e) { return ''; } }
 
 /* ======================================================================
    4. render(): one switch on phase
@@ -364,10 +411,14 @@ function render() {
   }
   document.body.dataset.mode = STAGE_PHASES.has(phase) ? 'stage' : 'page';
   app.replaceChildren(view);
+  state.renderedSig = screenSig();
   // The import dialog is rebuilt with the rest of the screen; re-open it as a modal (focus trap, Escape,
   // inert page behind). Without showModal() it still shows, as an ordinary open <dialog>.
   const dlg = $('importer');
   if (dlg && !dlg.open) { try { dlg.showModal(); } catch (e) { dlg.setAttribute('open', ''); } }
+  // Re-open the Options menu BEFORE focus goes back: focus inside a closed <details> is lost (P0-63).
+  const menu2 = $('stage-menu');
+  if (menu2 && menuOpen) menu2.open = true;
 
   let restored = false;
   if (focusedId) {
@@ -380,13 +431,55 @@ function render() {
   // Focus that could not be handed back falls to <body>; mute the Space/Enter shortcut briefly so a
   // key meant for the control the teacher had reached does not fire the phase's primary action.
   if (hadFocus && !restored) shortcutMuteUntil = Date.now() + SHORTCUT_MUTE_MS;
-  const menu2 = $('stage-menu');
-  if (menu2 && menuOpen) menu2.open = true;
 
   renderPill();
+  renderAuthSlot();
   document.title = state.game && state.game.pin ? `HomPub Quiz — PIN ${state.game.pin}` : 'HomPub Quiz — Host';
   ensureTicker(phase);
 }
+
+// Frames can arrive many times a second; they are drawn at most once per animation frame.
+let renderQueued = false;
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => { renderQueued = false; render(); });
+}
+
+// What the current screen is built from. Frames that leave it unchanged (roster, tally, host count)
+// are patched into the existing DOM instead of rebuilding it, so clicks, focus and the screen reader's
+// place survive (P0-73).
+function screenSig() {
+  const g = state.game;
+  return [currentPhase(), g ? g.q : '', state.reauth, !!state.panel, state.serverNote, state.storageError,
+    g ? !!g.locked : '', state.pending ? state.pending.action : '', expiryVisible(g)].join('|');
+}
+function patchStage() {
+  const g = state.game;
+  if (!g || renderQueued || state.renderedSig !== screenSig()) return false;
+  const count = typeof g.playerCount === 'number' ? g.playerCount : (g.roster || []).length;
+  const set = (id, text) => { const el = $(id); if (el && el.textContent !== text) el.textContent = text; };
+  set('head-count', plural(count, 'player') + (g.locked ? ' · locked' : ''));
+  set('host-note', hostNote(g));
+  set('lobby-count', plural(count, 'player'));
+  set('players-open', `All players (${count})`);
+  set('players-open-lobby', `All players (${count})`);
+  set('panel-title', `All players (${count})`);
+  const ans = $('answered');
+  if (ans && g.tally && (g.phase === 'open' || g.phase === 'intro')) {
+    const first = ans.firstChild;
+    const text = answeredText(g.tally);
+    if (first && first.nodeType === 3) { if (first.nodeValue !== text) first.nodeValue = text; } else return false;
+  }
+  const recent = $('lobby-recent');
+  if (recent) recent.replaceChildren(...recentChips(g));
+  const empty = $('lobby-empty');
+  if (empty) empty.hidden = count > 0;
+  const list = $('players-list');
+  if (list && !(state.panel && state.panel.editPid)) list.replaceChildren(...playerRows());
+  return true;
+}
+function refresh() { if (!patchStage()) scheduleRender(); }
 
 /* ---------- 4a. HOME ---------- */
 
@@ -394,7 +487,9 @@ function renderHome() {
   const quizzes = state.quizzes.slice().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   const hostKey = loadHostKey();
   return h('div', { class: 'wrap page' },
-    hostKey && h('section', { class: 'card resume' },
+    renderServerNote(),
+    state.auth.status === 'out' && hostKey ? renderSignIn(`Sign in to resume game ${hostKey.pin}`) : null,
+    hostKey && state.auth.status !== 'out' && h('section', { class: 'card resume' },
       h('p', { class: 'eyebrow' }, 'A game is still live'),
       h('h2', null, 'Resume game ', h('span', { class: 'mono' }, hostKey.pin)),
       h('p', { class: 'fine' }, hostKey.title ? `“${hostKey.title}” — ` : '', 'this browser still holds the host key. Students who are connected are waiting for you.'),
@@ -407,7 +502,7 @@ function renderHome() {
         h('h1', null, 'Your quizzes'),
         h('p', { class: 'lede' }, 'Build a quiz, put the PIN on the projector, students answer on their phones. Nothing is kept after the game except the CSV you download.')),
       h('div', { class: 'toolbar' },
-        btn('New quiz', 'new-quiz', { cls: 'primary' }),
+        btn('New quiz', 'new-quiz', { cls: 'primary', attrs: { id: 'new-quiz-btn' } }),
         btn('Import .json', 'import'),
         btn('Import Word or text', 'import-text', { attrs: { id: 'import-text-btn' } }),
         btn('Paste questions', 'paste-open', { attrs: { id: 'paste-btn' } }),
@@ -418,9 +513,70 @@ function renderHome() {
     quizzes.length
       ? h('div', { class: 'quiz-list' }, quizzes.map(renderQuizRow))
       : h('p', { class: 'empty' }, 'No quizzes yet. Start with “New quiz” or “Load sample”, or import questions written in Word.'),
+    renderLiveRooms(hostKey),
+    state.auth.status === 'out' && !hostKey ? renderSignIn('Sign in to host') : null,
     renderNetCheck(),
     h('p', { class: 'fine' }, 'Quizzes are saved only in this browser (localStorage). Export a .json copy before a lesson — a cleared browser means a lost quiz.'),
     state.importer ? renderImporter() : null);
+}
+
+// The host passcode form. Editing quizzes works without it; creating and controlling a game does not.
+function renderSignIn(title, opts) {
+  const a = state.auth;
+  const o = opts || {};
+  const problem = a.problem ? a.message : '';
+  return h('section', { class: 'card signin' + (o.stage ? ' on-stage' : ''), id: 'signin' },
+    h('h2', { id: 'signin-title' }, title),
+    h('p', { class: 'fine' }, o.stage
+      ? 'The game is still running on the server. Sign in and this screen reconnects to it.'
+      : 'Hosting needs the host passcode. You can make and edit quizzes without it.'),
+    problem
+      ? h('div', { class: 'notice bad', role: 'alert' }, problem)
+      : h('form', { class: 'signin-form', 'data-form': 'signin', 'aria-labelledby': 'signin-title' },
+          h('label', { class: 'field-label', for: 'passcode' }, 'Host passcode'),
+          h('input', { type: 'password', id: 'passcode', 'data-field': 'passcode', autocomplete: 'current-password', maxlength: 512, value: passcodeDraft, required: true }),
+          h('label', { class: 'check' },
+            h('input', { type: 'checkbox', id: 'signin-shared' }),
+            h('span', null, 'This is a shared computer — sign me out when the browser closes')),
+          a.error && h('p', { class: 'notice bad', role: 'alert', id: 'signin-error' }, a.error),
+          h('div', { class: 'btn-row' },
+            h('button', { type: 'submit', class: 'btn primary', id: 'signin-submit', disabled: a.busy }, a.busy ? 'Signing in…' : 'Sign in'),
+            o.stage ? btn('Back to my quizzes', 'leave', { cls: 'ghost' }) : null)));
+}
+
+// Live games this passcode started, from any device (P0-52). Host tokens never leave the server.
+function renderLiveRooms(hostKey) {
+  if (state.auth.status !== 'in') return null;
+  const rooms = state.liveRooms.filter((r) => !hostKey || r.pin !== hostKey.pin);
+  if (!rooms.length) return null;
+  return h('section', { class: 'card resume' },
+    h('p', { class: 'eyebrow' }, rooms.length === 1 ? 'A game you started is still live' : 'Games you started are still live'),
+    rooms.map((r) => h('div', { class: 'live-room' },
+      h('div', null,
+        h('h2', null, r.title || 'Untitled quiz', ' ', h('span', { class: 'mono' }, r.pin)),
+        h('p', { class: 'fine' }, `${phaseLabel(r.phase)} · ${plural(r.playerCount | 0, 'player')} · started on another device or tab`)),
+      btn(`Resume game ${r.pin}`, 'resume-remote', { cls: 'primary', attrs: { 'data-pin': r.pin, 'data-title': r.title || '' } }))));
+}
+function phaseLabel(p) {
+  return { lobby: 'In the lobby', intro: 'Question starting', open: 'Question open', closed: 'Showing answers', podium: 'On the podium', ended: 'Game over' }[p] || 'Live';
+}
+
+function renderServerNote() {
+  if (!state.serverNote) return null;
+  return h('div', { class: 'notice bad server-note', role: 'alert' },
+    h('b', null, state.serverNote === 'old' ? 'The server is running an older version' : 'A newer version of this page is ready'),
+    h('p', { class: 'fine' }, state.serverNote === 'old'
+      ? 'It was probably rolled back. Reload this page so it matches the server; a game in progress continues.'
+      : 'Reload this page when convenient; a game in progress continues.'),
+    h('div', { class: 'btn-row' }, btn('Reload now', 'reload')));
+}
+
+// "Sign out on this device" lives in the header whenever no game is live on this screen.
+function renderAuthSlot() {
+  const slot = $('auth-slot');
+  if (!slot) return;
+  const show = state.auth.status === 'in' && !isLive();
+  slot.replaceChildren(show ? h('button', { type: 'button', class: 'btn small', 'data-action': 'sign-out', id: 'sign-out-btn' }, 'Sign out on this device') : '');
 }
 
 function renderQuizRow(q) {
@@ -675,17 +831,16 @@ function renderSetup() {
       toggle('s-lateJoin', s.lateJoin, 'Allow late joiners', 'Students who join after the start score 0 for the questions they missed. Can be changed during the game.'),
       toggle('s-earlyClose', s.earlyClose, 'Close early when everyone has answered', 'Otherwise each question runs for its full time, or until you press “Close now”.'),
       h('div', { class: 'field' },
-        h('span', { class: 'field-label' }, 'Nicknames'),
-        h('div', { class: 'radio-group' },
-          radio('s-nicknameMode', 'free', s.nicknameMode === 'free', 'Students type a nickname', 'Filtered for profanity; duplicates get a number.'),
-          radio('s-nicknameMode', 'spin', s.nicknameMode === 'spin', 'Random two-word names only', 'e.g. “Brave Otter”. No typing, nothing to moderate.')))),
+        h('span', { class: 'field-label' }, 'Names'),
+        h('div', { class: 'radio-group' }, NAME_MODES.map((m) => radio('s-nameMode', m.id, s.nameMode === m.id, m.label, m.desc)))),
+      toggle('s-allowRename', s.allowRename !== false, 'Students can change their name', 'In the lobby only: up to 3 changes each. It switches off when you press Start; you can switch it on again from Options. You can rename anyone at any time.')),
     renderNetCheck(),
-    h('section', { class: 'card accent' },
+    state.auth.status === 'out' ? renderSignIn('Sign in to host this quiz') : h('section', { class: 'card accent' },
       h('h2', null, 'Host'),
       h('p', { class: 'fine' }, 'Creates a room with a 6-digit PIN. Keep this tab open on the projector for the whole game.'),
       state.error && h('div', { class: 'notice bad', role: 'alert' }, state.error),
       h('div', { class: 'btn-row' },
-        btn(state.busy ? 'Creating room…' : 'Host this quiz', 'host', { cls: 'primary big', disabled: problems.length > 0 || state.busy, attrs: { 'data-id': q.id } }))));
+        btn(state.busy ? 'Creating room…' : 'Host this quiz', 'host', { cls: 'primary big', disabled: problems.length > 0 || state.busy || state.auth.status === 'checking', attrs: { 'data-id': q.id } }))));
 }
 
 /* ---------- 4d. STAGE scaffolding (shared by lobby / question / reveal / podium / ended) ---------- */
@@ -696,14 +851,38 @@ function renderSetup() {
 function stageFrame(body, controls, hint, opts) {
   const g = state.game || {};
   const o = opts || {};
+  if (state.reauth) {
+    // The host socket closed with 4011 (session expired). The game keeps running on the server.
+    return h('div', { class: 'stage' }, renderStageHead(g), h('section', { class: 'stage-body' }, renderSignIn(`Sign in to continue game ${g.pin || ''}`, { stage: true })));
+  }
   const ctl = controls && controls.length
     ? h('div', { class: 'controls' }, hint ? h('span', { class: 'hint' }, hint) : null, controls.map(stableControlId))
     : null;
   return h('div', { class: 'stage' },
     renderStageHead(g),
+    renderStageBanners(g),
     o.controlsFirst ? ctl : null,
     h('section', { class: 'stage-body' }, body),
-    o.controlsFirst ? null : ctl);
+    o.controlsFirst ? null : ctl,
+    state.panel ? renderPlayersPanel() : null);
+}
+
+// Idle-wipe warning (P0-67), a failed save (daily limit), and a server/page version mismatch.
+function expiryVisible(g) {
+  const e = g && g.expiry;
+  return !!(e && e.wipeAt && e.warnAt && serverNow() >= e.warnAt && g.phase !== 'ended');
+}
+function renderStageBanners(g) {
+  const out = [];
+  if (state.storageError) out.push(h('div', { class: 'stage-banner bad', role: 'alert' }, state.storageError));
+  if (expiryVisible(g)) {
+    out.push(h('div', { class: 'stage-banner warn', role: 'alert', id: 'expiry' },
+      h('span', null, `Nothing has happened for a while, so the server will delete this game and its results at ${fmtClock(g.expiry.wipeAt)}.`),
+      btn('Keep 2 more hours', 'keep', { cls: 'primary', attrs: { id: 'keep-btn' } })));
+  }
+  if (state.serverNote) out.push(h('div', { class: 'stage-banner warn', role: 'status' },
+    state.serverNote === 'old' ? 'The server is running an older version. Reload this page between questions.' : 'A newer version of this page is ready. Reload it after the game.'));
+  return out.length ? out : null;
 }
 // Stage controls get a stable id (ctl-<action>) so render() can hand focus back after a rebuild.
 function stableControlId(el) {
@@ -716,19 +895,38 @@ function renderStageHead(g) {
   return h('header', { class: 'stage-head' },
     h('span', { class: 'pin' }, 'PIN ', h('b', null, g.pin || '')),
     h('span', null, location.host + '/play'),
-    h('span', { class: 'grow' }, plural(count, 'player'), g.locked ? ' · locked' : ''),
-    g.phase && g.phase !== 'ended' && isLive() ? renderStageMenu(g) : null);
+    h('span', { class: 'grow' },
+      h('span', { id: 'head-count' }, plural(count, 'player') + (g.locked ? ' · locked' : '')),
+      h('span', { id: 'host-note', class: 'host-note' }, hostNote(g))),
+    g.phase && g.phase !== 'ended' && isLive() && !state.reauth ? renderStageMenu(g) : null);
+}
+// P0-58: another device or tab controls this game too.
+function hostNote(g) {
+  const others = (g && g.hostCount | 0) - 1;
+  return others > 0 ? ` · also open on ${others === 1 ? '1 other screen' : others + ' other screens'}` : '';
 }
 
 // Live options: showOnDevices and lateJoin may change in any phase (PROTOCOL §2); lock too (§4.2).
 function renderStageMenu(g) {
   const s = g.settings || DEFAULT_SETTINGS;
+  const inLobby = g.phase === 'lobby';
+  const count = typeof g.playerCount === 'number' ? g.playerCount : (g.roster || []).length;
   return h('details', { class: 'stage-menu', id: 'stage-menu' },
     h('summary', { id: 'stage-menu-summary' }, 'Options'),
     h('div', { class: 'menu-body' },
+      btn(`All players (${count})`, 'players-open', { attrs: { id: 'players-open' } }),
       toggle('g-showOnDevices', !!s.showOnDevices, 'Show question on phones', 'Off: phones show only the four shapes.'),
       toggle('g-lateJoin', !!s.lateJoin, 'Allow late joiners', null),
       toggle('g-lock', !!g.locked, 'Lock room', 'No new players; reconnects still work.'),
+      toggle('g-allowRename', s.allowRename !== false, 'Students can change their name', inLobby ? 'Switches off when you press Start.' : 'Lets students fix their name now.'),
+      inLobby ? [
+        h('hr'),
+        h('label', { class: 'field-label', for: 'g-mode' }, 'Scoring'),
+        h('select', { id: 'g-mode', 'data-field': 'g-mode' }, MODES.map((m) => h('option', { value: m.id, selected: s.mode === m.id }, m.label))),
+        toggle('g-earlyClose', !!s.earlyClose, 'Close early when everyone has answered', null),
+        h('label', { class: 'field-label', for: 'g-nameMode' }, 'Names'),
+        h('select', { id: 'g-nameMode', 'data-field': 'g-nameMode' }, NAME_MODES.map((m) => h('option', { value: m.id, selected: (s.nameMode || 'typed') === m.id }, m.label))),
+      ] : null,
       h('hr'),
       btn(g.phase === 'lobby' ? 'Cancel game' : 'End game now', 'abort', { cls: 'danger', attrs: { id: 'menu-abort' } }),
       h('p', { class: 'fine', style: 'color:var(--stage-ink-soft);font-size:0.8rem' },
@@ -741,15 +939,22 @@ function abortOnlyControls() { return [btn('End game', 'abort', { cls: 'danger' 
 
 function renderConnecting() {
   const g = state.game;
+  const blocked = state.conn.blocked;
   return stageFrame(
     h('div', { class: 'center-card' },
-      h('h1', null, 'Connecting…'),
+      h('h1', null, state.autoResume ? 'Resuming your game…' : 'Connecting…'),
       h('p', null, 'Opening the host connection for game ', h('b', { class: 'mono' }, g.pin), '.'),
-      h('p', { class: 'fine' }, 'If this takes more than a few seconds, check the connection pill at the top.')),
-    [btn('Back to my quizzes', 'leave', { cls: 'ghost' })]);
+      blocked
+        ? h('div', { class: 'notice bad', role: 'alert' },
+            h('b', null, 'This network seems to block live connections'),
+            h('p', { class: 'fine' }, `${BLOCKED_MSG} The game keeps its PIN ${g.pin}; this page keeps trying and reconnects as soon as the network allows it.`))
+        : h('p', { class: 'fine' }, 'If this takes more than a few seconds, check the connection pill at the top.')),
+    [btn(state.autoResume ? 'Not now' : 'Back to my quizzes', 'leave', { cls: 'ghost' })]);
 }
 
 /* ---------- 4f. LOBBY ---------- */
+
+const RECENT_CHIPS = 30;   // the lobby shows the newest names; everyone is in "All players"
 
 function renderLobby() {
   const g = state.game;
@@ -764,28 +969,74 @@ function renderLobby() {
         h('p', { class: 'join-url mono' }, url),
         h('p', { class: 'eyebrow' }, 'Game PIN'),
         h('p', { class: 'pin-big mono' }, g.pin),
-        qrNode(url, g.pin)),
+        qrNode(qrUrl(g.pin, g.roomKey), g.pin)),
       h('div', { class: 'lobby-players' },
-        h('h2', null, plural(count, 'player')),
-        roster.length
-          ? h('p', { class: 'fine', style: 'color:var(--stage-ink-soft)' }, 'Click a name to remove that player.')
-          : h('p', { class: 'lobby-empty' }, 'Waiting for players to join…'),
-        h('div', { class: 'players-grid' }, roster.map((p) =>
-          h('button', {
-            type: 'button',
-            id: 'chip-' + p.pid,
-            class: 'player-chip' + (p.connected === false ? ' offline' : ''),
-            'data-action': 'kick', 'data-pid': p.pid, 'data-nick': p.nick,
-            'aria-label': `Remove ${p.nick}${p.connected === false ? ' (offline)' : ''} from the game`,
-            title: 'Remove this player',
-          }, p.nick, p.connected === false ? ' (offline)' : ''))))),
+        h('h2', { id: 'lobby-count' }, plural(count, 'player')),
+        h('p', { class: 'lobby-empty', id: 'lobby-empty', hidden: count > 0 }, 'Waiting for players to join…'),
+        h('p', { class: 'fine', style: 'color:var(--stage-ink-soft)' }, `Newest names. Click one to remove that player; “All players” has everyone, with search and rename.`),
+        h('div', { class: 'players-grid', id: 'lobby-recent' }, recentChips(g)),
+        h('div', { class: 'btn-row' }, btn(`All players (${count})`, 'players-open', { attrs: { id: 'players-open-lobby' } })))),
     [
       btn(g.locked ? 'Locked' : 'Lock room', 'toggle-lock', { attrs: { 'aria-pressed': g.locked ? 'true' : 'false' } }),
       btn('Show on phones', 'toggle-show', { attrs: { 'aria-pressed': s.showOnDevices ? 'true' : 'false' } }),
-      btn('Start ▸', 'start', { cls: 'primary big' }),
+      primaryBtn('Start ▸', 'start'),
     ],
     'Space / Enter: start · F: fullscreen',
     { controlsFirst: true });
+}
+
+function recentChips(g) {
+  const roster = Array.isArray(g.roster) ? g.roster : [];
+  return roster.slice(-RECENT_CHIPS).reverse().map((p) =>
+    h('button', {
+      type: 'button',
+      id: 'chip-' + p.pid,
+      class: 'player-chip' + (p.connected === false ? ' offline' : ''),
+      'data-action': 'kick', 'data-pid': p.pid, 'data-nick': p.nick,
+      'aria-label': `Remove ${p.nick}${p.connected === false ? ' (offline)' : ''} from the game`,
+      title: 'Remove this player',
+    }, p.nick, p.connected === false ? ' (offline)' : ''));
+}
+
+// A start/close/next/end button stays disabled from the click until the next phase frame (P0-51).
+function primaryBtn(label, action) {
+  const waiting = !!(state.pending && state.pending.action === action);
+  return btn(label, action, { cls: 'primary big', disabled: waiting, attrs: waiting ? { 'aria-busy': 'true' } : null });
+}
+
+/* ---------- 4f-ii. ALL PLAYERS panel (search, rename, remove) ---------- */
+
+function renderPlayersPanel() {
+  const g = state.game;
+  const count = typeof g.playerCount === 'number' ? g.playerCount : (g.roster || []).length;
+  return h('section', { class: 'players-panel', id: 'players-panel', 'aria-labelledby': 'panel-title' },
+    h('div', { class: 'panel-head' },
+      h('h2', { id: 'panel-title' }, `All players (${count})`),
+      btn('Close', 'players-close', { cls: 'ghost', attrs: { id: 'players-close' } })),
+    h('input', { type: 'search', id: 'players-search', 'data-field': 'players-search', placeholder: 'Search names', 'aria-label': 'Search players', value: state.panel.q || '', autocomplete: 'off' }),
+    h('ul', { class: 'players-list', id: 'players-list' }, playerRows()),
+    h('p', { class: 'fine' }, 'Removed players cannot answer any more. Their answers so far stay in the results file, marked “removed”. They could join again under another name unless the room is locked.'));
+}
+
+function playerRows() {
+  const g = state.game;
+  const q = (state.panel && state.panel.q || '').trim().toLowerCase();
+  const roster = (Array.isArray(g.roster) ? g.roster : []).filter((p) => !q || String(p.nick).toLowerCase().includes(q));
+  if (!roster.length) return [h('li', { class: 'empty' }, q ? 'No player matches that search.' : 'No players yet.')];
+  return roster.map((p) => {
+    if (state.panel.editPid === p.pid) {
+      return h('li', { class: 'editing' },
+        h('label', { class: 'sr-only', for: 'rename-input' }, `New name for ${p.nick}`),
+        h('input', { type: 'text', id: 'rename-input', value: p.nick, maxlength: 20, 'data-pid': p.pid, autocomplete: 'off' }),
+        btn('Save', 'rename-save', { cls: 'primary small', attrs: { 'data-pid': p.pid } }),
+        btn('Cancel', 'rename-cancel', { cls: 'ghost small' }));
+    }
+    return h('li', null,
+      h('span', { class: 'nick' + (p.connected === false ? ' offline' : '') }, p.nick, p.connected === false ? ' (offline)' : ''),
+      btn('Rename', 'rename-start', { cls: 'small', attrs: { 'data-pid': p.pid, id: 'rename-' + p.pid, 'aria-label': `Rename ${p.nick}` } }),
+      btn('Remove', 'kick', { cls: 'small danger', attrs: { 'data-pid': p.pid, 'data-nick': p.nick, id: 'kick-' + p.pid, 'aria-label': `Remove ${p.nick}` } }),
+      btn('Remove and lock', 'kick-lock', { cls: 'small danger', attrs: { 'data-pid': p.pid, 'data-nick': p.nick, 'aria-label': `Remove ${p.nick} and lock the room` } }));
+  });
 }
 
 // The QR is built locally from location.origin + a regex-checked PIN, then parsed as SVG (no innerHTML).
@@ -858,13 +1109,19 @@ function renderQuestion(phase) {
         renderRing(),
         phase === 'intro'
           ? h('p', { class: 'answered' }, 'Get ready…', h('small', null, 'the clock starts in a moment'))
-          : h('p', { class: 'answered', id: 'answered' }, `${tally.answered | 0} of ${tally.expected | 0}`, h('small', null, 'answered'))),
+          : h('p', { class: 'answered', id: 'answered' }, answeredText(tally), h('small', null, 'answered'))),
       h('div', { class: 'options' }, options.map((o, i) => optionTile(i, o))),
     ],
     phase === 'open'
-      ? [btn('Close now', 'close', { cls: 'primary big' })]
+      ? [primaryBtn('Close now', 'close')]
       : [btn('Get ready…', 'noop', { cls: 'big', disabled: true })],
     phase === 'open' ? 'Space / Enter: close now' : null);
+}
+
+// "12 of 30 answered". A late joiner can answer without being counted as expected; never show "3 of 2" (P0-60).
+function answeredText(t) {
+  const a = t.answered | 0;
+  return `${a} of ${Math.max(a, t.expected | 0)}`;
 }
 
 /* ---------- 4h. REVEAL (closed) ---------- */
@@ -896,14 +1153,14 @@ function renderReveal() {
       h('div', { class: 'reveal-row' },
         h('div', { class: 'stage-body' },
           h('div', { class: 'options' }, options.map((o, i) => optionTile(i, o, { count: counts[i] | 0, max, correct: i === r.correct, dim: i !== r.correct }))),
-          h('p', { class: 'answered' }, `${r.answered | 0} of ${r.expected | 0}`, h('small', null, 'answered')),
+          h('p', { class: 'answered' }, answeredText(r), h('small', null, 'answered')),
           h('p', { class: 'fastest' },
             r.fastest && r.fastest.nick
               ? ['Fastest correct: ', h('b', null, r.fastest.nick), ` (${fmtSec(r.fastest.ms)})`]
               : (q.points === 0 ? 'Survey question — no points awarded.' : 'Nobody got this one right.'))),
         h('div', null, h('p', { class: 'board-title' }, 'Leaderboard'), renderBoard(lb, true))),
     ],
-    [btn(isLast ? 'Show podium ▸' : 'Next question ▸', 'next', { cls: 'primary big' })],
+    [primaryBtn(isLast ? 'Show podium ▸' : 'Next question ▸', 'next')],
     'Space / Enter: next');
 }
 
@@ -928,8 +1185,8 @@ function renderPodium() {
       h('div', { class: 'podium' }, places),
       lb.length ? [h('p', { class: 'board-title' }, 'Top 10'), renderBoard(lb, false)] : null,
     ],
-    [btn('End game', 'end', { cls: 'primary big' })],
-    'Space / Enter: end game · the results file downloads next');
+    [primaryBtn('End game', 'end')],
+    'Space twice / Enter: end game · the results file downloads next');
 }
 
 /* ---------- 4j. ENDED / WIPED / DISCONNECTED ---------- */
@@ -971,6 +1228,7 @@ function renderEnded() {
         h('p', { class: 'fine' }, 'It is the only copy. Once you confirm below, nothing about this game remains on the server. The phones already show “Game over”.'),
         h('div', { class: 'btn-row' }, downloadButton(r)),
         h('div', { class: 'btn-row' }, btn('I have the results — wipe the game', 'ack', { cls: 'primary big' })),
+        state.auth.status === 'in' ? h('div', { class: 'btn-row' }, h('button', { type: 'button', class: 'link-btn', 'data-action': 'sign-out' }, 'Sign out on this device')) : null,
       ] : [
         h('p', null, 'Waiting for the results file from the server…'),
         h('p', { class: 'fine' }, 'If this takes more than a few seconds, check the connection pill at the top. The room keeps the results for 30 minutes.'),
@@ -1052,7 +1310,7 @@ function renderPill() {
   text.textContent = label;
 }
 function setConn(status, detail) {
-  state.conn = { status, detail: detail || '' };
+  state.conn = { status, detail: detail || '', blocked: status === 'live' ? false : !!state.conn.blocked };
   renderPill();
 }
 
@@ -1145,29 +1403,49 @@ const actions = {
   'net-check'() { checkNetwork(); },
   host(d) { hostQuiz(d.id); },
   resume() { const key = loadHostKey(); if (key) connectHost(key); else render(); },
+  'resume-remote'(d) {
+    if (!PIN_RE.test(String(d.pin))) return;
+    // No host token on this device: the signed-in session is enough, and the first sync hands the token over.
+    connectHost({ pin: String(d.pin), hostToken: '', title: d.title || '' });
+  },
+  reload() { location.reload(); },
+  'sign-out'() { signOut(); },
   'forget-host'() {
     if (!window.confirm('Forget this game on this browser? Students still connected will see it time out.')) return;
     removeKey(KEYS.host); render();
   },
   // ---- in-game ----
   start() {
-    if (!state.game) return;
+    if (!state.game || isPending('start')) return;
     if ((state.game.playerCount | 0) === 0 && !window.confirm('No players have joined yet. Start anyway?')) return;
-    send({ t: 'start' });
+    primarySend('start', 0);
   },
-  close() { send({ t: 'close' }); },
-  next() { send({ t: 'next' }); },
-  end() { send({ t: 'end' }); },
+  // Close is ignored for 0.5 s after a question opens and Next for 0.8 s after the reveal, so a
+  // double-click or a double Space cannot skip the answers (P0-51).
+  close() { primarySend('close', 500); },
+  next() { primarySend('next', 800); },
+  end() { primarySend('end', 800); },
   abort() {
     if (!state.game) return;
     const inLobby = state.game.phase === 'lobby';
     if (!window.confirm(inLobby ? 'Cancel this game? Players will be sent away.' : 'End the game now? You will get the results so far.')) return;
     send({ t: 'end' });
   },
+  // P0-07: a removed student can join again under another name, unless the room is locked. Say so.
   kick(d) {
-    if (!window.confirm(`Remove ${d.nick || 'this player'} from the game? They cannot rejoin.`)) return;
+    if (!window.confirm(`Remove ${d.nick || 'this player'}? They can join again under another name unless you lock the room.`)) return;
     send({ t: 'kick', pid: d.pid });
   },
+  'kick-lock'(d) {
+    if (!window.confirm(`Remove ${d.nick || 'this player'} and lock the room? Nobody new can join until you unlock it; everyone else stays.`)) return;
+    send({ t: 'kick', pid: d.pid, lock: true });
+  },
+  'players-open'() { state.panel = { q: '', editPid: null }; render(); focusLater('players-search'); },
+  'players-close'() { state.panel = null; render(); focusLater('players-open-lobby') || focusLater('stage-menu-summary'); },
+  'rename-start'(d) { if (!state.panel) return; state.panel.editPid = d.pid; render(); focusLater('rename-input', true); },
+  'rename-cancel'() { if (!state.panel) return; const pid = state.panel.editPid; state.panel.editPid = null; render(); focusLater('rename-' + pid); },
+  'rename-save'(d) { saveRename(d.pid); },
+  keep() { send({ t: 'keep' }); },
   'toggle-lock'() { if (state.game) setLock(!state.game.locked); },
   'toggle-show'() { if (state.game) updateSettings({ showOnDevices: !(state.game.settings && state.game.settings.showOnDevices) }); },
   download() { downloadResults(); },
@@ -1186,6 +1464,21 @@ const actions = {
   'toggle-fullscreen'() { toggleFullscreen(); },
 };
 
+// The sign-in form (home, setup, and over the stage after a 4011).
+document.addEventListener('submit', (e) => {
+  const form = e.target;
+  if (!form || !form.dataset || form.dataset.form !== 'signin') return;
+  e.preventDefault();
+  signIn();
+});
+// Enter in the rename box saves; Escape cancels.
+document.addEventListener('keydown', (e) => {
+  const el = e.target;
+  if (!el || el.id !== 'rename-input') return;
+  if (e.key === 'Enter') { e.preventDefault(); saveRename(el.dataset.pid); }
+  else if (e.key === 'Escape') { e.preventDefault(); actions['rename-cancel'](); }
+});
+
 document.addEventListener('click', (e) => {
   const el = e.target.closest ? e.target.closest('[data-action]') : null;
   if (!el) return;
@@ -1203,6 +1496,13 @@ document.addEventListener('input', (e) => {
   if (f === 'title') editQuiz((q) => { q.title = el.value; });
   else if (f === 'q-text') editQuiz((q) => { const qq = q.questions[+el.dataset.q]; if (qq) qq.text = el.value; });
   else if (f === 'opt') editQuiz((q) => { const qq = q.questions[+el.dataset.q]; if (qq) qq.options[+el.dataset.i] = el.value; });
+  else if (f === 'passcode') { passcodeDraft = el.value; }
+  else if (f === 'players-search') {
+    if (!state.panel) return;
+    state.panel.q = el.value;
+    const list = $('players-list');
+    if (list) list.replaceChildren(...playerRows());     // the search box itself is never rebuilt while typing
+  }
   // Import dialog: typing never rebuilds the dialog; the state just follows the fields.
   else if (f === 'import-text') { if (state.importer) state.importer.text = el.value; }
   else if (f === 'import-title') { if (state.importer && state.importer.preview) state.importer.preview.quiz.title = el.value; }
@@ -1223,9 +1523,14 @@ document.addEventListener('change', (e) => {
     case 's-showOnDevices': state.prefs.settings.showOnDevices = !!el.checked; savePrefs(); break;
     case 's-lateJoin': state.prefs.settings.lateJoin = !!el.checked; savePrefs(); break;
     case 's-earlyClose': state.prefs.settings.earlyClose = !!el.checked; savePrefs(); break;
-    case 's-nicknameMode': if (el.value === 'free' || el.value === 'spin') { state.prefs.settings.nicknameMode = el.value; savePrefs(); } break;
+    case 's-nameMode': if (NAME_MODES.some((m) => m.id === el.value)) { state.prefs.settings.nameMode = el.value; savePrefs(); } break;
+    case 's-allowRename': state.prefs.settings.allowRename = !!el.checked; savePrefs(); break;
     case 'g-showOnDevices': updateSettings({ showOnDevices: !!el.checked }); break;
     case 'g-lateJoin': updateSettings({ lateJoin: !!el.checked }); break;
+    case 'g-allowRename': updateSettings({ allowRename: !!el.checked }); break;
+    case 'g-earlyClose': updateSettings({ earlyClose: !!el.checked }); break;
+    case 'g-mode': if (MODES_IDS.includes(el.value)) updateSettings({ mode: el.value }); break;
+    case 'g-nameMode': if (NAME_MODES.some((m) => m.id === el.value)) updateSettings({ nameMode: el.value, nicknameMode: legacyNick(el.value) }); break;
     case 'g-lock': setLock(!!el.checked); break;
     default: break;
   }
@@ -1443,13 +1748,110 @@ function checkNetwork() {
    6. Hosting: create room, connect, apply frames
    ====================================================================== */
 
+/* ---------- sign-in (PROTOCOL §11) ---------- */
+
+async function checkSession() {
+  let res, body = null;
+  try {
+    res = await fetch('/api/session', { cache: 'no-store' });
+    try { body = await res.json(); } catch (e) { body = null; }
+  } catch (e) {
+    state.auth = Object.assign({}, state.auth, { status: 'offline' });
+    return;
+  }
+  if (res.status === 404) { state.serverNote = 'old'; state.auth = Object.assign({}, state.auth, { status: 'out' }); return; }
+  const signedIn = !!(body && body.signedIn);
+  state.auth = {
+    status: signedIn ? 'in' : 'out', shared: !!(body && body.shared), busy: false, error: '',
+    problem: body && body.problem ? body.problem : '', message: body && body.message ? body.message : '',
+  };
+}
+
+async function signIn() {
+  const pass = passcodeDraft || (($('passcode') || {}).value || '');
+  const shared = !!(($('signin-shared') || {}).checked);
+  if (!pass) { state.auth.error = 'Type the host passcode.'; render(); focusLater('passcode'); return; }
+  state.auth.busy = true; state.auth.error = ''; render();
+  let res, body = null;
+  try {
+    res = await fetch('/api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ passcode: pass, shared }) });
+    try { body = await res.json(); } catch (e) { body = null; }
+  } catch (e) {
+    state.auth.busy = false;
+    state.auth.error = 'Could not reach the server. Check your connection and try again.';
+    render(); focusLater('passcode'); return;
+  }
+  state.auth.busy = false;
+  if (res.ok && body && body.signedIn) {
+    passcodeDraft = '';
+    state.auth = { status: 'in', shared: !!body.shared, busy: false, error: '', problem: '', message: '' };
+    toast(body.shared ? 'Signed in until this browser closes.' : 'Signed in on this device.');
+    afterSignIn();
+    return;
+  }
+  if (res.status === 404) state.serverNote = 'old';
+  state.auth.error = (body && body.message) || `Sign-in failed (the server said ${res.status}). Try again.`;
+  if (body && (body.error === 'not_configured' || body.error === 'passcode_too_short')) { state.auth.problem = body.error; state.auth.message = body.message; }
+  render(); focusLater('passcode');
+}
+
+function afterSignIn() {
+  if (state.reauth && state.game) {
+    state.reauth = false;
+    const key = loadHostKey() || { pin: state.game.pin, hostToken: state.game.hostToken || '', title: state.game.title || '' };
+    connectHost(key);
+    return;
+  }
+  loadLiveRooms();
+  const key = loadHostKey();
+  if (key && !state.game) { state.autoResume = true; connectHost(key); return; }
+  render();
+}
+
+async function signOut() {
+  try { await fetch('/api/session', { method: 'DELETE' }); } catch (e) { /* the cookie is HttpOnly: only the server can clear it */ }
+  state.auth = { status: 'out', shared: false, busy: false, error: '', problem: '', message: '' };
+  state.liveRooms = [];
+  toast('Signed out on this device.');
+  render();
+}
+
+async function loadLiveRooms() {
+  if (state.auth.status !== 'in') return;
+  try {
+    const res = await fetch('/api/rooms', { cache: 'no-store' });
+    if (res.status === 401) { state.auth.status = 'out'; render(); return; }
+    const body = await res.json();
+    state.liveRooms = body && Array.isArray(body.rooms) ? body.rooms.filter((r) => r && PIN_RE.test(String(r.pin))) : [];
+  } catch (e) { state.liveRooms = []; }
+  if (!state.game) render();
+}
+
+// GET /api/session renews the cookie when it is due; a shared-computer session renews on use only.
+function keepSessionAlive() {
+  if (state.auth.status !== 'in') return;
+  fetch('/api/session', { cache: 'no-store' }).then((r) => r.json()).then((b) => {
+    if (b && b.signedIn === false && state.auth.status === 'in') { state.auth.status = 'out'; if (!isLive()) render(); }
+  }).catch(() => { /* offline: try again later */ });
+}
+
+function focusLater(id, select) {
+  const el = $(id);
+  if (!el) return false;
+  requestAnimationFrame(() => { const e2 = $(id); if (e2) { try { e2.focus(); if (select && e2.select) e2.select(); } catch (e) { /* ignore */ } } });
+  return true;
+}
+
+/* ---------- hosting ---------- */
+
 async function hostQuiz(id) {
   const q = findQuiz(id); if (!q) return;
   const problems = validateQuiz(q);
   if (problems.length) { state.error = problems[0]; render(); return; }
+  if (state.auth.status !== 'in') { state.auth.status = 'out'; render(); focusLater('passcode'); return; }
   if (loadHostKey() && !window.confirm('Another game is still live from this browser. Starting a new one forgets the old one here (its room times out on the server). Continue?')) return;
   const quiz = cleanQuiz(q);
-  const settings = Object.assign({}, DEFAULT_SETTINGS, state.prefs.settings);
+  const settings = prefSettings(state.prefs.settings);
   state.busy = true; state.error = null; render();
 
   let res;
@@ -1460,13 +1862,16 @@ async function hostQuiz(id) {
   }
   let body = null;
   try { body = await res.json(); } catch (e) { body = null; }
+  if (res.status === 401) { state.busy = false; state.auth.status = 'out'; state.auth.error = 'Your sign-in has expired. Sign in again to host.'; render(); focusLater('passcode'); return; }
   if (!res.ok) { failCreate(createErrorMessage(res.status, body)); return; }
   if (!body || !PIN_RE.test(String(body.pin)) || typeof body.hostToken !== 'string' || !body.hostToken) {
     failCreate('The server sent an unexpected reply. Try again.'); return;
   }
   state.busy = false;
   const key = { pin: String(body.pin), hostToken: body.hostToken, title: quiz.title };
-  saveHostKey(key);
+  state.keyNotSaved = !saveHostKey(key);
+  if (state.keyNotSaved) toast('This browser cannot save the host key. If this tab closes, resume from another signed-in device.', 9000);
+  state.autoResume = false;
   connectHost(key);
 }
 function failCreate(message) { state.busy = false; state.error = message; render(); }
@@ -1476,38 +1881,84 @@ function createErrorMessage(status, body) {
     case 400: return 'The server rejected the quiz' + (detail ? `: ${detail}` : '.');
     case 403: return 'The server refused this page’s origin. Open the host page from the quiz site itself, not a copy.';
     case 413: return 'The quiz is too large (over 200 KB). Shorten some questions.';
-    case 429: return 'Too many games have been created today (the pilot allows 30 per network and 300 in total). Try again tomorrow, or from another network.';
-    case 503: return 'No game PIN is free right now. Wait a minute and try again.';
+    case 429: return 'Too many games have been created today (the whole site allows 300 a day). Try again tomorrow.';
+    case 503: return body && body.message ? body.message : 'No game PIN is free right now. Wait a minute and try again.';
     default: return `The server answered ${status}` + (detail ? ` (${detail})` : '') + '. Try again.';
   }
 }
 
-function connectHost(key) {
+// Protocol 2: the host token travels in a first {t:'auth'} frame, not in the URL (PROTOCOL §11). A signed-in
+// session is also checked by the Worker, so a device without the token (resume elsewhere) gets in too.
+// After a 4001 the URL form is tried once, for a server rolled back to before protocol 2.
+function connectHost(key, keepFallback) {
   if (socket) { socket.close(); socket = null; }
+  if (!keepFallback) state.urlTokenTried = false;
   state.game = { pin: key.pin, title: key.title || '', hostToken: key.hostToken };   // minimal until the first sync
-  state.closeInfo = null; state.wiped = false; state.busy = false; state.error = null;
+  state.closeInfo = null; state.wiped = false; state.busy = false; state.error = null; state.reauth = false;
+  state.pending = null; state.storageError = ''; state.panel = null;
   if (state.results && state.results.pin !== key.pin) state.results = null;
   qrCache = null;
-  const url = `${wsBase()}/api/room/${key.pin}/ws?role=host&token=${encodeURIComponent(key.hostToken)}`;
-  socket = createSocket({ url, onFrame: applyFrame, onStatus: setConn, onClose: onSocketClosed });
+  const urlFor = () => {
+    const tok = state.game && state.game.hostToken;
+    return `${wsBase()}/api/room/${key.pin}/ws?role=host&v=${PROTO}` + (state.urlTokenTried && tok ? `&token=${encodeURIComponent(tok)}` : '');
+  };
+  const onOpen = (sendRaw) => {
+    const tok = state.game && state.game.hostToken;
+    if (tok && !state.urlTokenTried) sendRaw({ t: 'auth', token: tok });
+  };
+  socket = createSocket({ urlFor, onOpen, onFrame: applyFrame, onStatus: setConn, onClose: onSocketClosed, onFail: onHandshakeFail });
   requestWakeLock();
   render();
 }
 
-function send(obj) {
-  if (!socket || !socket.send(obj)) toast('Not connected right now — reconnecting…');
+function onHandshakeFail(n) {
+  const blocked = n >= BLOCKED_AFTER_FAILS;
+  if (state.conn.blocked !== blocked) { state.conn.blocked = blocked; if (currentPhase() === 'connecting') scheduleRender(); }
 }
+
+function send(obj) {
+  if (!socket || !socket.send(obj)) { toast('Not connected right now — reconnecting…'); return false; }
+  return true;
+}
+// Settings and Lock change on screen only when the server's `settings` reply arrives (P0-59).
 function updateSettings(partial) {
   if (!state.game) return;
-  state.game.settings = Object.assign({}, state.game.settings || DEFAULT_SETTINGS, partial);   // optimistic; the `settings` reply confirms
-  send({ t: 'settings', settings: partial });
-  render();
+  if (!send({ t: 'settings', settings: partial })) render();   // put the checkbox back
 }
 function setLock(on) {
   if (!state.game) return;
-  state.game.locked = !!on;                                   // optimistic; PROTOCOL gives `lock` no explicit reply
-  send({ t: 'lock', on: !!on });
+  if (!send({ t: 'lock', on: !!on })) render();
+}
+
+function isPending(action) { return !!(state.pending && state.pending.action === action && Date.now() - state.pending.at < 3000); }
+// One press of a phase button sends one frame; further presses wait for the next phase frame (P0-51).
+function primarySend(action, guardMs) {
+  if (!state.game || isPending(action)) return;
+  if (Date.now() - state.phaseChangedAt < guardMs) return;
+  if (!send({ t: action })) return;
+  state.pending = { action, at: Date.now() };
+  scheduleRender();
+  setTimeout(() => { if (state.pending && state.pending.action === action && Date.now() - state.pending.at >= 3000) { state.pending = null; scheduleRender(); } }, 3100);
+}
+
+function saveRename(pid) {
+  const input = $('rename-input');
+  const nick = input ? input.value.trim() : '';
+  if (!nick) { toast('Type a name first.'); return; }
+  if (!send({ t: 'rename_player', pid, nick })) return;
+  if (state.panel) state.panel.editPid = null;
   render();
+  focusLater('rename-' + pid);
+}
+
+function rosterUpsert(g, players) {
+  if (!Array.isArray(players)) return;
+  if (!Array.isArray(g.roster)) g.roster = [];
+  const at = new Map(g.roster.map((p, i) => [p.pid, i]));
+  for (const p of players) {
+    if (!p || typeof p.pid !== 'string') continue;
+    if (at.has(p.pid)) g.roster[at.get(p.pid)] = p; else { at.set(p.pid, g.roster.length); g.roster.push(p); }
+  }
 }
 
 // Every server frame lands here. `sync` replaces the snapshot wholesale; deltas patch it in place.
@@ -1522,15 +1973,42 @@ function applyFrame(f) {
       if (!PIN_RE.test(String(snap.pin))) snap.pin = g ? g.pin : '';
       if (snap.question && !snap.tally) snap.tally = emptyTally(snap.question.optionCount, snap.playerCount);
       if (!Array.isArray(snap.roster)) snap.roster = [];
+      if (!g || g.phase !== snap.phase || g.q !== snap.q) markPhase();
       state.game = snap;
-      if (snap.hostToken) saveHostKey({ pin: snap.pin, hostToken: snap.hostToken, title: snap.title });
+      state.serverNote = typeof f.proto !== 'number' ? 'old' : (f.proto > PROTO ? 'new' : '');
+      if (snap.hostToken) state.keyNotSaved = !saveHostKey({ pin: snap.pin, hostToken: snap.hostToken, title: snap.title });
+      if (snap.expiry && snap.expiry.warnAt) wakeAt(snap.expiry.warnAt);
       break;
     }
-    case 'roster':
+    case 'roster':                                           // a server from before protocol 2
       g.roster = Array.isArray(f.players) ? f.players : [];
       if (typeof f.playerCount === 'number') g.playerCount = f.playerCount;
+      refresh();
+      return;
+    case 'player_joined':
+    case 'player_updated':
+      rosterUpsert(g, f.players);
+      if (typeof f.playerCount === 'number') g.playerCount = f.playerCount;
+      refresh();
+      return;
+    case 'player_left': {
+      const gone = new Set(Array.isArray(f.pids) ? f.pids : []);
+      if (Array.isArray(g.roster)) g.roster = g.roster.filter((p) => !gone.has(p.pid));
+      if (typeof f.playerCount === 'number') g.playerCount = f.playerCount;
+      if (state.panel && gone.has(state.panel.editPid)) state.panel.editPid = null;
+      refresh();
+      return;
+    }
+    case 'hosts':
+      g.hostCount = f.count | 0;
+      refresh();
+      return;
+    case 'expiry':
+      g.expiry = { wipeAt: f.wipeAt || null, warnAt: f.warnAt || null };
+      if (g.expiry.warnAt) wakeAt(g.expiry.warnAt);
       break;
     case 'intro':
+      markPhase();
       g.phase = 'intro';
       g.question = f.question || null;
       if (g.question) { g.q = g.question.q; if (g.question.total) g.total = g.question.total; }
@@ -1538,13 +2016,16 @@ function applyFrame(f) {
       g.tally = emptyTally(g.question ? g.question.optionCount : 0, g.playerCount);
       break;
     case 'open':
+      markPhase();
       g.phase = 'open';
       if (g.question && g.question.q === f.q && typeof f.deadline === 'number') g.question.deadline = f.deadline;
       break;
     case 'tally':
       if (g.question && f.q === g.question.q) g.tally = { counts: Array.isArray(f.counts) ? f.counts : [], answered: f.answered | 0, expected: f.expected | 0 };
-      break;
+      refresh();
+      return;
     case 'reveal': {
+      markPhase();
       g.phase = 'closed';
       const r = Object.assign({}, f); delete r.t; delete r.serverNow;
       g.reveal = r;
@@ -1554,6 +2035,7 @@ function applyFrame(f) {
       break;
     }
     case 'podium':
+      markPhase();
       g.phase = 'podium';
       g.podium = { top: Array.isArray(f.top) ? f.top : [] };
       if (Array.isArray(f.leaderboard)) g.leaderboard = f.leaderboard;
@@ -1564,12 +2046,15 @@ function applyFrame(f) {
       // of a `podium` room (then `wiped` / 4004 follow). Keep what we hold; download only when the
       // file is new or has changed, so a Wi-Fi blip on the Game over screen does not drop another
       // "… (1).csv". A cancelled game (nothing answered) gets no file at all.
+      if (g.phase !== 'ended') markPhase();
       g.phase = 'ended';
       if (typeof f.csv === 'string') {
         const held = heldResults(g);
         if (!held || held.csv !== f.csv) {
           state.results = { pin: g.pin, csv: f.csv, filename: safeFilename(f.filename, g.pin), downloaded: false };
-          if (!gameWasCancelled(g)) downloadResults();       // "Download the results" stays available either way
+          // `update`: a player was renamed after End. Keep the new file without dropping another download.
+          if (f.update === true) toast('The results file now has the new name. Download it again to keep this version.', 7000);
+          else if (!gameWasCancelled(g)) downloadResults();  // "Download the results" stays available either way
         }
       }
       break;
@@ -1582,19 +2067,49 @@ function applyFrame(f) {
       if (typeof f.locked === 'boolean') g.locked = f.locked;
       break;
     case 'error':
+      if (f.code === 'storage_full') { state.storageError = typeof f.message === 'string' ? f.message : 'The server could not save the game.'; break; }
+      if (f.code === 'auth_timeout') { if (socket) { socket.close(); socket = null; } state.reauth = true; break; }
+      // A second press of a phase button lands here ("This question is already closed."); nothing to say.
+      if (f.code === 'bad_phase' && state.pending) break;
       toast(typeof f.message === 'string' && f.message ? f.message : `Server error: ${f.code || 'unknown'}`);
       break;
     default:
       break;                                                 // unknown frame types are ignored
   }
-  render();
+  scheduleRender();
+}
+
+// A phase frame arrived: the phase buttons are live again (after a short guard, see primarySend).
+function markPhase() { state.phaseChangedAt = Date.now(); state.pending = null; state.confirmEndAt = 0; }
+// Redraw when a server time is reached (the idle-wipe warning appears without a frame).
+let wakeTimer = null;
+function wakeAt(serverTs) {
+  clearTimeout(wakeTimer);
+  const ms = serverTs - serverNow();
+  if (ms > 0 && ms < 4 * 3600 * 1000) wakeTimer = setTimeout(scheduleRender, ms + 50);
 }
 
 function onSocketClosed(code, reason, willRetry) {
   if (willRetry) return;                                     // the pill shows "reconnecting"
   if (state.wiped) return;                                   // the expected 4004 after `wiped`
-  if (code === 4004 && state.game && state.game.phase === 'ended') { finishWipe(); return; }   // `wiped` frame lost in flight: same meaning
+  const g = state.game;
+  if (code === 4004 && g && g.phase === 'ended') { finishWipe(); return; }   // `wiped` frame lost in flight: same meaning
+  if (code === 4011) {                                       // session expired: sign in over the stage, keep the key
+    socket = null; state.reauth = true; state.auth.status = 'out'; render(); focusLater('passcode'); return;
+  }
+  if (code === 4001 && !state.urlTokenTried && g && g.hostToken) {
+    state.urlTokenTried = true;                              // an older server: try the token in the URL once
+    connectHost({ pin: g.pin, hostToken: g.hostToken, title: g.title || '' }, true);
+    return;
+  }
   if (code === 4004 || code === 4001) removeKey(KEYS.host);  // this host key cannot work any more
+  if (code === 4004 && state.autoResume && g && !g.phase) {
+    // Resuming on page load found the game already gone: back to the quiz list with a short note.
+    const pin = g.pin;
+    leaveGame();
+    toast(`Game ${pin} has ended or was wiped, so it cannot be resumed.`, 7000);
+    return;
+  }
   state.closeInfo = { code, reason: typeof reason === 'string' ? reason : '' };
   releaseWakeLock();
   render();
@@ -1612,6 +2127,7 @@ function finishWipe() {
 function leaveGame() {
   if (socket) { socket.close(); socket = null; }
   state.game = null; state.closeInfo = null; state.wiped = false; state.results = null;
+  state.reauth = false; state.panel = null; state.pending = null; state.autoResume = false; state.storageError = '';
   state.screen = 'home';
   releaseWakeLock();
   setConn('idle');
@@ -1633,15 +2149,22 @@ function downloadResults() {
    7. Socket wrapper (PROTOCOL §4, §5)
    ====================================================================== */
 
+// opts: urlFor() → URL for each attempt; onOpen(sendRaw) right after the handshake (the auth frame);
+// onFrame, onStatus(status, detail), onClose(code, reason, willRetry), onFail(handshakes that never opened).
+// A connection is treated as dead when neither a pong nor any frame arrives within PONG_TIMEOUT_MS of a
+// ping: the socket is dropped at once and a new one opened, instead of waiting for the browser (P0-11).
 function createSocket(opts) {
   let ws = null;
   let attempt = 0;
+  let neverOpened = 0;      // consecutive handshakes that failed before `open`
   let retryTimer = null;
   let pingTimer = null;
+  let pongTimer = null;
   let connectTimer = null;
   let stopped = false;
 
   function status(s, detail) { if (opts.onStatus) opts.onStatus(s, detail); }
+  function clearLive() { clearInterval(pingTimer); pingTimer = null; clearTimeout(pongTimer); pongTimer = null; }
 
   function connect() {
     if (stopped) return;
@@ -1649,21 +2172,28 @@ function createSocket(opts) {
     clearTimeout(retryTimer); retryTimer = null;
     status('connecting');
     let s;
-    try { s = new WebSocket(opts.url); } catch (e) { scheduleRetry(); return; }
+    try { s = new WebSocket(opts.urlFor()); } catch (e) { neverOpened += 1; if (opts.onFail) opts.onFail(neverOpened); scheduleRetry(); return; }
     ws = s;
+    let opened = false;
     // A handshake that hangs (captive portal, dead proxy) is closed after 10 s so the backoff loop continues.
-    connectTimer = setTimeout(() => { if (s.readyState === WebSocket.CONNECTING) { try { s.close(); } catch (e) { /* ignore */ } } }, 10000);
+    connectTimer = setTimeout(() => { if (s === ws && s.readyState === WebSocket.CONNECTING) drop(s); }, 10000);
 
     s.addEventListener('open', () => {
       if (s !== ws) return;
+      opened = true;
       clearTimeout(connectTimer);
       attempt = 0;
+      neverOpened = 0;
+      if (opts.onFail) opts.onFail(0);
       status('live');
-      clearInterval(pingTimer);
-      pingTimer = setInterval(() => { if (s.readyState === WebSocket.OPEN) { try { s.send('ping'); } catch (e) { /* ignore */ } } }, 25000);
+      if (opts.onOpen) opts.onOpen((obj) => { try { s.send(JSON.stringify(obj)); } catch (e) { /* ignore */ } });
+      clearLive();
+      pingTimer = setInterval(() => ping(s, PONG_TIMEOUT_MS), PING_EVERY_MS);
     });
     s.addEventListener('message', (ev) => {
-      if (s !== ws || typeof ev.data !== 'string' || ev.data === 'pong') return;
+      if (s !== ws) return;
+      clearTimeout(pongTimer); pongTimer = null;             // any frame proves the connection is alive
+      if (typeof ev.data !== 'string' || ev.data === 'pong') return;
       let frame;
       try { frame = JSON.parse(ev.data); } catch (e) { return; }
       if (frame && typeof frame.t === 'string') opts.onFrame(frame);
@@ -1671,15 +2201,33 @@ function createSocket(opts) {
     s.addEventListener('close', (ev) => {
       if (s !== ws) return;
       clearTimeout(connectTimer);
-      clearInterval(pingTimer); pingTimer = null;
+      clearLive();
       ws = null;
       if (stopped) return;
+      if (!opened) { neverOpened += 1; if (opts.onFail) opts.onFail(neverOpened); }
       const retry = !NO_RETRY_CODES.has(ev.code);
       if (!retry) { stopped = true; status('closed', ev.reason); }
       if (opts.onClose) opts.onClose(ev.code, ev.reason, retry);
       if (retry) scheduleRetry();
     });
     s.addEventListener('error', () => { /* the close event that follows drives the retry */ });
+  }
+
+  function ping(s, timeoutMs) {
+    if (s !== ws || s.readyState !== WebSocket.OPEN) return;
+    try { s.send('ping'); } catch (e) { drop(s); return; }
+    if (!pongTimer) pongTimer = setTimeout(() => drop(s), timeoutMs);
+  }
+
+  // Give up on a socket now: ignore anything it still does, show "Reconnecting…", open a new one.
+  function drop(s) {
+    if (s !== ws) return;
+    clearTimeout(connectTimer);
+    clearLive();
+    ws = null;
+    try { s.close(); } catch (e) { /* ignore */ }
+    if (stopped) return;
+    scheduleRetry();
   }
 
   // 500 ms → 8 s, doubling, ±30 % jitter.
@@ -1692,12 +2240,13 @@ function createSocket(opts) {
     retryTimer = setTimeout(() => { retryTimer = null; connect(); }, delay);
   }
 
-  // Called on visibilitychange→visible and 'online': reconnect at once instead of waiting out the backoff.
+  // Called on visibilitychange→visible and 'online': probe an open socket quickly (3 s), or reconnect at once.
   function nudge() {
     if (stopped) return;
-    if (ws && ws.readyState === WebSocket.OPEN) { try { ws.send('ping'); } catch (e) { /* ignore */ } return; }
+    if (ws && ws.readyState === WebSocket.OPEN) { clearTimeout(pongTimer); pongTimer = null; ping(ws, 3000); return; }
     if (ws && ws.readyState === WebSocket.CONNECTING) return;
     clearTimeout(retryTimer); retryTimer = null;
+    attempt = 0;
     connect();
   }
   function send(obj) {
@@ -1706,7 +2255,7 @@ function createSocket(opts) {
   }
   function close() {
     stopped = true;
-    clearTimeout(retryTimer); clearInterval(pingTimer); clearTimeout(connectTimer);
+    clearTimeout(retryTimer); clearLive(); clearTimeout(connectTimer);
     if (ws) { try { ws.close(1000); } catch (e) { /* ignore */ } ws = null; }
   }
 
@@ -1837,8 +2386,17 @@ document.addEventListener('keydown', (e) => {
     // <body> (see render()), a key meant for the control the teacher had reached must do nothing.
     if (t && t.closest('button, a, summary, label, input, select, textarea')) return;
     if (Date.now() < shortcutMuteUntil) return;
+    if (state.panel || state.reauth) return;                 // the players panel or sign-in is in front
     const fn = primaryAction(phase);
-    if (fn) { e.preventDefault(); fn(); }
+    if (!fn) return;
+    e.preventDefault();
+    if (phase === 'podium' && Date.now() - state.confirmEndAt > 3000) {
+      // Ending the game is final: the first Space only asks (P0-65).
+      state.confirmEndAt = Date.now();
+      toast('Press Space again to end the game.', 3000);
+      return;
+    }
+    fn();
   }
 });
 
@@ -1863,5 +2421,15 @@ window.addEventListener('storage', (e) => {                  // another tab chan
 state.quizzes = loadQuizzes();
 applyContrast();
 render();
+// After a refresh mid-game, go straight back to the stage (P0-53); the connecting screen offers "Not now".
+checkSession().then(() => {
+  const key = loadHostKey();
+  if (state.auth.status === 'in') {
+    loadLiveRooms();
+    if (key && !state.game) { state.autoResume = true; connectHost(key); return; }
+  }
+  render();
+});
+setInterval(keepSessionAlive, 20 * 60 * 1000);
 
 })();

@@ -18,7 +18,12 @@
  * ===================================================================== */
 
 // §4: after these close codes the server has said a definite "no"; never retry.
-const NO_RETRY_CODES = new Set([4001, 4003, 4004, 4009, 4010]);
+// 4012: this player is now playing in another tab or on another device. 4014: too many wrong PINs.
+const NO_RETRY_CODES = new Set([4001, 4003, 4004, 4009, 4010, 4012, 4014]);
+const PROTO = 2;                 // protocol version this page speaks (PROTOCOL §11)
+const PING_EVERY_MS = 10000;     // keepalive; answered at the edge, not billed
+const PONG_TIMEOUT_MS = 10000;   // no pong or frame this long after a ping → the socket is dead (P0-11)
+const WAKE_FRESH_MS = 3000;      // hidden longer than this → open a fresh socket at once on return (P0-12)
 
 class ReconnectingSocket {
   /**
@@ -35,8 +40,17 @@ class ReconnectingSocket {
     this.everOpened = false;
     this.stopped = false;
     this.timers = { retry: 0, open: 0, ping: 0, probe: 0 };
+    this.hiddenAt = 0;
     // §5: reconnect when the page comes back (tab switch, screen unlock, Wi-Fi back).
-    this._wake = () => { if (document.visibilityState === 'visible') this.checkAlive(); };
+    this._wake = (ev) => {
+      if (document.visibilityState === 'hidden') { this.hiddenAt = Date.now(); return; }
+      const away = this.hiddenAt ? Date.now() - this.hiddenAt : 0;
+      this.hiddenAt = 0;
+      // After the screen was locked or the app switched away, the old socket is often dead while the
+      // browser still calls it open. Do not wait to find out: open a fresh one now (P0-12).
+      if ((ev && ev.type === 'online') || away > WAKE_FRESH_MS) this.fresh();
+      else this.checkAlive();
+    };
     document.addEventListener('visibilitychange', this._wake);
     window.addEventListener('online', this._wake);
     window.addEventListener('pageshow', this._wake);
@@ -59,7 +73,7 @@ class ReconnectingSocket {
       const isReconnect = this.everOpened;
       this.everOpened = true;
       this.attempt = 0;
-      this.timers.ping = setInterval(() => this.ping(), 25000);   // §4: literal "ping" every 25 s
+      this.timers.ping = setInterval(() => this.keepalive(), PING_EVERY_MS);   // §4: literal "ping"
       this.h.status('open');
       this.h.open(isReconnect);
     });
@@ -95,6 +109,27 @@ class ReconnectingSocket {
 
   ping() { this.send('ping'); }
 
+  /** Ping, and give up on the socket if nothing comes back in time (a pong or any frame cancels it). */
+  keepalive() {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    this.ping();
+    if (!this.timers.probe) {
+      this.timers.probe = setTimeout(() => { this.timers.probe = 0; if (this.ws === ws) this.fresh(); }, PONG_TIMEOUT_MS);
+    }
+  }
+
+  /** Drop the current socket without waiting for the browser to notice it is dead, and connect again now. */
+  fresh() {
+    if (this.stopped) return;
+    const old = this.ws;
+    this.ws = null;                              // events from the old socket are ignored from here on
+    this._clearTimers();
+    if (old) { try { old.close(); } catch (err) { /* ignore */ } }
+    this.attempt = 0;
+    this.connect();
+  }
+
   get isOpen() { return !!this.ws && this.ws.readyState === WebSocket.OPEN; }
 
   /** Called on visibilitychange / online / pageshow. */
@@ -108,7 +143,7 @@ class ReconnectingSocket {
       this.ping();
       this.timers.probe = setTimeout(() => {
         this.timers.probe = 0;
-        if (this.ws === ws) ws.close();     // fires 'close' → backoff from zero
+        if (this.ws === ws) this.fresh();   // dead: reconnect at once
       }, 4000);
     }
     // CONNECTING: the open timer already covers it.
@@ -159,7 +194,11 @@ class ReconnectingSocket {
  * ===================================================================== */
 
 const PIN_RE = /^[1-9][0-9]{5}$/;
-const PIN = new URLSearchParams(location.search).get('pin') || '';
+const PARAMS = new URLSearchParams(location.search);
+const PIN = PARAMS.get('pin') || '';
+// The QR code adds the room key (&k=…): scanned joins are never held up by the per-network guess limit.
+const ROOM_KEY = /^[0-9a-f]{16}$/.test(PARAMS.get('k') || '') ? PARAMS.get('k') : '';
+const NAME_MAX = 20;                                // characters (code points), as the server counts
 const STORE_PREFIX = 'hompub-quiz:player:';
 const STORE_KEY = STORE_PREFIX + PIN;               // §4.3 welcome
 const SAVED_MAX_AGE_MS = 6 * 60 * 60 * 1000;        // entries older than this are swept on load
@@ -176,6 +215,8 @@ const CLOSE_TEXT = {
   4004: ['This game has ended', 'The game is over or the PIN is no longer in use.'],
   4009: ['This game is full', 'The host has reached the player limit.'],
   4010: ['This game is locked', 'The host is not letting new players in right now.'],
+  4012: ['This game is open somewhere else', 'You are playing in another tab or on another device. Tap “Use it here” to play on this one instead.'],
+  4014: ['Too many wrong PINs', 'Too many wrong PINs came from this network. Wait a few minutes, or scan the QR code on the big screen.'],
 };
 
 const PILL_TEXT = { connecting: 'Connecting…', open: 'Connected', reconnecting: 'Reconnecting…', closed: 'Disconnected' };
@@ -200,7 +241,16 @@ const ui = {
   summary: null,        // GET /api/room/<pin> (join screen only)
   failures: 0,          // handshakes that failed before the first successful open
   focusedNick: false,
+  joinId: '',           // random id sent with every join attempt, so a lost `welcome` cannot make a duplicate
+  nickMsg: '',          // why the typed name was refused (join_rejected)
+  nameNote: '',         // why the name we got differs from what was typed (welcome.note / renamed.note)
+  renaming: false,      // the name-change form is open
+  renameMsg: '',        // why a rename was refused
+  sentAt: 0,            // when the pending answer was sent; no ack within ACK_WAIT_MS → reconnect and resend
+  stuck: false,         // the pending answer is not getting through
+  legacyServer: false,  // the server speaks protocol 1 (rolled back): no renames
 };
+const ACK_WAIT_MS = 2000;
 
 let clockOffset = 0;    // §2: serverNow - Date.now(); refreshed by every timed frame
 let sock = null;
@@ -281,10 +331,18 @@ function requestWakeLock() {
 
 function wsUrl() {
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  let url = `${scheme}//${location.host}/api/room/${PIN}/ws?role=player`;
+  let url = `${scheme}//${location.host}/api/room/${PIN}/ws?role=player&v=${PROTO}`;
+  if (ROOM_KEY) url += '&k=' + ROOM_KEY;
   if (ui.saved && ui.saved.token) url += '&token=' + encodeURIComponent(ui.saved.token);
   return url;
 }
+function randomId() {
+  const b = new Uint8Array(16);
+  try { crypto.getRandomValues(b); } catch (err) { for (let i = 0; i < 16; i += 1) b[i] = Math.floor(Math.random() * 256); }
+  return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+}
+// Cut by characters (code points), as the server does, not UTF-16 units.
+const cutName = (text) => Array.from(String(text || '').trim()).slice(0, NAME_MAX).join('').trim();
 
 function openSocket() {
   if (sock) { sock.reconnectNow(); return; }
@@ -326,7 +384,8 @@ function openSocket() {
       if (code === 4003 || code === 4004) clearSaved();   // token is dead either way, even after `ended`
       if (ui.fatal || state.phase === 'ended') return;
       const [title, fallback] = CLOSE_TEXT[code] || ['Disconnected', `The connection was closed (code ${code}).`];
-      ui.fatal = { title, text: reason || fallback, retry: code === 4009 || code === 4010 };
+      // 4012 has its own text and a "Use it here" button; other refusals use the server's reason when it has one.
+      ui.fatal = { title, text: code === 4012 ? fallback : (reason || fallback), retry: code === 4009 || code === 4010, here: code === 4012 };
       ui.joining = false;
       render();
     },
@@ -341,8 +400,33 @@ function handleFrame(f) {
       // §4.3: persist so a reload (or a new tab) resumes instead of re-joining.
       saveSaved({ pin: f.pin || PIN, token: f.token, pid: f.pid, nick: f.nick });
       ui.joining = false;
+      ui.joinFrame = null;
+      ui.nickMsg = '';
+      ui.nameNote = f.note && typeof f.note.message === 'string' ? f.note.message : '';
       state.me = Object.assign({}, state.me, { pid: f.pid, nick: f.nick });
       requestWakeLock();
+      break;
+
+    case 'join_rejected':
+      // A typed name was refused ("Please choose another name"): stay on the form, socket still open.
+      ui.joining = false;
+      ui.joinFrame = null;
+      ui.nickMsg = typeof f.message === 'string' ? f.message : 'Please choose another name.';
+      ui.focusedNick = false;
+      break;
+
+    case 'renamed':
+      if (state.me) { state.me.nick = f.nick; if (typeof f.renamesLeft === 'number') state.me.renamesLeft = f.renamesLeft; }
+      if (ui.saved) saveSaved(Object.assign({}, ui.saved, { nick: f.nick }));
+      ui.renaming = false;
+      ui.renameMsg = '';
+      ui.nameNote = f.byHost ? 'The host changed your name.' : (f.note && f.note.message ? f.note.message : '');
+      say(`Your name is now ${f.nick}.` + (ui.nameNote ? ' ' + ui.nameNote : ''));   // P0-06: announce it
+      break;
+
+    case 'rename_rejected':
+      ui.renameMsg = typeof f.message === 'string' ? f.message : 'That name cannot be used.';
+      if (state.me && typeof f.renamesLeft === 'number') state.me.renamesLeft = f.renamesLeft;
       break;
 
     case 'sync':
@@ -374,6 +458,8 @@ function handleFrame(f) {
     case 'ack':
       if (f.q !== state.q) break;                  // stale ack from a previous question
       ui.ack = { accepted: !!f.accepted, reason: f.reason || '' };
+      ui.stuck = false;
+      ui.sentAt = 0;
       if (f.accepted && state.me) { state.me.answered = true; state.me.choice = ui.pendingChoice; }
       if (!f.accepted && f.reason === 'invalid') ui.pendingChoice = null;   // let them tap again
       if (!f.accepted && f.reason === 'closed' && state.phase === 'open' && !ui.timeUp
@@ -426,6 +512,7 @@ function handleFrame(f) {
       break;
 
     case 'error':
+      if (f.code === 'join_timeout') { cancelJoin(); toast('Joining took too long — try again.'); return; }
       if (f.code === 'already_joined' && ui.saved) {
         // Only respin() sends `join` after we are in: the server has run out of spins.
         ui.spins = MAX_SPINS;
@@ -446,9 +533,12 @@ function handleFrame(f) {
 // belongs to one question (pending tap, ack, local time-up) is reset too — the
 // server's `me.answered` / `me.choice` say what counts.
 function applySync(f) {
+  const prevQ = state.q;
+  const held = ui.pendingChoice;
   state = Object.assign({}, f);
   delete state.t;
   delete state.serverNow;
+  ui.legacyServer = typeof f.proto !== 'number';
   if (state.me && state.me.pid) {
     ui.joining = false;
     // A spun or de-duplicated nickname may differ from what we stored.
@@ -461,6 +551,13 @@ function applySync(f) {
   ui.pendingChoice = null;
   ui.ack = null;
   ui.timeUp = false;
+  ui.stuck = false;
+  // A tap that had not been confirmed when the connection dropped: if the question is still open and the
+  // server has no answer from us, send it again (the server ignores duplicates). P0-17, P0-20.
+  if (held != null && state.phase === 'open' && state.q === prevQ && state.me && !state.me.answered) {
+    ui.pendingChoice = held;
+    if (sock && sock.send({ t: 'answer', q: state.q, choice: held })) ui.sentAt = Date.now();
+  }
   if (state.phase === 'ended') {
     // Reconnected after the host pressed End: same promise as the `ended` frame —
     // nothing about this game is kept, here or on the server.
@@ -473,10 +570,13 @@ function applySync(f) {
 
 function startJoin(spin) {
   if (ui.joining || ui.saved) return;
-  const nick = spin ? '' : $('nick').value.trim().slice(0, 20);
-  ui.joinFrame = spin ? { t: 'join', spin: true } : { t: 'join', nick };
+  const nick = spin ? '' : cutName($('nick').value);
+  if (!spin && !nick) { ui.nickMsg = 'Type your name to join.'; render(); $('nick').focus(); return; }
+  if (!ui.joinId) ui.joinId = randomId();
+  ui.joinFrame = spin ? { t: 'join', spin: true, joinId: ui.joinId } : { t: 'join', nick, joinId: ui.joinId };
   if (spin) ui.spins += 1;
   ui.joining = true;
+  ui.nickMsg = '';
   if (!sock) openSocket();
   else if (!sock.send(ui.joinFrame)) sock.reconnectNow();   // sent from the open handler instead
   render();
@@ -501,24 +601,80 @@ function respin() {
   render();
 }
 
+// "Answer sent" only once the server says so (P0-17). Until then: "Sending…". No ack within 2 s:
+// "Not getting through — reconnecting…", a fresh socket, and the answer is sent again after its sync.
+// A tap while reconnecting is held and sent when the connection is back (P0-20).
 function onChoice(choice) {
   if (state.phase !== 'open' || !state.question) return;
   if (ui.pendingChoice != null || (state.me && state.me.answered) || ui.timeUp) return;
-  if (!sock || !sock.isOpen) {
-    toast('Not connected — reconnecting…');
-    if (sock) sock.reconnectNow();
-    return;
-  }
   if (navigator.vibrate) { try { navigator.vibrate(30); } catch (err) { /* ignore */ } }
   ui.pendingChoice = choice;
-  sock.send({ t: 'answer', q: state.q, choice });
+  ui.ack = null;
+  if (sock && sock.send({ t: 'answer', q: state.q, choice })) {
+    ui.sentAt = Date.now();
+    ui.stuck = false;
+    setTimeout(checkAck, ACK_WAIT_MS + 50);
+  } else {
+    ui.sentAt = 0;
+    ui.stuck = true;
+    if (sock) sock.reconnectNow(); else openSocket();
+  }
   render();
+}
+function checkAck() {
+  if (ui.pendingChoice == null || ui.ack || !ui.sentAt || state.phase !== 'open') return;
+  if (Date.now() - ui.sentAt < ACK_WAIT_MS) return;
+  ui.stuck = true;
+  ui.sentAt = 0;
+  if (sock) sock.fresh();
+  render();
+}
+
+/* ---------- name changes (PROTOCOL §11: {t:'rename'}) ---------- */
+
+function nameMode() {
+  const s = state.settings || ui.summary || {};
+  if (s.nameMode === 'typed' || s.nameMode === 'either' || s.nameMode === 'random') return s.nameMode;
+  return s.nicknameMode === 'spin' ? 'random' : 'either';     // an older server
+}
+function canRename() {
+  const me = state.me || {};
+  return !ui.legacyServer && !!ui.saved && !!(state.settings && state.settings.allowRename) && (me.renamesLeft == null || me.renamesLeft > 0);
+}
+function openRename() {
+  if (!canRename()) return;
+  ui.renaming = true;
+  ui.renameMsg = '';
+  render();
+  const input = $('rename-nick');
+  input.value = (state.me && state.me.nick) || '';
+  input.focus();
+  try { input.select(); } catch (err) { /* ignore */ }
+}
+function closeRename() { ui.renaming = false; ui.renameMsg = ''; render(); }
+function sendRename(random) {
+  const nick = random ? '' : cutName($('rename-nick').value);
+  if (!random && !nick) { ui.renameMsg = 'Type a name.'; render(); return; }
+  const frame = random ? { t: 'rename', random: true } : { t: 'rename', nick };
+  if (!sock || !sock.send(frame)) { ui.renameMsg = 'Not connected — try again in a moment.'; render(); return; }
+  ui.renameMsg = '';
+  render();
+}
+function say(text) {
+  const el = $('announcer');
+  clearTimeout(announceTimer);
+  el.textContent = '';
+  announceTimer = setTimeout(() => { el.textContent = text; }, 50);
 }
 
 async function fetchSummary() {
   try {
-    const res = await fetch(`/api/room/${PIN}`, { cache: 'no-store', headers: { accept: 'application/json' } });
-    if (res.status === 404) {
+    const res = await fetch(`/api/room/${PIN}` + (ROOM_KEY ? `?k=${ROOM_KEY}` : ''), { cache: 'no-store', headers: { accept: 'application/json' } });
+    if (res.status === 429) {
+      let body = null;
+      try { body = await res.json(); } catch (err) { body = null; }
+      ui.fatal = { title: 'Too many wrong PINs', text: (body && body.message) || CLOSE_TEXT[4014][1], retry: true };
+    } else if (res.status === 404) {
       ui.fatal = { title: 'No game with that PIN', text: 'Check the PIN on the big screen and try again.', retry: false };
     } else if (res.ok) {
       const s = await res.json();
@@ -564,6 +720,7 @@ function render() {
   if (changed) focusScreenHeading(screen);     // before draw(): the join screen may move focus on to the nickname
   const draw = RENDER[screen];
   if (draw) draw();
+  renderRenameForm(screen);
   if (changed) announceScreen(screen);         // after draw(): the headline is read back from the DOM
   if (screen === 'intro' || screen === 'open') {
     // paintClock() may move intro → open or flag time-up; each change is one-way,
@@ -638,11 +795,15 @@ const RENDER = {
     setText('join-pin', 'PIN ' + PIN);
     setText('join-count', plural(state.playerCount, 'player') + ' in');
 
-    const mode = (state.settings && state.settings.nicknameMode)
-      || (s && (s.nicknameMode || (s.settings && s.settings.nicknameMode)));
-    const spinOnly = mode === 'spin';
+    const mode = nameMode();
+    const spinOnly = mode === 'random';
     $('nick-row').hidden = spinOnly;
     $('spin-hint').hidden = !spinOnly;
+    $('spin-btn').hidden = mode === 'typed';    // "Typed names only": no random-name button
+    $('or-row').hidden = mode !== 'either';
+    $('nick-msg').hidden = !ui.nickMsg;
+    setText('nick-msg', ui.nickMsg);
+    $('nick').setAttribute('aria-invalid', ui.nickMsg ? 'true' : 'false');
 
     // podium counts as ended: the server refuses every join from the podium on (4004).
     const tooLate = !!(s && (s.phase === 'podium' || s.phase === 'ended'));
@@ -663,7 +824,7 @@ const RENDER = {
     $('join-btn').disabled = busy || tooLate;
     $('spin-btn').disabled = busy || tooLate;
     setText('join-btn', busy ? 'Joining…' : 'Join');
-    setText('spin-btn', busy ? 'Joining…' : 'Spin a name');
+    setText('spin-btn', busy ? 'Joining…' : 'Random name');
     if (!spinOnly && !busy && !tooLate && !ui.focusedNick) { ui.focusedNick = true; $('nick').focus(); }
   },
 
@@ -678,9 +839,13 @@ const RENDER = {
     const me = state.me || {};
     setText('lobby-nick', me.nick || (ui.saved && ui.saved.nick) || '');
     setText('lobby-count', plural(state.playerCount, 'player') + ' in');
-    const canSpin = ui.spins < MAX_SPINS && !me.answered;
+    $('name-note').hidden = !ui.nameNote;
+    setText('name-note', ui.nameNote);
+    // Protocol 2: the name is changed with "Change my name". An older server only knows re-spins.
+    const canSpin = ui.legacyServer && ui.spins < MAX_SPINS && !me.answered;
     $('respin-btn').hidden = !canSpin;
     setText('respin-btn', ui.spins ? `Spin again (${MAX_SPINS - ui.spins} left)` : 'Spin a new name');
+    $('edit-name-btn').hidden = !canRename() || ui.renaming;
   },
 
   intro() {
@@ -721,9 +886,14 @@ const RENDER = {
       kind = 'bad';
       if (ui.ack.reason === 'duplicate') text = 'Already answered';
       else if (ui.ack.reason === 'invalid') text = 'That answer wasn’t valid — try again';
+      else if (ui.ack.reason === 'unavailable') text = 'The game server could not save answers right now';
       else text = 'Too late — not counted';                 // late / closed
-    } else if (answered) {
+    } else if (me.answered || (ui.ack && ui.ack.accepted)) {
       text = 'Answer sent — waiting for the others'; kind = 'ok';
+    } else if (ui.pendingChoice != null && ui.stuck) {
+      text = 'Not getting through — reconnecting…'; kind = 'bad';
+    } else if (ui.pendingChoice != null) {
+      text = 'Sending…'; kind = 'muted';
     } else if (ui.timeUp) {
       text = 'Time’s up'; kind = 'muted';
     }
@@ -770,6 +940,8 @@ const RENDER = {
     const streak = (r ? r.streak : me.streak) || 0;
     $('res-streak').hidden = streak < 2;
     setText('res-streak-n', `${streak} in a row`);
+    // Only if the host switched "Students can change their name" back on during the game.
+    $('edit-name-closed').hidden = !canRename() || ui.renaming;
   },
 
   podium() {
@@ -795,9 +967,36 @@ const RENDER = {
   fatal() {
     setText('fatal-title', ui.fatal.title);
     setText('fatal-text', ui.fatal.text || '');
-    $('fatal-retry').hidden = !ui.fatal.retry;
+    $('fatal-retry').hidden = !ui.fatal.retry && !ui.fatal.here;
+    setText('fatal-retry', ui.fatal.here ? 'Use it here' : 'Try again');
   },
 };
+
+// The name-change form opens over the lobby or the result screen, never anywhere else.
+function renderRenameForm(screen) {
+  const show = ui.renaming && (screen === 'lobby' || screen === 'closed') && canRename();
+  if (!show && ui.renaming && screen !== 'lobby' && screen !== 'closed') ui.renaming = false;
+  $('rename-form').hidden = !show;
+  if (!show) return;
+  const me = state.me || {};
+  const mode = nameMode();
+  $('rename-random').hidden = mode === 'typed';
+  $('rename-nick').disabled = mode === 'random';
+  $('rename-save').hidden = mode === 'random';
+  $('rename-msg').hidden = !ui.renameMsg;
+  setText('rename-msg', ui.renameMsg);
+  $('rename-nick').setAttribute('aria-invalid', ui.renameMsg ? 'true' : 'false');
+  const left = typeof me.renamesLeft === 'number' ? me.renamesLeft : 3;
+  setText('rename-left', `${left} change${left === 1 ? '' : 's'} left.`);
+}
+
+// "Use it here" after 4012: take the game back to this tab.
+function useHere() {
+  ui.fatal = null;
+  if (sock) { sock.close(); sock = null; }
+  render();
+  openSocket();
+}
 
 /* ---------- countdowns (§2: always the server's clock) ---------- */
 
@@ -868,7 +1067,13 @@ function boot() {
   $('spin-btn').addEventListener('click', () => startJoin(true));
   $('join-cancel').addEventListener('click', cancelJoin);
   $('respin-btn').addEventListener('click', respin);
-  $('fatal-retry').addEventListener('click', () => location.reload());
+  $('fatal-retry').addEventListener('click', () => { if (ui.fatal && ui.fatal.here) useHere(); else location.reload(); });
+  document.querySelectorAll('[data-rename-open]').forEach((b) => b.addEventListener('click', openRename));
+  $('rename-form').addEventListener('submit', (ev) => { ev.preventDefault(); sendRename(false); });
+  $('rename-random').addEventListener('click', () => sendRename(true));
+  $('rename-cancel').addEventListener('click', closeRename);
+  $('rename-form').addEventListener('keydown', (ev) => { if (ev.key === 'Escape') { ev.preventDefault(); closeRename(); } });
+  $('nick').addEventListener('input', () => { if (ui.nickMsg) { ui.nickMsg = ''; render(); } });
   $('grid').addEventListener('click', (ev) => {
     const btn = ev.target.closest('.opt');
     if (btn && !btn.disabled) onChoice(Number(btn.dataset.choice));
