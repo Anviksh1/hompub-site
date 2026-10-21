@@ -7,6 +7,8 @@
 #
 # Runs on every push to the work branch that changes quiz/ or this file, and by hand
 # (Actions → "Deploy quiz (staging)" → Run workflow) once this file is on main.
+# GitHub skips the run when the pushed commit's message contains [skip ci] (or
+# [ci skip], [no ci], [skip actions]) anywhere, the body included.
 
 name: Deploy quiz (staging)
 
