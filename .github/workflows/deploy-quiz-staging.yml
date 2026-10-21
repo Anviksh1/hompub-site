@@ -60,12 +60,27 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # The production account's workers.dev subdomain (public: it is in the production URL).
+          PRODUCTION_SUBDOMAIN: vaidyadeenadayal
         run: |
           set -u
           if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
             echo "::error::The staging environment has no CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID secret."
             exit 1
           fi
+          # Never deploy staging into the production account (a mixed-up token or account id), and
+          # say so plainly when the staging account has no workers.dev subdomain yet.
+          SUB=$(curl -sS --retry 3 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain" | jq -r '.result.subdomain // empty' || true)
+          if [ -z "$SUB" ]; then
+            echo "::error::Could not read this account's workers.dev subdomain. In the staging account choose one under Workers & Pages, and check that the token and account id belong to that account."
+            exit 1
+          fi
+          if [ "$SUB" = "$PRODUCTION_SUBDOMAIN" ]; then
+            echo "::error::These credentials belong to the production account ($SUB.workers.dev). Put the staging account's token and id in the staging environment."
+            exit 1
+          fi
+          echo "Deploying into the account with subdomain $SUB.workers.dev"
           npx wrangler deploy --env staging --durable-objects-code-update-mode immediate --message "staging ${GITHUB_SHA::7}" 2>&1 | tee ../wrangler-out.txt
           VID=$(grep -Eo 'Current Version ID: [0-9a-f-]{36}' ../wrangler-out.txt | awk '{print $4}' || true)
           URL=$(grep -Eo 'https://[a-z0-9.-]+\.workers\.dev' ../wrangler-out.txt | head -1 || true)

@@ -295,6 +295,9 @@ account**, or lists only that account under *Account Resources*.
    before creating it.
 2. A new account needs its `workers.dev` subdomain chosen once in the
    dashboard (**Workers & Pages**); a non-interactive deploy cannot do it.
+   Before deploying, the staging workflow reads that subdomain with the
+   staging credentials and stops if it is missing or is the production
+   account's, so a mixed-up token cannot deploy staging into production.
 3. GitHub → repository **Settings → Environments**: create `production`
    (required reviewer: you; untick *Allow administrators to bypass*;
    deployment branch `main`) and `staging` (deployment branch: the work
