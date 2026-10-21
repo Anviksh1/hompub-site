@@ -1,53 +1,128 @@
-# Deploys the HomPub Quiz referee (everything under quiz/) to Cloudflare Workers.
+# Deploys the HomPub Quiz referee (everything under quiz/) to PRODUCTION.
 #
-# When it runs
-#   - on a push to main that changes quiz/ (Markdown-only changes are skipped:
-#     a README edit should not restart live games), or this file;
-#   - by hand, from the Actions tab ("Run workflow").
-#   Never on pull-request branches. A deploy restarts every Durable Object and
-#   drops every open WebSocket, so a class in progress loses a few seconds while
-#   phones reconnect (PROTOCOL.md §5). Merge to main outside school hours.
+# It never runs on its own. A merge to main deploys nothing. To deploy:
+#   repository → Actions → "Deploy quiz (production)" → Run workflow, on branch main.
+# The job then waits for a required reviewer to press Approve, because it uses the
+# GitHub Environment "production" (deployment branch main only, required reviewer,
+# administrators may not bypass). The production Cloudflare token lives only in that
+# environment, so no other workflow or branch can reach it.
 #
-# What it needs (repo → Settings → Secrets and variables → Actions)
-#   CLOUDFLARE_API_TOKEN    a token made from the "Edit Cloudflare Workers" template
-#   CLOUDFLARE_ACCOUNT_ID   shown on the Workers & Pages overview page
-#   Step-by-step instructions are in quiz/README.md, "Deploying through GitHub".
+# Actions
+#   deploy          deploy the code on main, then tag that commit with release_tag
+#                   (for example quiz-phase-1) so it can be redeployed later.
+#   redeploy-ref    roll back by deploying an earlier tag or commit (ref). Keeps the
+#                   Worker's CURRENT secrets. This is the normal way to roll back.
+#   rollback-version
+#                   Cloudflare's own rollback to a version id. Each version keeps the
+#                   secrets it was created with, so this can bring back an old
+#                   HOST_PASSCODE or SESSION_KEY. It only runs when
+#                   accept_secret_revert is ticked.
 #
-# The Wrangler version comes from quiz/package.json (installed by `npm ci`), so
-# the laptop and the workflow deploy with the same tool.
+# Every deploy restarts every Durable Object and drops every open WebSocket. Phones
+# reconnect within seconds, but run it outside class time.
 
-name: Deploy quiz
+name: Deploy quiz (production)
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'quiz/**'
-      - '!quiz/**.md'
-      - '.github/workflows/deploy-quiz.yml'
   workflow_dispatch:
+    inputs:
+      action:
+        description: 'What to do'
+        type: choice
+        options: [deploy, redeploy-ref, rollback-version]
+        default: deploy
+      release_tag:
+        description: 'deploy: tag to create on the deployed commit (quiz-phase-N)'
+        type: string
+        default: ''
+      ref:
+        description: 'redeploy-ref: an earlier tag (quiz-phase-N) or a full 40-character commit id'
+        type: string
+        default: ''
+      version_id:
+        description: 'rollback-version: the Cloudflare version id (UUID)'
+        type: string
+        default: ''
+      accept_secret_revert:
+        description: 'rollback-version: I understand secrets from that version may come back'
+        type: boolean
+        default: false
+      reason:
+        description: 'Short reason, shown in the Cloudflare deployment history'
+        type: string
+        default: 'Deployed from GitHub Actions'
 
-# The job only reads the repository; deploy credentials come from the secrets.
 permissions:
   contents: read
 
-# One deploy at a time. A second push waits for the first instead of racing it,
-# and nothing is cancelled half-way through an upload.
 concurrency:
-  group: deploy-quiz
+  group: deploy-quiz-production
   cancel-in-progress: false
 
 jobs:
-  deploy:
-    name: Typecheck, test, deploy
+  production:
+    name: Production (${{ inputs.action }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment: production
+    permissions:
+      contents: write   # only to push the release tag after a successful deploy
+    env:
+      ACTION: ${{ inputs.action }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      REF_INPUT: ${{ inputs.ref }}
+      VERSION_ID: ${{ inputs.version_id }}
+      ACCEPT_SECRET_REVERT: ${{ inputs.accept_secret_revert }}
+      REASON: ${{ inputs.reason }}
+    # bash -eo pipefail: a failing `wrangler … | tee` fails the step instead of passing.
     defaults:
       run:
-        working-directory: quiz
+        shell: bash
     steps:
-      - name: Check out the repository
+      # Each input is matched as a whole string ([[ =~ ]], not grep, which passes when
+      # any one line matches), and nothing typed in goes into $GITHUB_ENV.
+      - name: Check the inputs
+        id: pick
+        run: |
+          set -u
+          tag_re='^quiz-phase-[0-9]+([.][0-9]+)?$'
+          ref_re='^(quiz-phase-[0-9]+([.][0-9]+)?|[0-9a-f]{40})$'
+          uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          reason_re='^[A-Za-z0-9][A-Za-z0-9 .,:()_/-]{0,99}$'
+          case "$ACTION" in
+            deploy)
+              if [ "$GITHUB_REF" != "refs/heads/main" ]; then echo "::error::Run this from main."; exit 1; fi
+              [[ $RELEASE_TAG =~ $tag_re ]] || { echo "::error::release_tag must look like quiz-phase-1"; exit 1; }
+              echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT" ;;
+            redeploy-ref)
+              [[ $REF_INPUT =~ $ref_re ]] || { echo "::error::ref must be a quiz-phase-N tag or a 40-character commit id"; exit 1; }
+              echo "ref=$REF_INPUT" >> "$GITHUB_OUTPUT" ;;
+            rollback-version)
+              [[ $VERSION_ID =~ $uuid_re ]] || { echo "::error::version_id must be a UUID"; exit 1; }
+              if [ "$ACCEPT_SECRET_REVERT" != "true" ]; then echo "::error::Tick accept_secret_revert, or use redeploy-ref, which keeps current secrets."; exit 1; fi
+              echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::Unknown action"; exit 1 ;;
+          esac
+          [[ $REASON =~ $reason_re ]] || { echo "::error::reason must start with a letter or digit and may use letters, digits, spaces and . , : ( ) _ / - (100 max)"; exit 1; }
+
+      # No credentials are left in .git/config, so npm install and test scripts cannot
+      # use this job's write token. The tag is created through the API further down.
+      - name: Check out the code to deploy
         uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.pick.outputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the commit is on main
+        run: |
+          set -u
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::$(git rev-parse HEAD) is not on main. Only code that is on main can go to production."; exit 1
+          fi
+          if [ "$ACTION" = "deploy" ] && git rev-parse -q --verify "refs/tags/$RELEASE_TAG" >/dev/null; then
+            echo "::error::The tag $RELEASE_TAG already exists. Pick the next number."; exit 1
+          fi
 
       - name: Set up Node 22
         uses: actions/setup-node@v5
@@ -56,19 +131,37 @@ jobs:
           cache: npm
           cache-dependency-path: quiz/package-lock.json
 
-      - name: Install dependencies (exactly what package-lock.json says)
-        run: npm ci
+      - name: Install, typecheck, test
+        working-directory: quiz
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
 
-      - name: Typecheck
-        run: npm run typecheck
+      - name: Deploy or roll back
+        working-directory: quiz
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CHECKOUT_REF: ${{ steps.pick.outputs.ref }}
+        run: |
+          set -u
+          if [ "$ACTION" = "rollback-version" ]; then
+            npx wrangler rollback "$VERSION_ID" --durable-objects-code-update-mode immediate --message="$REASON" -y 2>&1 | tee ../wrangler-out.txt
+            if ! grep -q "Current Version ID: $VERSION_ID" ../wrangler-out.txt; then echo "::error::Wrangler did not confirm the rollback to $VERSION_ID; check the log above."; exit 1; fi
+            echo "Rolled back to $VERSION_ID. Secrets are those of that version: re-set any secret rotated since." >> "$GITHUB_STEP_SUMMARY"
+          else
+            npx wrangler deploy --durable-objects-code-update-mode immediate --message="$REASON" 2>&1 | tee ../wrangler-out.txt
+            VID=$(grep -Eo 'Current Version ID: [0-9a-f-]{36}' ../wrangler-out.txt | awk '{print $4}' || true)
+            if [ -z "$VID" ]; then echo "::error::Wrangler printed no version id; check the log above before trusting this deploy."; exit 1; fi
+            echo "Deployed $CHECKOUT_REF. Version id: $VID" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
-      - name: Unit tests
-        run: npm test
-
-      - name: Deploy to Cloudflare Workers
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          workingDirectory: quiz
-          command: deploy
+      - name: Tag the deployed commit
+        if: env.ACTION == 'deploy'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$RELEASE_TAG" -f sha="$GITHUB_SHA" >/dev/null
+          echo "Tagged $GITHUB_SHA as $RELEASE_TAG." >> "$GITHUB_STEP_SUMMARY"

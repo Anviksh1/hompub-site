@@ -197,6 +197,7 @@ p { margin: 0; }
 }
 .pill[data-conn="open"]::before { background: #8adde1; box-shadow: 0 0 6px rgba(138,221,225,0.8); }
 .pill[data-conn="closed"]::before { background: #ff8a80; box-shadow: none; }
+.pill[data-conn="offline"]::before { background: #ff8a80; box-shadow: none; }
 body[data-screen="ended"] .pill,
 body[data-screen="fatal"] .pill,
 body[data-screen="nopin"] .pill { visibility: hidden; }
@@ -438,3 +439,15 @@ input[type="text"]:focus-visible { outline: 3px solid var(--accent); outline-off
   .row { flex-direction: row; }
   .row .btn { width: auto; flex: 1; }
 }
+
+/* ---------- Phase 1: name feedback and name changes ---------- */
+.label-note { font-weight: 400; color: var(--ink-soft); }
+.field-msg { color: var(--bad); font-weight: 600; margin: 4px 0 0; }
+.rename-form {
+  display: flex; flex-direction: column; gap: 10px; margin: 16px auto 0; width: 100%; max-width: 440px;
+  padding: 16px; border-radius: 16px; background: var(--paper-raised); border: 1px solid var(--line, rgba(0,0,0,0.12));
+}
+.rename-form[hidden] { display: none; }
+.rename-form h2 { font-size: 1.15rem; margin: 0; }
+.rename-form .row { display: flex; flex-wrap: wrap; gap: 10px; }
+.rename-form input { min-height: 48px; font-size: 1.1rem; }

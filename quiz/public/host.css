@@ -540,6 +540,55 @@ body[data-mode="stage"] .site-footer { display: none; }
 }
 @media (min-width: 900px) {
   .lobby { grid-template-columns: minmax(300px, 1fr) 1.2fr; align-items: start; }
+  /* Keep the PIN inside its column (the full projector layout is Phase 2's, P0-62). */
+  .lobby-join { min-width: 0; }
+  .pin-big { font-size: clamp(3.4rem, 6.8vw, 10rem); }
   .reveal-row { grid-template-columns: 1.4fr 1fr; align-items: start; }
   .stage { padding-left: 24px; padding-right: 24px; }
 }
+
+/* ---------- Phase 1: sign-in, live games, players panel, stage banners ---------- */
+.signin { display: flex; flex-direction: column; gap: 10px; max-width: 560px; }
+.signin-form { display: flex; flex-direction: column; gap: 10px; }
+.signin-form input[type="password"] {
+  min-height: 48px; padding: 10px 12px; font: inherit; font-size: 1.1rem;
+  border: 1px solid var(--rule-strong, var(--accent)); border-radius: 10px; background: var(--paper-raised); color: var(--ink);
+}
+.signin .check { display: flex; gap: 10px; align-items: flex-start; }
+.signin.on-stage { margin: 0 auto; background: var(--stage-panel); border-color: var(--stage-rule); color: var(--stage-ink); }
+.signin.on-stage .fine, .signin.on-stage .field-label { color: var(--stage-ink-soft); }
+.signin.on-stage input[type="password"] { background: #ffffff; color: #1c1730; }
+.live-room { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; justify-content: space-between; }
+.live-room h2 { font-size: 1.15rem; }
+.server-note b { font-weight: 600; }
+.host-note { color: var(--stage-ink-soft); }
+.stage-banner {
+  order: 0; display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; justify-content: space-between;
+  padding: 10px 14px; border-radius: 10px; border: 2px solid var(--warn); background: var(--stage-panel-strong);
+  color: var(--stage-ink); font-size: clamp(1rem, 1.6vw, 1.3rem);
+}
+.stage-banner.bad { border-color: #ffb4ab; }
+.stage-menu .menu-body select {
+  min-height: 44px; font: inherit; padding: 6px 10px; border-radius: 8px;
+  background: var(--stage-panel-strong); color: var(--stage-ink); border: 1px solid var(--stage-rule);
+}
+.stage-menu .menu-body .field-label { color: var(--stage-ink-soft); margin-top: 4px; }
+.players-panel {
+  order: 3; display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; border-radius: 14px;
+  border: 1px solid var(--stage-rule); background: var(--stage-panel);
+}
+.players-panel .panel-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.players-panel h2 { font-size: clamp(1.2rem, 2vw, 1.6rem); color: var(--stage-ink); }
+.players-panel input[type="search"], .players-list input[type="text"] {
+  min-height: 44px; padding: 8px 12px; font: inherit; font-size: 1.05rem; border-radius: 10px;
+  border: 1px solid var(--stage-rule); background: #ffffff; color: #1c1730;
+}
+.players-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; max-height: 50vh; overflow: auto; }
+.players-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 6px 4px; border-bottom: 1px solid var(--stage-rule); }
+.players-list li .nick { flex: 1; min-width: 10ch; overflow-wrap: anywhere; color: var(--stage-ink); font-size: 1.1rem; }
+.players-list li .nick.offline { opacity: 0.6; font-style: italic; }
+.players-list li .score { color: var(--stage-ink-soft); }
+.players-list li.editing input { flex: 1; min-width: 12ch; }
+.players-list li.empty { color: var(--stage-ink-soft); border: 0; }
+.players-panel .fine { color: var(--stage-ink-soft); }
+.btn[disabled][aria-busy="true"] { opacity: 0.6; cursor: progress; }
