@@ -1,0 +1,90 @@
+# Deploys the HomPub Quiz referee to STAGING (Worker hompub-quiz-staging).
+#
+# Staging lives in a separate free Cloudflare account, so staging tests never spend
+# the daily free allowance a live class needs, and the staging token cannot reach
+# production. The token and account id come from the GitHub Environment "staging",
+# which only the work branch below may use.
+#
+# Runs on every push to the work branch that changes quiz/ or this file, and by hand
+# (Actions → "Deploy quiz (staging)" → Run workflow) once this file is on main.
+# GitHub skips the run when the pushed commit's message contains [skip ci] (or
+# [ci skip], [no ci], [skip actions]) anywhere, the body included.
+
+name: Deploy quiz (staging)
+
+on:
+  push:
+    branches: [claude/serene-ptolemy-2tfn9t]
+    paths:
+      - 'quiz/**'
+      - '.github/workflows/deploy-quiz-staging.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-quiz-staging
+  cancel-in-progress: false
+
+jobs:
+  staging:
+    name: Typecheck, test, deploy to staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: staging
+    # bash -eo pipefail: a failing `wrangler … | tee` fails the step instead of passing.
+    defaults:
+      run:
+        shell: bash
+        working-directory: quiz
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: quiz/package-lock.json
+
+      - name: Install dependencies (exactly what package-lock.json says)
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Deploy to staging
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # The production account's workers.dev subdomain (public: it is in the production URL).
+          PRODUCTION_SUBDOMAIN: vaidyadeenadayal
+        run: |
+          set -u
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "::error::The staging environment has no CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID secret."
+            exit 1
+          fi
+          # Never deploy staging into the production account (a mixed-up token or account id), and
+          # say so plainly when the staging account has no workers.dev subdomain yet.
+          SUB=$(curl -sS --retry 3 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain" | jq -r '.result.subdomain // empty' || true)
+          if [ -z "$SUB" ]; then
+            echo "::error::Could not read this account's workers.dev subdomain. In the staging account choose one under Workers & Pages, and check that the token and account id belong to that account."
+            exit 1
+          fi
+          if [ "$SUB" = "$PRODUCTION_SUBDOMAIN" ]; then
+            echo "::error::These credentials belong to the production account ($SUB.workers.dev). Put the staging account's token and id in the staging environment."
+            exit 1
+          fi
+          echo "Deploying into the account with subdomain $SUB.workers.dev"
+          npx wrangler deploy --env staging --durable-objects-code-update-mode immediate --message "staging ${GITHUB_SHA::7}" 2>&1 | tee ../wrangler-out.txt
+          VID=$(grep -Eo 'Current Version ID: [0-9a-f-]{36}' ../wrangler-out.txt | awk '{print $4}' || true)
+          URL=$(grep -Eo 'https://[a-z0-9.-]+\.workers\.dev' ../wrangler-out.txt | head -1 || true)
+          if [ -z "$VID" ]; then echo "::error::Wrangler printed no version id; check the log above."; exit 1; fi
+          echo "Staging deployed ${GITHUB_SHA::7}. Version id: ${VID:-see log}. URL: ${URL:-see log}" >> "$GITHUB_STEP_SUMMARY"

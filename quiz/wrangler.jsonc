@@ -20,12 +20,38 @@
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Room", "Directory"] }
   ],
+  // Secrets are not here. Set them per Worker in the Cloudflare dashboard
+  // (Settings → Variables and Secrets): HOST_PASSCODE, SESSION_KEY, IP_HASH_KEY.
+  // Never put DEV_* switches here: they belong in .dev.vars only (test/config.test.mjs checks).
   "vars": {
     "ALLOWED_ORIGINS": "",
-    "MAX_PLAYERS": "250",
+    "MAX_PLAYERS": "400",
     "ROOM_CREATE_PER_IP_PER_DAY": "30",
-    "ROOM_CREATE_PER_DAY": "300"
+    "ROOM_CREATE_PER_DAY": "300",
+    "PIN_MISS_LIMIT": "100"
   },
   // Privacy commitment: no request logs, no traces. Keep this off.
-  "observability": { "enabled": false }
+  "observability": { "enabled": false },
+
+  // Staging: `wrangler deploy --env staging`, deployed by .github/workflows/deploy-quiz-staging.yml
+  // into a separate Cloudflare account. Bindings and vars do not inherit, so they are repeated
+  // here exactly; test/config.test.mjs fails if the two blocks drift apart.
+  "env": {
+    "staging": {
+      "name": "hompub-quiz-staging",
+      "durable_objects": {
+        "bindings": [
+          { "name": "ROOM", "class_name": "Room" },
+          { "name": "DIRECTORY", "class_name": "Directory" }
+        ]
+      },
+      "vars": {
+        "ALLOWED_ORIGINS": "",
+        "MAX_PLAYERS": "400",
+        "ROOM_CREATE_PER_IP_PER_DAY": "30",
+        "ROOM_CREATE_PER_DAY": "300",
+        "PIN_MISS_LIMIT": "100"
+      }
+    }
+  }
 }

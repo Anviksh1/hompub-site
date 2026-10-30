@@ -61,16 +61,17 @@
     <button id="join-cancel" class="btn secondary slim" type="button" hidden>Cancel</button>
     <form id="join-form" novalidate autocomplete="off">
       <div id="nick-row">
-        <label class="label" for="nick">Your nickname</label>
+        <label class="label" for="nick">Your name <span class="label-note">(up to 20 characters)</span></label>
         <input id="nick" type="text" maxlength="20" autocomplete="off" autocapitalize="words"
-               autocorrect="off" spellcheck="false" enterkeyhint="go" placeholder="e.g. Priya">
+               autocorrect="off" spellcheck="false" enterkeyhint="go" placeholder="e.g. Priya" aria-describedby="nick-msg">
+        <p id="nick-msg" class="field-msg" role="alert" hidden></p>
         <button id="join-btn" class="btn primary" type="submit">Join</button>
-        <p class="or">or</p>
+        <p class="or" id="or-row">or</p>
       </div>
-      <p id="spin-hint" class="hint" hidden>The host has asked everyone to use a spun name.</p>
-      <button id="spin-btn" class="btn secondary" type="button">Spin a name</button>
+      <p id="spin-hint" class="hint" hidden>The host has asked everyone to use a random name.</p>
+      <button id="spin-btn" class="btn secondary" type="button">Random name</button>
     </form>
-    <p class="privacy">No account. Just a nickname. Nothing is kept after the game.</p>
+    <p class="privacy">No account. Just a name. Nothing is kept after the game.</p>
   </section>
 
   <section data-screen="connecting" class="center" hidden>
@@ -84,7 +85,9 @@
     <h1 id="lobby-heading" class="huge" tabindex="-1">You’re in, <span id="lobby-nick"></span>!</h1>
     <p class="big-hint">Watch the big screen.</p>
     <p id="lobby-count" class="meta"></p>
+    <p id="name-note" class="hint" hidden></p>
     <button id="respin-btn" class="btn secondary slim" type="button" hidden>Spin a new name</button>
+    <button id="edit-name-btn" class="btn secondary slim" type="button" data-rename-open hidden>Change my name</button>
   </section>
 
   <section data-screen="intro" class="center" hidden>
@@ -144,6 +147,7 @@
       <span id="res-streak-n"></span>
     </p>
     <p class="muted waiting">Waiting for the host…</p>
+    <button id="edit-name-closed" class="btn secondary slim" type="button" data-rename-open hidden>Change my name</button>
   </section>
 
   <section data-screen="podium" class="center" hidden>
@@ -159,6 +163,21 @@
     <p id="ended-text" class="big-hint">Nothing about this game is kept.</p>
     <a class="btn primary slim" href="/">Join another game</a>
   </section>
+
+  <!-- Name change (lobby, or later while the host allows it). Outside the screens so it can open over any of them. -->
+  <form id="rename-form" class="rename-form" novalidate autocomplete="off" hidden>
+    <h2 id="rename-title" tabindex="-1">Change your name</h2>
+    <label class="label" for="rename-nick">New name <span class="label-note">(up to 20 characters)</span></label>
+    <input id="rename-nick" type="text" maxlength="20" autocomplete="off" autocapitalize="words"
+           autocorrect="off" spellcheck="false" enterkeyhint="done" aria-describedby="rename-msg">
+    <p id="rename-msg" class="field-msg" role="alert" hidden></p>
+    <p id="rename-left" class="hint"></p>
+    <div class="row">
+      <button id="rename-save" class="btn primary" type="submit">Save</button>
+      <button id="rename-random" class="btn secondary" type="button" hidden>Random name</button>
+      <button id="rename-cancel" class="btn secondary" type="button">Cancel</button>
+    </div>
+  </form>
 
   <section data-screen="fatal" class="center" hidden>
     <h1 id="fatal-title" tabindex="-1"></h1>

@@ -1,0 +1,7 @@
+# Response headers for the static pages (Workers Static Assets reads this file; it is not served).
+# The /api/* responses get the same headers from src/worker.ts. A full Content-Security-Policy comes in Phase 5.
+/*
+  X-Frame-Options: DENY
+  Content-Security-Policy: frame-ancestors 'none'
+  Referrer-Policy: strict-origin-when-cross-origin
+  X-Content-Type-Options: nosniff
