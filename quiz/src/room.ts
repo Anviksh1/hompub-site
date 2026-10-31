@@ -6,10 +6,11 @@
 // It uses the WebSocket Hibernation API, so between questions (no pending
 // timers) the object is evicted from memory while the sockets stay attached
 // at the edge; the next frame re-runs the constructor, which reloads state
-// from SQLite. Per-socket attachments carry only {role, pid, v, authed, sx, at, joinAt, wid}.
+// from SQLite. Per-socket attachments carry only {role, pid, v, authed, sx, at, joinAt, wid, tab, seq}.
 //
-// Protocol 2 (PROTOCOL.md §11): pages say `v=2`. Version-1 pages (cached before
-// the deploy) keep receiving the frames they understand.
+// Protocol 3 (PROTOCOL.md §11): pages say `v=3`. Version-2 pages (cached from
+// before the deploy) work as before, except that they cannot report Focus check
+// (§13), so their players are marked "not checked". Version-1 pages are told to reload.
 //
 // See ../PROTOCOL.md for every frame and transition implemented here.
 
@@ -19,10 +20,12 @@ import { deriveKey, mintPlayerToken, roomKey, secretsProblem, verifyHostHeader }
 import {
   LIMITS,
   csvEscape,
+  displayRanks,
   hasResults,
   idlePlan,
   joinName,
   letterFor,
+  mergeAway,
   mergeSettings,
   normalizeSettings,
   randomHex,
@@ -30,6 +33,7 @@ import {
   sanitizeNick,
   scoreAnswer,
   spinName,
+  type AwayRecord,
   type NameNote,
   type Phase,
   type Question,
@@ -53,7 +57,10 @@ type RoomRow = {
   created_at: number;
   last_activity: number;
   phase_at: number;
+  focus_qs?: string | null;
 };
+
+type AwayRow = { pid: string; q: number; n: number; ms: number; copies: number; old: number; writes: number };
 
 type PlayerRow = {
   pid: string;
@@ -101,7 +108,12 @@ interface RoomState {
   createdAt: number;
   lastActivity: number;
   phaseAt: number;
+  /** Questions opened while Focus check was on (only these are checked). */
+  focusQs: number[];
 }
+
+/** A Focus check record in memory: `old` = the player's page could not report; `dirty` = not saved yet. */
+interface AwayState extends AwayRecord { old: boolean; writes: number; dirty: boolean }
 
 /**
  * v: protocol version the page speaks (missing = 1). authed: false only for a
@@ -125,7 +137,16 @@ interface Keys { host: CryptoKey; token: CryptoKey; room: CryptoKey }
 type Frame = Record<string, unknown> & { t: string };
 type Timer = ReturnType<typeof setTimeout>;
 
-const PROTO = 2;
+const PROTO = 3;
+type Ranks = Map<string, { rank: number; tied: boolean }>;
+
+/** The stored list of checked questions; anything unreadable means none. */
+function parseFocusQs(raw: string | null | undefined): number[] {
+  try {
+    const v = JSON.parse(raw ?? '[]');
+    return Array.isArray(v) ? v.filter((x): x is number => Number.isInteger(x) && x >= 0) : [];
+  } catch { return []; }
+}
 /** What a player_updated delta is about: the name and whether the phone is connected. */
 const rosterSig = (e: RosterEntry) => `${e.connected ? 1 : 0}|${e.nick}`;
 const ACTIVITY_PERSIST_MS = 60_000;
@@ -172,6 +193,16 @@ const SCHEMA = `
     renames INTEGER NOT NULL DEFAULT 0,
     join_id TEXT
   );
+  CREATE TABLE IF NOT EXISTS away (
+    pid TEXT NOT NULL,
+    q INTEGER NOT NULL,
+    n INTEGER NOT NULL DEFAULT 0,
+    ms INTEGER NOT NULL DEFAULT 0,
+    copies INTEGER NOT NULL DEFAULT 0,
+    old INTEGER NOT NULL DEFAULT 0,
+    writes INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (pid, q)
+  );
 `;
 
 export class Room extends DurableObject<Env> {
@@ -189,8 +220,13 @@ export class Room extends DurableObject<Env> {
   private closeTimer: Timer | null = null;
   private tallyTimer: Timer | null = null;
   private rosterTimer: Timer | null = null;
-  /** What version-2 hosts were last told about each player; null after a wake (they then get a sync). */
+  /** What hosts were last told about each player; null after a wake (they then get a sync). */
   private rosterBaseline: Map<string, string> | null = null;
+  /** Focus check records by `${pid}|${q}` (PROTOCOL.md §13). */
+  private away = new Map<string, AwayState>();
+  /** Records changed since hosts were last told, and the timer that tells them. */
+  private focusChanged = new Set<string>();
+  private focusTimer: Timer | null = null;
   private buckets = new WeakMap<WebSocket, { tokens: number; at: number }>();
   private lastPersistedActivity = 0;
   private warnedWipeAt = 0;
@@ -207,6 +243,9 @@ export class Room extends DurableObject<Env> {
     const cols = this.sql.exec<{ name: string }>('PRAGMA table_info(players)').toArray().map(r => r.name);
     if (!cols.includes('renames')) this.sql.exec('ALTER TABLE players ADD COLUMN renames INTEGER NOT NULL DEFAULT 0');
     if (!cols.includes('join_id')) this.sql.exec('ALTER TABLE players ADD COLUMN join_id TEXT');
+    // Added in protocol 3 (Focus check). The default keeps the previous version's INSERT working.
+    const roomCols = this.sql.exec<{ name: string }>('PRAGMA table_info(room)').toArray().map(r => r.name);
+    if (!roomCols.includes('focus_qs')) this.sql.exec("ALTER TABLE room ADD COLUMN focus_qs TEXT NOT NULL DEFAULT '[]'");
     if (devOn(env)) {
       const scale = Number(env.DEV_TTL_SCALE);
       const fail = Number(env.DEV_FAIL_WRITES_AFTER);
@@ -236,7 +275,7 @@ export class Room extends DurableObject<Env> {
     );
     this.state = {
       pin, hostToken, phase: 'lobby', q: -1, opensAt: null, deadline: null,
-      settings: clean, quiz, locked: false, createdAt: now, lastActivity: now, phaseAt: now,
+      settings: clean, quiz, locked: false, createdAt: now, lastActivity: now, phaseAt: now, focusQs: [],
     };
     this.lastPersistedActivity = now;
     this.rosterBaseline = new Map(); // a new room: every host starts from an empty player list
@@ -296,7 +335,8 @@ export class Room extends DurableObject<Env> {
     const url = new URL(request.url);
     const role = url.searchParams.get('role');
     const token = url.searchParams.get('token') || '';
-    const v = Number(url.searchParams.get('v')) >= 2 ? 2 : 1;
+    const vp = Math.floor(Number(url.searchParams.get('v')));
+    const v = vp >= PROTO ? PROTO : vp === 2 ? 2 : 1;
     const tabParam = url.searchParams.get('tab') || '';
     const tab = /^[0-9a-f]{16,32}$/.test(tabParam) ? tabParam : undefined;
     const seqParam = Number(url.searchParams.get('seq'));
@@ -321,10 +361,7 @@ export class Room extends DurableObject<Env> {
       const sx = keys ? await verifyHostHeader(keys.host, request.headers.get('X-HQ-Host'), s.pin, Date.now()) : null;
       let authed: boolean;
       if (sx !== null) authed = true;
-      else if (token) {
-        if (token !== s.hostToken) return reject(4001, 'Bad host token');
-        authed = true;
-      } else if (v >= 2) authed = false; // waits for {t:'auth', token}
+      else if (v >= 2) authed = false; // waits for {t:'auth', token}; the token is never taken from the URL
       else return reject(4001, 'Bad host token');
       if (!authed && this.pendingHosts() >= LIMITS.pendingHosts) return reject(4000, 'Too many host connections are waiting');
       const wid = authed ? undefined : randomHex(8);
@@ -342,6 +379,8 @@ export class Room extends DurableObject<Env> {
     }
 
     if (role !== 'player') return reject(4000, 'Unknown role');
+    // Version-1 pages were cached before protocol 2 (two releases ago). 4010 is a code they do not retry, and they show the reason.
+    if (v < 2) return reject(4010, 'This page is out of date. Reload it to join the game.');
 
     if (token) {
       const pid = this.byToken.get(token);
@@ -356,39 +395,28 @@ export class Room extends DurableObject<Env> {
         server.close(4003, 'Removed by the host');
         return respond();
       }
-      const mine = this.socketsOf(pid);
-      // Sockets this connection replaces. Version 2: one live page per player, so every
-      // other open version-2 socket (one the page is already closing is left to finish).
-      // Version 1: pages are never evicted for a second tab (two old tabs would evict each
-      // other forever), but at the 3-socket cap the oldest goes, since it is usually a
-      // half-open socket a phone abandoned when it woke up.
-      let replaced: WebSocket[];
-      if (v >= 2) {
-        replaced = mine.filter(old => ((old.deserializeAttachment() as Attachment | null)?.v ?? 1) >= 2 && old.readyState === 1 /* OPEN */);
-        // The same tab already holds a newer connection: this upgrade is one the page abandoned
-        // (it reconnected again while the request was in flight), so it must not evict the newer one.
-        for (const old of replaced) {
-          const a = old.deserializeAttachment() as Attachment | null;
-          if (tab && a?.tab === tab && seq !== undefined && a.seq !== undefined && a.seq > seq) return reject(4013, 'Replaced by a newer connection from this page');
-        }
-      } else {
-        const byAge = mine.map(ws => ({ ws, at: (ws.deserializeAttachment() as Attachment | null)?.at ?? 0 })).sort((a, b) => a.at - b.at);
-        replaced = byAge.slice(0, Math.max(0, mine.length - (LIMITS.socketsPerPlayer - 1))).map(x => x.ws);
+      // Sockets this connection replaces: one live page per player, so every other open
+      // socket of this player (one the page is already closing is left to finish).
+      const replaced = this.socketsOf(pid).filter(old => old.readyState === 1 /* OPEN */);
+      // The same tab already holds a newer connection: this upgrade is one the page abandoned
+      // (it reconnected again while the request was in flight), so it must not evict the newer one.
+      for (const old of replaced) {
+        const a = old.deserializeAttachment() as Attachment | null;
+        if (tab && a?.tab === tab && seq !== undefined && a.seq !== undefined && a.seq > seq) return reject(4013, 'Replaced by a newer connection from this page');
       }
       // Check the room-wide cap first, so a refused connection never costs the player a working one.
       if (this.ctx.getWebSockets('player').length - replaced.length >= this.maxPlayers() * 2 + SOCKET_HEADROOM) return reject(4009, 'This game is full');
       for (const old of replaced) {
         const a = old.deserializeAttachment() as Attachment | null;
         // Same tab: the page's own older socket (it ignores this close). Another tab or device: 4012, no retry.
-        const [code, why] = (a?.v ?? 1) < 2
-          ? [4009, 'Too many tabs are open for this player. Close the others, then tap Try again.']
-          : tab && a?.tab === tab
-            ? [4013, 'Replaced by a newer connection from this page']
-            : [4012, 'This game is open in another tab or device'];
+        const [code, why] = tab && a?.tab === tab
+          ? [4013, 'Replaced by a newer connection from this page']
+          : [4012, 'This game is open in another tab or device'];
         this.closeWith(old, code, why);
       }
       this.accept(server, { role: 'player', pid, v, ...(tab ? { tab } : {}), ...(seq !== undefined ? { seq } : {}) });
       this.touch();
+      if (v < PROTO) this.markOld(pid);
       this.send(server, this.buildSync('player', pid));
       this.scheduleRoster();
       return respond();
@@ -561,22 +589,8 @@ export class Room extends DurableObject<Env> {
   private async handlePlayer(ws: WebSocket, att: Attachment, frame: Frame): Promise<void> {
     switch (frame.t) {
       case 'join': {
-        if (att.pid) {
-          // Already joined: a version-1 page may re-spin its name before the first answer (max 3
-          // spins). Version-2 pages use `rename`, which follows the host's name settings.
-          const p = this.players.get(att.pid);
-          if (p && (att.v ?? 1) < 2 && frame.spin === true && Object.keys(p.answers).length === 0 && p.spins < 3) {
-            const before = { nick: p.nick, spins: p.spins };
-            p.nick = this.uniqueNick(spinName(), p.pid);
-            p.spins += 1;
-            try { this.persistPlayer(p); } catch (e) { Object.assign(p, before); throw e; }
-            this.send(ws, this.buildSync('player', p.pid));
-            this.scheduleRoster();
-          } else {
-            this.sendError(ws, 'already_joined', 'You have already joined');
-          }
-          return;
-        }
+        // Already joined: a new name goes through `rename`, which follows the host's name settings.
+        if (att.pid) { this.sendError(ws, 'already_joined', 'You have already joined'); return; }
         // Mint the token first: everything after this await runs without interruption.
         const token = await this.newPlayerToken();
         const s = this.state;
@@ -605,7 +619,7 @@ export class Room extends DurableObject<Env> {
         const refusal = this.joinRefusal();
         if (refusal) { ws.close(refusal.code, refusal.reason); return; }
 
-        const choice = joinName({ nameMode: s.settings.nameMode, v2: (att.v ?? 1) >= 2, nick: frame.nick, spin: frame.spin === true });
+        const choice = joinName({ nameMode: s.settings.nameMode, nick: frame.nick, spin: frame.spin === true });
         if (choice.kind === 'reject') {
           // The student stays on the form and tries again; the pending-socket clock restarts.
           att.joinAt = Date.now();
@@ -643,6 +657,7 @@ export class Room extends DurableObject<Env> {
         this.send(ws, { t: 'welcome', pid, token, nick, pin: s.pin, ...(note ? { note } : {}) });
         this.send(ws, this.buildSync('player', pid));
         this.scheduleRoster();
+        if ((att.v ?? 1) < PROTO) this.markOld(pid);
         return;
       }
       case 'rename': {
@@ -670,9 +685,54 @@ export class Room extends DurableObject<Env> {
         this.answer(ws, att.pid, frame);
         return;
       }
+      case 'away':
+        if (att.pid) this.awayReport(att.pid, frame);
+        return;
       default:
         this.sendError(ws, 'unknown_type', `Unknown frame type ${frame.t}`);
     }
+  }
+
+  /**
+   * Focus check (PROTOCOL.md §13): the phone left the page during a question and
+   * came back. Reports are running totals for one question; only questions opened
+   * while the setting was on count, and only the question now open or just closed
+   * (or the previous one, during the next intro). Unusable reports are ignored
+   * without a reply: there is nothing the student needs to do about them.
+   */
+  private awayReport(pid: string, frame: Frame): void {
+    const s = this.state!;
+    const p = this.players.get(pid);
+    if (!p || p.kicked) return;
+    const q = frame.q;
+    if (typeof q !== 'number' || !Number.isInteger(q) || !s.focusQs.includes(q)) return;
+    const current = q === s.q && (s.phase === 'open' || s.phase === 'closed' || s.phase === 'podium');
+    const previous = q === s.q - 1 && (s.phase === 'intro' || s.phase === 'open');
+    if (!current && !previous) return;
+    const key = `${pid}|${q}`;
+    const prev = this.away.get(key) ?? null;
+    const next = mergeAway(prev, frame, s.quiz.questions[q].timeLimit);
+    if (!next || (prev && next.n === prev.n && next.ms === prev.ms && next.copies === prev.copies)) return;
+    const rec: AwayState = { ...next, old: prev?.old ?? false, writes: prev?.writes ?? 0, dirty: true };
+    this.away.set(key, rec);
+    this.focusChanged.add(key);
+    this.scheduleFocus();
+    // At most a few rows per player and question while it is open; the rest is saved when it closes.
+    if (rec.writes < LIMITS.awayWrites) this.persistAway(pid, q, rec);
+  }
+
+  /** A player whose page cannot report (an older page) is "not checked" for a checked question. */
+  private markOld(pid: string): void {
+    const s = this.state;
+    if (!s || !(s.phase === 'intro' || s.phase === 'open') || !s.focusQs.includes(s.q)) return;
+    const key = `${pid}|${s.q}`;
+    const rec = this.away.get(key);
+    if (rec?.old) return;
+    const next: AwayState = rec ? { ...rec, old: true, dirty: true } : { n: 0, ms: 0, copies: 0, old: true, writes: 0, dirty: true };
+    this.away.set(key, next);
+    this.focusChanged.add(key);
+    this.scheduleFocus();
+    try { this.persistAway(pid, s.q, next); } catch { /* saved with the next flush, or reported by the write that matters */ }
   }
 
   private answer(ws: WebSocket, pid: string, frame: Frame): void {
@@ -807,10 +867,16 @@ export class Room extends DurableObject<Env> {
       }
       case 'settings': {
         const before = s.settings;
-        s.settings = mergeSettings(before, frame.settings, s.phase === 'lobby');
+        const patch = frame.settings && typeof frame.settings === 'object' ? { ...(frame.settings as Record<string, unknown>) } : null;
+        // Focus check covers whole questions only: it cannot change while one is starting or open.
+        if (patch && typeof patch.focusCheck === 'boolean' && patch.focusCheck !== before.focusCheck && (s.phase === 'intro' || s.phase === 'open')) {
+          delete patch.focusCheck;
+          this.sendError(ws, 'focus_mid_question', 'Focus check can be turned on or off between questions, not during one.');
+        }
+        s.settings = mergeSettings(before, patch, s.phase === 'lobby');
         try { this.persistRoom(); } catch (e) { s.settings = before; throw e; }
         this.settingsChanged(
-          before.nameMode !== s.settings.nameMode || before.allowRename !== s.settings.allowRename,
+          before.nameMode !== s.settings.nameMode || before.allowRename !== s.settings.allowRename || before.focusCheck !== s.settings.focusCheck,
           before.showOnDevices !== s.settings.showOnDevices,
         );
         return;
@@ -883,6 +949,8 @@ export class Room extends DurableObject<Env> {
     s.deadline = s.opensAt + question.timeLimit * 1000;
     s.phaseAt = now;
     s.lastActivity = now;
+    // A new array, so restore() can put the old one back.
+    if (s.settings.focusCheck && !s.focusQs.includes(q)) s.focusQs = [...s.focusQs, q];
     this.answered = new Set();
     this.eligible = null;
     try { this.persistRoom(); } catch (e) { restore(); throw e; }
@@ -905,6 +973,11 @@ export class Room extends DurableObject<Env> {
     s.lastActivity = now;
     try { this.persistRoom(); } catch (e) { restore(); throw e; }
     this.eligible = this.connectedPids();
+    if (s.focusQs.includes(s.q)) {
+      for (const pid of this.eligible) {
+        if (this.socketsOf(pid).every(ws => ((ws.deserializeAttachment() as Attachment | null)?.v ?? 1) < PROTO)) this.markOld(pid);
+      }
+    }
     const frame = { t: 'open', q: s.q, deadline: s.deadline, serverNow: now };
     this.broadcast('player', frame);
     this.broadcast('host', frame);
@@ -924,9 +997,9 @@ export class Room extends DurableObject<Env> {
     s.phaseAt = now;
     s.lastActivity = now;
     try { this.persistRoom(); } catch (e) { restore(); throw e; }
+    this.flushAway();
 
     const ranks = this.rankMap();
-    const question = s.quiz.questions[s.q];
     const playerCount = this.activePlayers().length;
     const cache = new Map<string, object>();
     for (const sock of this.ctx.getWebSockets('player')) {
@@ -936,12 +1009,12 @@ export class Room extends DurableObject<Env> {
       if (!frame) {
         const p = this.players.get(a.pid);
         if (!p || p.kicked) continue;
-        frame = { t: 'result', ...this.resultFor(p, question, ranks, playerCount) };
+        frame = { t: 'result', ...this.resultFor(p, s.q, ranks, playerCount) };
         cache.set(a.pid, frame);
       }
       this.send(sock, frame);
     }
-    this.broadcast('host', { t: 'reveal', ...this.revealView(ranks) });
+    this.broadcast('host', { t: 'reveal', ...this.revealView() });
     await this.armAlarm();
   }
 
@@ -957,8 +1030,9 @@ export class Room extends DurableObject<Env> {
     s.phase = 'podium';
     s.phaseAt = now;
     s.lastActivity = now;
-    const ranks = this.rankMap();
+    this.flushAway();
     const sorted = this.sortedPlayers();
+    const ranks = this.rankMap(sorted);
     const playerCount = sorted.length;
     const top = sorted.slice(0, 3);
     for (const sock of this.ctx.getWebSockets('player')) {
@@ -970,8 +1044,8 @@ export class Room extends DurableObject<Env> {
     }
     this.broadcast('host', {
       t: 'podium',
-      top: top.map(p => ({ pid: p.pid, nick: p.nick, score: p.score })),
-      leaderboard: this.leaderboard(sorted),
+      top: this.topView(top, ranks),
+      leaderboard: this.leaderboard(sorted, ranks),
       playerCount,
     });
     this.persistRoom();
@@ -985,7 +1059,8 @@ export class Room extends DurableObject<Env> {
     s.phase = 'ended';
     s.phaseAt = now;
     s.lastActivity = now;
-    this.broadcast('player', { t: 'ended' });
+    this.flushAway();
+    this.broadcast('player', { t: 'ended', played: this.played() });
     this.broadcast('host', this.resultsFrame());
     this.persistRoom();
     await this.armAlarm();
@@ -1011,6 +1086,9 @@ export class Room extends DurableObject<Env> {
     this.answered.clear();
     this.eligible = null;
     this.rosterBaseline = null;
+    this.away.clear();
+    this.focusChanged.clear();
+    if (this.focusTimer) { clearTimeout(this.focusTimer); this.focusTimer = null; }
     await this.ctx.storage.deleteAlarm();
     await this.ctx.storage.deleteAll();
     if (s) {
@@ -1118,6 +1196,7 @@ export class Room extends DurableObject<Env> {
     const playerCount = sorted.length;
     const base: Record<string, unknown> = {
       t: 'sync', proto: PROTO, serverNow: now, role, pin: s.pin, title: s.quiz.title,
+      focusQs: s.focusQs,
       phase: s.phase, q: s.q, total: s.quiz.questions.length,
       locked: s.locked, settings: s.settings, playerCount,
       question: inQuestion ? this.questionView(role === 'host' || s.settings.showOnDevices) : null,
@@ -1126,21 +1205,26 @@ export class Room extends DurableObject<Env> {
       const p = this.players.get(pid);
       if (p) {
         const ans = inQuestion ? p.answers[String(s.q)] : undefined;
+        const r = ranks.get(pid);
         base.me = {
-          pid: p.pid, nick: p.nick, score: p.score, rank: ranks.get(pid) ?? playerCount,
+          pid: p.pid, nick: p.nick, score: p.score, rank: r?.rank ?? playerCount, tied: r?.tied ?? false,
           streak: p.streak, answered: !!ans, choice: ans ? ans.c : null, spins: p.spins,
           renamesLeft: Math.max(0, LIMITS.maxRenames - p.renames),
         };
-        if (s.phase === 'closed') base.result = this.resultFor(p, s.quiz.questions[s.q], ranks, playerCount);
+        if (s.phase === 'closed') base.result = this.resultFor(p, s.q, ranks, playerCount);
+        // A phone that was away for the reveal and is back for the next question gets what it missed (P0-18).
+        if ((s.phase === 'intro' || s.phase === 'open') && s.q > 0) base.recap = this.resultFor(p, s.q - 1, ranks, playerCount);
         if (finished) base.podium = this.podiumFor(p, sorted.slice(0, 3), ranks);
+        if (s.phase === 'ended') base.played = this.played();
       }
     }
     if (role === 'host') {
       base.roster = this.roster();
       if (inQuestion) base.tally = this.tallyFrame(false);
-      if (s.phase === 'closed') base.reveal = this.revealView(ranks);
-      if (s.phase === 'closed' || finished) base.leaderboard = this.leaderboard(sorted);
-      if (finished) base.podium = { top: sorted.slice(0, 3).map(p => ({ pid: p.pid, nick: p.nick, score: p.score })) };
+      if (s.phase === 'closed') base.reveal = this.revealView();
+      if (s.phase === 'closed' || finished) base.leaderboard = this.leaderboard(sorted, ranks);
+      if (finished) base.podium = { top: this.topView(sorted.slice(0, 3), ranks) };
+      base.focus = this.focusRecords();
       base.hostToken = s.hostToken;
       base.roomKey = this.roomKeyText;
       base.hostCount = this.authedHosts().length;
@@ -1149,23 +1233,40 @@ export class Room extends DurableObject<Env> {
     return base;
   }
 
-  private resultFor(p: Player, question: Question, ranks: Map<string, number>, playerCount: number): object {
+  /** One player's result for question `q`; rank and score are as of now. */
+  private resultFor(p: Player, q: number, ranks: Ranks, playerCount: number): object {
     const s = this.state!;
-    const ans = p.answers[String(s.q)];
+    const question: Question = s.quiz.questions[q];
+    const ans = p.answers[String(q)];
+    const r = ranks.get(p.pid);
     return {
-      q: s.q, correct: question.correct, choice: ans ? ans.c : null, points: ans ? ans.p : 0,
-      score: p.score, rank: ranks.get(p.pid) ?? playerCount, streak: p.streak, playerCount,
+      q, correct: question.correct, choice: ans ? ans.c : null, points: ans ? ans.p : 0,
+      score: p.score, rank: r?.rank ?? playerCount, tied: r?.tied ?? false, streak: p.streak, playerCount,
     };
   }
 
-  private podiumFor(p: Player, top: Player[], ranks: Map<string, number>): object {
+  private podiumFor(p: Player, top: Player[], ranks: Ranks): object {
+    const r = ranks.get(p.pid);
     return {
-      top: top.map(t => ({ nick: t.nick, score: t.score })),
-      you: { score: p.score, rank: ranks.get(p.pid) ?? this.activePlayers().length },
+      top: top.map(t => ({ nick: t.nick, score: t.score, rank: ranks.get(t.pid)?.rank ?? 0, tied: ranks.get(t.pid)?.tied ?? false })),
+      you: { score: p.score, rank: r?.rank ?? this.activePlayers().length, tied: r?.tied ?? false },
     };
   }
 
-  private revealView(ranks: Map<string, number>): object {
+  private topView(top: Player[], ranks: Ranks): object[] {
+    return top.map(p => ({ pid: p.pid, nick: p.nick, score: p.score, rank: ranks.get(p.pid)?.rank ?? 0, tied: ranks.get(p.pid)?.tied ?? false }));
+  }
+
+  /** Whether the game got as far as a question with an answer, for the phones' "game over" wording (P0-10). */
+  private played(): boolean {
+    const s = this.state!;
+    if (s.q >= 1) return true;
+    if (s.q < 0) return false;
+    for (const p of this.players.values()) if (p.answers['0']) return true;
+    return false;
+  }
+
+  private revealView(): object {
     const s = this.state!;
     const question = s.quiz.questions[s.q];
     const key = String(s.q);
@@ -1181,18 +1282,32 @@ export class Room extends DurableObject<Env> {
       if (a.c === question.correct && (fastest === null || a.ms < fastest.ms)) fastest = { nick: p.nick, ms: a.ms };
     }
     const sorted = this.sortedPlayers();
-    void ranks;
     return {
       q: s.q, correct: question.correct, counts, answered,
       expected: this.eligible ? this.eligible.size : this.connectedPids().size,
-      fastest, leaderboard: this.leaderboard(sorted), playerCount: active.length,
+      fastest, leaderboard: this.leaderboard(sorted, this.rankMap(sorted)), playerCount: active.length,
     };
   }
 
-  private leaderboard(sorted: Player[]): object[] {
+  private leaderboard(sorted: Player[], ranks: Ranks): object[] {
     const s = this.state!;
     const key = String(s.q);
-    return sorted.slice(0, 10).map(p => ({ pid: p.pid, nick: p.nick, score: p.score, delta: p.answers[key]?.p ?? 0 }));
+    return sorted.slice(0, 10).map(p => ({
+      pid: p.pid, nick: p.nick, score: p.score, delta: p.answers[key]?.p ?? 0,
+      rank: ranks.get(p.pid)?.rank ?? 0, tied: ranks.get(p.pid)?.tied ?? false,
+    }));
+  }
+
+  /** Every Focus check record, for the host (removed players included: the CSV keeps them). */
+  private focusRecords(keys?: Iterable<string>): object[] {
+    const out: object[] = [];
+    for (const key of keys ?? this.away.keys()) {
+      const r = this.away.get(key);
+      if (!r) continue;
+      const bar = key.lastIndexOf('|');
+      out.push({ pid: key.slice(0, bar), q: Number(key.slice(bar + 1)), n: r.n, ms: r.ms, copies: r.copies, old: r.old });
+    }
+    return out;
   }
 
   private tallyFrame(withType = true): object {
@@ -1223,6 +1338,12 @@ export class Room extends DurableObject<Env> {
     const n = s.quiz.questions.length;
     const header = ['rank', 'nickname', 'score', 'correct', 'answered'];
     for (let i = 1; i <= n; i++) header.push(`q${i}`);
+    // Focus check columns, only when at least one question was checked (PROTOCOL.md §13).
+    const checked = s.focusQs.length > 0;
+    if (checked) {
+      for (let i = 1; i <= n; i++) header.push(`q${i} left page`);
+      header.push('times left page', 'seconds away', 'copies blocked');
+    }
     const lines = [header.join(',')];
     const row = (rank: number | string, p: Player) => {
       let correct = 0;
@@ -1234,6 +1355,15 @@ export class Room extends DurableObject<Env> {
         answered += 1;
         if (a.c === s.quiz.questions[qi].correct) correct += 1;
         cells.push(`${letterFor(a.c)} ${a.p}`);
+      }
+      if (checked) {
+        let times = 0, ms = 0, copies = 0;
+        for (let qi = 0; qi < n; qi++) {
+          const r = s.focusQs.includes(qi) ? this.away.get(`${p.pid}|${qi}`) : undefined;
+          if (r) { times += r.n; ms += r.ms; copies += r.copies; }
+          cells.push(!s.focusQs.includes(qi) ? '' : r?.old && r.n === 0 ? 'not checked' : r && r.n > 0 ? `${r.n}x ${Math.round(r.ms / 1000)} s` : '0');
+        }
+        cells.push(String(times), String(Math.round(ms / 1000)), String(copies));
       }
       return [rank, csvEscape(p.nick), p.score, correct, answered, ...cells].join(',');
     };
@@ -1258,10 +1388,9 @@ export class Room extends DurableObject<Env> {
       b.score - a.score || a.elapsedTotal - b.elapsedTotal || a.joinedAt - b.joinedAt || (a.pid < b.pid ? -1 : 1));
   }
 
-  private rankMap(sorted: Player[] = this.sortedPlayers()): Map<string, number> {
-    const m = new Map<string, number>();
-    sorted.forEach((p, i) => m.set(p.pid, i + 1));
-    return m;
+  /** Display ranks: equal scores share a place and are marked tied (P0-19). Scores and the CSV order are unchanged. */
+  private rankMap(sorted: Player[] = this.sortedPlayers()): Ranks {
+    return displayRanks(sorted);
   }
 
   private connectedPids(): Set<string> {
@@ -1282,12 +1411,8 @@ export class Room extends DurableObject<Env> {
     return out;
   }
 
-  /** Version-2 pages get `frame`; a version-1 page gets a fresh sync, which carries the new name. */
   private sendToPlayer(pid: string, frame: object): void {
-    for (const sock of this.socketsOf(pid)) {
-      const a = sock.deserializeAttachment() as Attachment | null;
-      this.send(sock, (a?.v ?? 1) >= 2 ? frame : this.buildSync('player', pid));
-    }
+    for (const sock of this.socketsOf(pid)) this.send(sock, frame);
   }
 
   /** Open, authenticated host sockets (one the server has just closed is no longer counted). */
@@ -1310,11 +1435,11 @@ export class Room extends DurableObject<Env> {
     return n;
   }
 
-  /** Every version-2 host learns how many host pages are open (P0-58). */
+  /** Every host learns how many host pages are open (P0-58). */
   private broadcastHostCount(exclude?: WebSocket): void {
     const hosts = this.authedHosts(exclude);
     const text = JSON.stringify({ t: 'hosts', count: hosts.length });
-    for (const h of hosts) if ((h.att.v ?? 1) >= 2) { try { h.ws.send(text); } catch { /* gone */ } }
+    for (const h of hosts) { try { h.ws.send(text); } catch { /* gone */ } }
   }
 
   /** Kicked players' names stay reserved, so a removed student cannot rejoin under the same name. */
@@ -1389,9 +1514,8 @@ export class Room extends DurableObject<Env> {
   }
 
   /**
-   * Version-1 hosts get the full roster (as before protocol 2). Version-2 hosts
-   * get only what changed: player_joined / player_updated / player_left, or a
-   * full sync when this object has just woken and no longer knows what they hold.
+   * Hosts get only what changed: player_joined / player_updated / player_left, or
+   * a full sync when this object has just woken and no longer knows what they hold.
    * "Changed" means a new name or a connection change: scores and answered
    * flags move for everyone on every question and reach the host through
    * tally, reveal and leaderboard instead, so they would only bloat the deltas.
@@ -1401,13 +1525,7 @@ export class Room extends DurableObject<Env> {
     const entries = this.roster();
     const playerCount = entries.length;
     const hosts = this.authedHosts(exclude);
-    const v1 = hosts.filter(h => (h.att.v ?? 1) < 2);
-    const v2 = hosts.filter(h => (h.att.v ?? 1) >= 2);
-    if (v1.length) {
-      const text = JSON.stringify({ t: 'roster', players: entries, playerCount });
-      for (const h of v1) { try { h.ws.send(text); } catch { /* gone */ } }
-    }
-    if (v2.length) {
+    if (hosts.length) {
       const frames: object[] = [];
       if (!this.rosterBaseline) {
         frames.push(this.buildSync('host', null));
@@ -1428,11 +1546,23 @@ export class Room extends DurableObject<Env> {
       }
       for (const f of frames) {
         const text = JSON.stringify(f);
-        for (const h of v2) { try { h.ws.send(text); } catch { /* gone */ } }
+        for (const h of hosts) { try { h.ws.send(text); } catch { /* gone */ } }
       }
     }
     this.rosterBaseline = new Map(entries.map(e => [e.pid, rosterSig(e)]));
     if (s.phase === 'lobby') this.broadcast('player', { t: 'lobby', playerCount, locked: s.locked });
+  }
+
+  /** Focus check changes reach hosts in one `focus` frame every 500 ms at most. */
+  private scheduleFocus(): void {
+    if (this.focusTimer) return;
+    this.focusTimer = setTimeout(() => {
+      this.focusTimer = null;
+      if (!this.state || !this.focusChanged.size) return;
+      const records = this.focusRecords(this.focusChanged);
+      this.focusChanged.clear();
+      this.broadcast('host', { t: 'focus', records });
+    }, LIMITS.rosterIntervalMs);
   }
 
   private clearTimers(): void {
@@ -1530,10 +1660,36 @@ export class Room extends DurableObject<Env> {
   private persistRoom(): void {
     const s = this.state!;
     this.write(
-      'UPDATE room SET phase = ?, q = ?, opens_at = ?, deadline = ?, settings = ?, locked = ?, last_activity = ?, phase_at = ? WHERE id = 1',
-      s.phase, s.q, s.opensAt, s.deadline, JSON.stringify(s.settings), s.locked ? 1 : 0, s.lastActivity, s.phaseAt,
+      'UPDATE room SET phase = ?, q = ?, opens_at = ?, deadline = ?, settings = ?, locked = ?, last_activity = ?, phase_at = ?, focus_qs = ? WHERE id = 1',
+      s.phase, s.q, s.opensAt, s.deadline, JSON.stringify(s.settings), s.locked ? 1 : 0, s.lastActivity, s.phaseAt, JSON.stringify(s.focusQs),
     );
     this.lastPersistedActivity = s.lastActivity;
+  }
+
+  /** One Focus check row. Throws StorageError like every write; memory keeps the record either way. */
+  private persistAway(pid: string, q: number, r: AwayState): void {
+    this.write(
+      `INSERT INTO away (pid, q, n, ms, copies, old, writes) VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(pid, q) DO UPDATE SET n = excluded.n, ms = excluded.ms, copies = excluded.copies, old = excluded.old, writes = excluded.writes`,
+      pid, q, r.n, r.ms, r.copies, r.old ? 1 : 0, r.writes + 1,
+    );
+    r.writes += 1;
+    r.dirty = false;
+  }
+
+  /** Save the Focus check records that went over the per-question write limit (at close, podium and End). */
+  private flushAway(): void {
+    try {
+      for (const [key, r] of this.away) {
+        if (!r.dirty) continue;
+        const bar = key.lastIndexOf('|');
+        this.persistAway(key.slice(0, bar), Number(key.slice(bar + 1)), r);
+      }
+    } catch (err) {
+      // The phase change itself is saved; a lost Focus check row is not worth stopping the game for.
+      if (err instanceof StorageError) this.storageFailed();
+      else throw err;
+    }
   }
 
   private persistPlayer(p: Player): void {
@@ -1551,7 +1707,7 @@ export class Room extends DurableObject<Env> {
     this.state = {
       pin: r.pin, hostToken: r.host_token, phase: r.phase, q: r.q, opensAt: r.opens_at, deadline: r.deadline,
       settings: normalizeSettings(JSON.parse(r.settings), r.phase), quiz: JSON.parse(r.quiz) as Quiz, locked: r.locked === 1,
-      createdAt: r.created_at, lastActivity: r.last_activity, phaseAt: r.phase_at,
+      createdAt: r.created_at, lastActivity: r.last_activity, phaseAt: r.phase_at, focusQs: parseFocusQs(r.focus_qs),
     };
     this.lastPersistedActivity = r.last_activity;
     this.players.clear();
@@ -1571,6 +1727,10 @@ export class Room extends DurableObject<Env> {
       this.byToken.set(p.token, p.pid);
       if (p.joinId && now - p.joinedAt <= LIMITS.joinIdMs) this.joinIds.set(p.joinId, p.pid);
       if (!p.kicked && p.answers[key]) this.answered.add(p.pid);
+    }
+    this.away.clear();
+    for (const a of this.sql.exec<AwayRow>('SELECT * FROM away').toArray()) {
+      this.away.set(`${a.pid}|${a.q}`, { n: a.n, ms: a.ms, copies: a.copies, old: a.old === 1, writes: a.writes, dirty: false });
     }
     this.eligible = null;
     // Re-arm in-memory timers if we woke up mid-question (deferred so sockets are available).

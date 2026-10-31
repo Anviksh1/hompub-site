@@ -16,6 +16,17 @@
       { "name": "DIRECTORY", "class_name": "Directory" }
     ]
   },
+  // The synced quiz library (PROTOCOL.md §12). Schema changes go only through
+  // migrations/NNNN_*.sql, applied by the deploy workflows before `wrangler deploy`.
+  // Database ids are not secret. The staging block below has its own database.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hompub-quiz-library",
+      "database_id": "08bf5bf0-f56d-4372-a9c8-4c30d6135d12",
+      "migrations_dir": "migrations"
+    }
+  ],
   // SQLite-backed classes are the only kind the Workers Free plan can create.
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Room", "Directory"] }
@@ -45,6 +56,14 @@
           { "name": "DIRECTORY", "class_name": "Directory" }
         ]
       },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "hompub-quiz-library-staging",
+          "database_id": "8deca85b-8b80-4032-ac2d-64d58aa36e06",
+          "migrations_dir": "migrations"
+        }
+      ],
       "vars": {
         "ALLOWED_ORIGINS": "",
         "MAX_PLAYERS": "400",

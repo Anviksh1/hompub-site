@@ -5,6 +5,8 @@ export interface Env {
   ROOM: DurableObjectNamespace<Room>;
   DIRECTORY: DurableObjectNamespace<Directory>;
   ASSETS: Fetcher;
+  /** The synced quiz library (PROTOCOL.md §12). Missing only if the binding is removed. */
+  DB?: D1Database;
   ALLOWED_ORIGINS: string;
   MAX_PLAYERS: string;
   ROOM_CREATE_PER_IP_PER_DAY: string;
