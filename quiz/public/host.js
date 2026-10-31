@@ -5,7 +5,7 @@
   Organisation:
     0. constants            limits and defaults, mirroring PROTOCOL §2 / §9
     1. DOM helpers          h() builds elements; every string becomes a text node (no innerHTML)
-    2. storage + quizzes    localStorage keys, validation, sample quiz
+    2. storage + quizzes    localStorage keys, the synced library (library.js), validation, sample quiz
     3. state                ONE state object; currentPhase() picks the screen
     4. render()             a single switch on phase → one function per screen
     5. actions              click / input / change delegation via data-action / data-field
@@ -22,18 +22,22 @@
    ====================================================================== */
 
 const KEYS = {
-  quizzes: 'hompub-quiz:quizzes',   // [{id, title, questions, updatedAt, exportedAt}]  (PROTOCOL §2 Quiz + id/updatedAt)
   host: 'hompub-quiz:host',         // {pin, hostToken, title} while a game is live     (PROTOCOL §5)
   prefs: 'hompub-quiz:host-prefs',  // {highContrast, settings} — per-device conveniences only
+  downloaded: 'hompub-quiz:downloaded:', // + pin: the results file this browser already downloaded (P0-70)
 };
+// Quizzes live in the synced library (PROTOCOL §12): library.js keeps one localStorage key per quiz
+// (hompub-quiz:lib:*) and moves the Phase 1 list (hompub-quiz:quizzes) over once, without changing it.
 const LIMITS = { title: 80, text: 200, option: 80, questions: 100, bodyBytes: 200 * 1024 };
 const TIME_LIMITS = [5, 10, 15, 20, 30, 60, 90, 120, 240];
 const POINTS = [0, 1000, 2000];
 const INTRO_MS = 3000;
 const LETTERS = ['A', 'B', 'C', 'D'];
 const PIN_RE = /^[1-9][0-9]{5}$/;
-const PROTO = 2;                 // protocol version this page speaks (PROTOCOL §11)
+const PROTO = 3;                 // protocol version this page speaks (PROTOCOL §11)
 const NO_RETRY_CODES = new Set([4001, 4003, 4004, 4009, 4010, 4011]);
+const SYNC_EVERY_MS = 2 * 60 * 1000;   // fetch library changes from other devices while the page is open
+const SAMPLE_ID = 'sample-warm-up';    // "Load sample" opens this quiz again instead of adding another copy
 const PING_EVERY_MS = 10000;     // keepalive; answered at the edge without waking the Room, and not billed
 const PONG_TIMEOUT_MS = 10000;   // no pong (or any frame) this long after a ping: the connection is dead
 const BLOCKED_AFTER_FAILS = 3;   // handshakes that never opened before the page says WebSockets look blocked
@@ -45,7 +49,7 @@ const DEFAULT_CLOSE_MSG = {
   4009: 'The room is full.',
   4010: 'The room is locked.',
 };
-const DEFAULT_SETTINGS = { mode: 'speed', showOnDevices: false, lateJoin: true, earlyClose: false, nameMode: 'typed', allowRename: true, nicknameMode: 'free' };
+const DEFAULT_SETTINGS = { mode: 'speed', showOnDevices: false, lateJoin: true, earlyClose: false, nameMode: 'typed', allowRename: true, focusCheck: false, nicknameMode: 'free' };
 const NAME_MODES = [
   { id: 'typed', label: 'Typed names only', desc: 'Students type their name. Rude words are refused; duplicates get a number. No random-name button.' },
   { id: 'either', label: 'Typed or random', desc: 'Students type a name, or tap for a random two-word name such as “Brave Otter”.' },
@@ -59,7 +63,7 @@ function prefSettings(raw) {
   const r = raw && typeof raw === 'object' ? raw : {};
   const out = Object.assign({}, DEFAULT_SETTINGS);
   if (MODES_IDS.includes(r.mode)) out.mode = r.mode;
-  ['showOnDevices', 'lateJoin', 'earlyClose', 'allowRename'].forEach((k) => { if (typeof r[k] === 'boolean') out[k] = r[k]; });
+  ['showOnDevices', 'lateJoin', 'earlyClose', 'allowRename', 'focusCheck'].forEach((k) => { if (typeof r[k] === 'boolean') out[k] = r[k]; });
   if (NAME_MODES.some((m) => m.id === r.nameMode)) out.nameMode = r.nameMode;
   else if (r.nicknameMode === 'spin') out.nameMode = 'random';
   out.nicknameMode = legacyNick(out.nameMode);
@@ -84,7 +88,8 @@ const RING_R = 54;
 const RING_C = 2 * Math.PI * RING_R;
 const SHORTCUT_MUTE_MS = 500;   // Space/Enter stay quiet this long after a rebuild dropped focus to <body>
 const SESSION_CHECK_MS = 20 * 60 * 1000;   // how often the open page checks (and renews) its sign-in
-const NOT_SAVED_MSG = 'Not saved — this browser is blocking storage. Export your quiz to keep it.';
+const NOT_SAVED_MSG = 'Not saved on this device — this browser is blocking storage.';
+const FOCUS_NOTICE = 'Your teacher can see if you leave this page during a question.';
 // "Import Word or text" / "Paste questions" (section 4a-ii). The parsing itself lives in import-text.js
 // (window.HomPubImport); the file is read in this browser and never sent anywhere.
 const IMPORT_MAX_BYTES = 5 * 1024 * 1024;
@@ -194,7 +199,7 @@ function fmtDate(ts) {
   if (!ts) return 'never';
   try { return new Date(ts).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }); } catch (e) { return new Date(ts).toLocaleString(); }
 }
-function plural(n, word) { return `${n} ${word}${n === 1 ? '' : 's'}`; }
+function plural(n, word, many) { return `${n} ${n === 1 ? word : (many || word + 's')}`; }
 
 /* ======================================================================
    2. Storage + quizzes
@@ -215,26 +220,52 @@ function loadHostKey() {
 }
 function saveHostKey(k) { return saveJSON(KEYS.host, { pin: k.pin, hostToken: k.hostToken, title: k.title || '' }); }
 
-function loadQuizzes() {
-  const list = loadJSON(KEYS.quizzes, []);
-  return Array.isArray(list) ? list.filter((q) => q && typeof q === 'object' && typeof q.id === 'string' && Array.isArray(q.questions)) : [];
-}
-// Returns whether the write succeeded, so the editor's status line can say "Not saved" honestly.
-function persistQuizzes() {
-  const ok = saveJSON(KEYS.quizzes, state.quizzes);
-  state.storageBlocked = !ok;
-  if (!ok) toast('Could not save: this browser is blocking storage. Export your quiz to keep it.');
-  return ok;
-}
-function findQuiz(id) { return state.quizzes.find((q) => q.id === id) || null; }
+// The synced quiz library (library.js). Without it (the script failed to load) nothing can be saved.
+function safeStorage() { try { const s = window.localStorage; s.getItem('x'); return s; } catch (e) { return null; } }
 function uid() {
   try { return crypto.randomUUID(); } catch (e) { return 'q' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 }
-function newQuestion() { return { text: '', options: ['', '', '', ''], correct: 0, timeLimit: 20, points: 1000 }; }
-function makeStored(quiz, exported) {
-  const now = Date.now();
-  return { id: uid(), title: quiz.title, questions: quiz.questions, updatedAt: now, exportedAt: exported ? now : null };
+const TAB_ID = uid();
+const lib = window.HomPubLibrary
+  ? window.HomPubLibrary.createLibrary({ storage: safeStorage(), fetch: (u, i) => fetch(u, i), now: () => Date.now(), locks: navigator.locks || null, tabId: TAB_ID, onChange: libChanged })
+  : null;
+
+// A quiz as the screens use it: title and questions are the library entry's body, edited in place.
+function quizView(e) {
+  const v = { id: e.id, updatedAt: e.updatedAt, exportedAt: e.exportedAt, deletedAt: e.deletedAt, readOnly: !!(lib && lib.readOnly(e)), draft: false };
+  Object.defineProperty(v, 'title', { get: () => e.body.title, set: (x) => { e.body.title = x; }, enumerable: true });
+  Object.defineProperty(v, 'questions', { get: () => e.body.questions, set: (x) => { e.body.questions = x; }, enumerable: true });
+  return v;
 }
+// "New quiz" is a draft until its first edit, so an untouched one leaves nothing behind (P0-35).
+function draftView(d) {
+  const v = quizView({ id: d.id, body: d.body, updatedAt: d.at, exportedAt: null, deletedAt: null });
+  v.draft = true;
+  return v;
+}
+function allQuizzes() { return lib ? lib.list().map(quizView) : []; }
+function findQuiz(id) {
+  if (state.draft && state.draft.id === id) return draftView(state.draft);
+  const e = lib && lib.get(id);
+  return e && !e.deletedAt ? quizView(e) : null;
+}
+// After an edit: store it (and queue it for the server). Returns whether this browser could store it.
+function saveQuiz(q) {
+  if (!lib || q.readOnly) return false;
+  if (q.draft) {
+    lib.create(state.draft.body, { id: state.draft.id });
+    state.draft = null;
+  } else lib.touch(q.id);
+  state.storageBlocked = lib.storageBlocked();
+  return !state.storageBlocked;
+}
+function addQuiz(body, opts) {
+  if (!lib) { toast('The quiz library did not load. Reload the page.'); return null; }
+  const e = lib.create(body, opts);
+  state.storageBlocked = lib.storageBlocked();
+  return quizView(e);
+}
+function newQuestion(timeLimit) { return { text: '', options: ['', '', '', ''], correct: 0, timeLimit: TIME_LIMITS.includes(timeLimit) ? timeLimit : 20, points: 1000 }; }
 // A quiz counts as exported only while no edit is newer than its last export; otherwise the
 // "not exported" marker and the setup-screen notice must come back.
 function isExported(q) { return !!q.exportedAt && !(q.updatedAt > q.exportedAt); }
@@ -246,7 +277,7 @@ function isExported(q) { return !!q.exportedAt && !(q.updatedAt > q.exportedAt);
 // import toast can say so instead of pretending the file came through whole.
 function normaliseQuiz(raw) {
   if (!raw || typeof raw !== 'object' || !Array.isArray(raw.questions)) return null;
-  const dropped = { questions: Math.max(0, raw.questions.length - LIMITS.questions), options: 0 };
+  const dropped = { questions: Math.max(0, raw.questions.length - LIMITS.questions), options: 0, timers: 0, points: 0 };
   const questions = raw.questions.slice(0, LIMITS.questions).map((item) => {
     const o = item && typeof item === 'object' ? item : {};
     const rawOptions = Array.isArray(o.options) ? o.options : null;
@@ -256,6 +287,9 @@ function normaliseQuiz(raw) {
     const correct = Number.isInteger(o.correct) && o.correct >= 0 && o.correct < options.length ? o.correct : -1;
     const timeLimit = TIME_LIMITS.includes(Number(o.timeLimit)) ? Number(o.timeLimit) : 20;
     const points = POINTS.includes(Number(o.points)) ? Number(o.points) : 1000;
+    // A value the file had but the game does not allow is reported, not changed silently (P0-48).
+    if (o.timeLimit !== undefined && timeLimit !== Number(o.timeLimit)) dropped.timers += 1;
+    if (o.points !== undefined && points !== Number(o.points)) dropped.points += 1;
     return { text: String(o.text == null ? '' : o.text), options, correct, timeLimit, points };
   });
   if (!questions.length) questions.push(newQuestion());
@@ -316,7 +350,7 @@ const storedPrefs = loadJSON(KEYS.prefs, {}) || {};
 const state = {
   screen: 'home',          // local screens while no game is live: 'home' | 'editor' | 'setup'
   editorId: null,          // quiz being edited / prepared for hosting
-  quizzes: [],             // mirror of localStorage hompub-quiz:quizzes
+  draft: null,             // {id, body, at}: a "New quiz" not saved until its first edit (P0-35)
   game: null,              // server snapshot while hosting: the last `sync` frame (minus t), delta frames applied in place
   closeInfo: null,         // {code, reason} once the socket closed for good (a no-retry code)
   results: null,           // {pin, csv, filename, downloaded} — kept outside `game` so a later sync cannot drop it
@@ -326,7 +360,7 @@ const state = {
   netCheck: { status: 'idle', message: '' },
   conn: { status: 'idle', detail: '' },
   allTimers: null,         // last value chosen in the editor's "Set all timers to…" select
-  storageBlocked: false,   // the last persistQuizzes() failed (private window, site data blocked)
+  storageBlocked: false,   // this browser refuses localStorage writes (private window, site data blocked)
   importer: null,          // Word/text import dialog over the home screen: null | {mode: 'paste'|'preview', source: 'paste'|'file', sourceName, text, preview, error, busy}
   // Host sign-in (PROTOCOL §11). status: 'checking' | 'in' | 'out' | 'offline'. The session cookie is HttpOnly,
   // so the page learns its state only from GET /api/session.
@@ -334,15 +368,16 @@ const state = {
   liveRooms: [],           // this library's live games, from GET /api/rooms (resume on another device)
   reauth: false,           // the host socket closed with 4011: sign in again over the stage, then reconnect
   panel: null,             // "All players" panel: null | {q: search text, editPid: pid being renamed, draft: the name being typed}
-  serverNote: '',          // '' | 'old' (server rolled back to before protocol 2) | 'new' (a newer protocol)
+  serverNote: '',          // '' | 'old' (server rolled back to an older protocol) | 'new' (a newer protocol)
+  serverProto: PROTO,      // the protocol the server's last sync said; Focus check needs 3, renames 2
   storageError: '',        // the server could not save (daily limit): shown until the page is reloaded
   pending: null,           // {action, at}: a start/close/next/end that was sent and awaits the next phase frame
   phaseChangedAt: 0,       // when the last phase frame arrived (double-click guard, P0-51)
   confirmEndAt: 0,         // first Space on the podium; a second within 3 s ends the game (P0-65)
   autoResume: false,       // this connection was opened automatically on page load
-  urlTokenTried: false,    // after a 4001 on the first-frame token, try the URL form once (older servers)
   keyNotSaved: false,      // the host key could not be stored: resuming must happen from another device
   limitedUntil: 0,         // server time until which some students cannot join by typing the PIN (`notice` pin_limited)
+  focusFilter: false,      // "All players": show only students who left the page (Focus check)
   prefs: {
     highContrast: !!storedPrefs.highContrast,
     settings: prefSettings(storedPrefs.settings),
@@ -513,6 +548,8 @@ function patchStage() {
   if (empty) empty.hidden = count > 0;
   const list = $('players-list');
   if (list && !(state.panel && state.panel.editPid)) patchKeyed(list, playerRows(), 'players-search');
+  const fl = $('focus-line');
+  if (fl && g.phase === 'closed') { const fresh = focusRevealLine(g); if (fresh && fl.textContent !== fresh.textContent) fl.textContent = fresh.textContent; }
   return true;
 }
 function refresh() { if (!patchStage()) scheduleRender(); }
@@ -520,40 +557,85 @@ function refresh() { if (!patchStage()) scheduleRender(); }
 /* ---------- 4a. HOME ---------- */
 
 function renderHome() {
-  const quizzes = state.quizzes.slice().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   const hostKey = loadHostKey();
+  // The Resume card comes first and is built apart from the list, so a quiz that cannot be drawn never hides it (P0-33).
+  let resume = null;
+  try { resume = renderResumeCard(hostKey); } catch (e) { resume = null; }
+  let quizzes = [];
+  try { quizzes = allQuizzes(); } catch (e) { quizzes = []; }
+  const trashed = lib ? lib.trash() : [];
   return h('div', { class: 'wrap page' },
     renderServerNote(),
     state.auth.status === 'out' && hostKey ? renderSignIn(`Sign in to resume game ${hostKey.pin}`) : null,
-    hostKey && state.auth.status !== 'out' && h('section', { class: 'card resume' },
-      h('p', { class: 'eyebrow' }, 'A game is still live'),
-      h('h2', null, 'Resume game ', h('span', { class: 'mono' }, hostKey.pin)),
-      h('p', { class: 'fine' }, hostKey.title ? `“${hostKey.title}” — ` : '', 'this browser still holds the host key. Students who are connected are waiting for you.'),
-      h('div', { class: 'btn-row' },
-        btn(`Resume game ${hostKey.pin}`, 'resume', { cls: 'primary big' }),
-        h('button', { type: 'button', class: 'link-btn', 'data-action': 'forget-host' }, 'Forget this game'))),
+    resume,
+    renderLibNotices(),
     h('div', { class: 'page-head' },
       h('div', null,
         h('p', { class: 'eyebrow' }, 'Host'),
         h('h1', null, 'Your quizzes'),
-        h('p', { class: 'lede' }, 'Build a quiz, put the PIN on the projector, students answer on their phones. Nothing is kept after the game except the CSV you download.')),
-      h('div', { class: 'toolbar' },
+        h('p', { class: 'lede' }, 'Build a quiz, put the PIN on the projector, students answer on their phones. Your quizzes are saved in your library on the server, so every device you sign in on has them. Games, names and answers are not kept: you download the results at the end.')),
+      quizzes.length ? h('div', { class: 'toolbar' },
         btn('New quiz', 'new-quiz', { cls: 'primary', attrs: { id: 'new-quiz-btn' } }),
-        btn('Import .json', 'import'),
         btn('Import Word or text', 'import-text', { attrs: { id: 'import-text-btn' } }),
-        btn('Paste questions', 'paste-open', { attrs: { id: 'paste-btn' } }),
-        btn('Load sample', 'load-sample'))),
-    h('p', { class: 'fine' },
-      'Writing in Word? ', h('a', { href: 'template-questions.docx', download: true }, 'Download the Word template'),
-      ', type your questions into it, then “Import Word or text”. Or paste questions straight from any document. The file is read in this browser; nothing is uploaded.'),
-    quizzes.length
-      ? h('div', { class: 'quiz-list' }, quizzes.map(renderQuizRow))
-      : h('p', { class: 'empty' }, 'No quizzes yet. Start with “New quiz” or “Load sample”, or import questions written in Word.'),
+        btn('Paste questions', 'paste-open', { attrs: { id: 'paste-btn' } })) : null),
+    renderNetCheck(true),
+    quizzes.length ? null : renderFirstStep(),
+    quizzes.length ? h('div', { class: 'list-head' },
+      renderSyncStatus(),
+      h('div', { class: 'btn-row' },
+        btn('Open a quiz file (.json)', 'import', { cls: 'small' }),
+        btn('Export all (.json)', 'export-all', { cls: 'small' }),
+        btn('Load sample', 'load-sample', { cls: 'small' }),
+        state.auth.status === 'in' && lib && lib.status() !== 'saving' ? btn('Sync now', 'sync-now', { cls: 'small ghost' }) : null)) : null,
+    quizzes.length ? h('div', { class: 'quiz-list' }, quizzes.map(safeQuizRow)) : null,
     renderLiveRooms(hostKey),
-    state.auth.status === 'out' && !hostKey ? renderSignIn('Sign in to host') : null,
-    renderNetCheck(),
-    h('p', { class: 'fine' }, 'Quizzes are saved only in this browser (localStorage). Export a .json copy before a lesson — a cleared browser means a lost quiz.'),
+    state.auth.status === 'out' && !hostKey ? renderSignIn('Sign in to host and to sync your quizzes') : null,
+    trashed.length ? renderTrash(trashed) : null,
     state.importer ? renderImporter() : null);
+}
+
+// A teacher's first visit: one obvious way in, the Word template as a real button (P0-40).
+function renderFirstStep() {
+  return h('section', { class: 'card first-step' },
+    h('h2', null, 'Start here'),
+    h('p', null, 'Write your first quiz in the editor, or bring questions you already have.'),
+    h('div', { class: 'btn-row' },
+      btn('New quiz', 'new-quiz', { cls: 'primary big', attrs: { id: 'new-quiz-btn' } }),
+      btn('Load the sample quiz', 'load-sample')),
+    h('h3', null, 'Questions already written?'),
+    h('div', { class: 'btn-row' },
+      h('a', { class: 'btn', href: 'template-questions.docx', download: true }, 'Download the Word template'),
+      btn('Import Word or text', 'import-text', { attrs: { id: 'import-text-btn' } }),
+      btn('Paste questions', 'paste-open', { attrs: { id: 'paste-btn' } }),
+      btn('Open a quiz file (.json)', 'import')),
+    h('p', { class: 'fine' }, 'Type questions into the template in Word, then “Import Word or text”. The file is read in this browser; only the quiz you add is saved to your library.'),
+    renderSyncStatus());
+}
+
+function renderResumeCard(hostKey) {
+  if (!hostKey || state.auth.status === 'out') return null;
+  // The live-games list says when the game is already over (P0-70).
+  const live = state.liveRooms.find((r) => r.pin === hostKey.pin);
+  const ended = live && live.phase === 'ended';
+  return h('section', { class: 'card resume' },
+    h('p', { class: 'eyebrow' }, ended ? 'A game has ended' : 'A game is still live'),
+    h('h2', null, ended ? 'Results for game ' : 'Resume game ', h('span', { class: 'mono' }, hostKey.pin)),
+    h('p', { class: 'fine' }, hostKey.title ? `“${hostKey.title}” — ` : '', ended
+      ? 'the game is over. Open it to download the results again and wipe it.'
+      : 'this browser still holds the host key. Students who are connected are waiting for you.'),
+    h('div', { class: 'btn-row' },
+      btn(ended ? `Open game ${hostKey.pin}` : `Resume game ${hostKey.pin}`, 'resume', { cls: 'primary big' }),
+      h('button', { type: 'button', class: 'link-btn', 'data-action': 'forget-host' }, 'Forget this game')));
+}
+
+function renderTrash(list) {
+  return h('details', { class: 'card trash', id: 'trash' },
+    h('summary', null, `Trash (${list.length}) — deleted quizzes are kept for 30 days`),
+    h('ul', { class: 'trash-list' }, list.map((e) => h('li', null,
+      h('span', null, h('b', null, e.body.title || 'Untitled quiz'), h('span', { class: 'fine mono' }, ` · deleted ${fmtDate(e.deletedAt)}`)),
+      h('span', { class: 'btn-row' },
+        btn('Restore', 'trash-restore', { cls: 'small', attrs: { 'data-id': e.id } }),
+        btn('Delete for good', 'trash-purge', { cls: 'small danger', attrs: { 'data-id': e.id } }))))));
 }
 
 // The host passcode form. Editing quizzes works without it; creating and controlling a game does not.
@@ -615,28 +697,41 @@ function renderAuthSlot() {
   slot.replaceChildren(show ? h('button', { type: 'button', class: 'btn small', 'data-action': 'sign-out', id: 'sign-out-btn' }, 'Sign out on this device') : '');
 }
 
+// One row that cannot be drawn shows as such; it never blanks the page (P0-33).
+function safeQuizRow(q) {
+  try { return renderQuizRow(q); } catch (e) {
+    return h('div', { class: 'card quiz-row' }, h('div', null, h('div', { class: 'title' }, 'This quiz cannot be shown'), h('div', { class: 'meta' }, 'Export all keeps a copy of it.')));
+  }
+}
+
 function renderQuizRow(q) {
   const n = q.questions.length;
-  const problems = validateQuiz(q).length;
+  const problems = q.readOnly ? 0 : validateQuiz(q).length;
+  const e = lib && lib.get(q.id);
+  const error = lib ? lib.error(q.id) : '';
+  const unsynced = e && lib.needsSync(e);
   return h('div', { class: 'card quiz-row' },
     h('div', null,
       h('div', { class: 'title' }, q.title || 'Untitled quiz'),
       h('div', { class: 'meta mono' },
         `${plural(n, 'question')} · about ${fmtDuration(quizDurationSec(q))} · edited ${fmtDate(q.updatedAt)}`,
         problems ? ` · ${plural(problems, 'problem')}` : '',
-        isExported(q) ? '' : ' · not exported')),
+        q.readOnly ? ' · made with a newer version: read only' : '',
+        unsynced ? ' · not in your library yet' : ''),
+      error ? h('div', { class: 'meta bad' }, 'Not saved to your library: ', error) : null),
     h('div', { class: 'btn-row' },
-      btn('Host', 'setup', { cls: 'primary', attrs: { 'data-id': q.id } }),
-      btn('Edit', 'edit', { attrs: { 'data-id': q.id } }),
-      btn('Duplicate', 'duplicate', { attrs: { 'data-id': q.id } }),
+      btn('Host', 'setup', { cls: 'primary', disabled: q.readOnly, attrs: { 'data-id': q.id } }),
+      btn(q.readOnly ? 'View' : 'Edit', 'edit', { attrs: { 'data-id': q.id } }),
+      btn('Duplicate', 'duplicate', { disabled: q.readOnly, attrs: { 'data-id': q.id } }),
       btn('Export .json', 'export', { attrs: { 'data-id': q.id } }),
-      btn('Delete', 'delete', { cls: 'danger', attrs: { 'data-id': q.id } })));
+      btn('Delete', 'delete', { cls: 'danger', attrs: { 'data-id': q.id, 'aria-label': `Delete ${q.title || 'Untitled quiz'}` } })));
 }
 
-function renderNetCheck() {
+// compact: the one-line version near the top of the home screen ("Before class", P0-40).
+function renderNetCheck(compact) {
   const nc = state.netCheck;
-  return h('section', { class: 'card netcheck' },
-    h('h2', null, 'Check my network'),
+  return h('section', { class: 'card netcheck' + (compact ? ' compact' : '') },
+    h('h2', null, compact ? 'Before class: check the network' : 'Check my network'),
     h('p', { class: 'fine' }, 'School networks sometimes block WebSockets, which the live game needs. Run this on the Wi-Fi you will use in class.'),
     h('div', { class: 'btn-row' }, btn(nc.status === 'running' ? 'Testing…' : 'Check my network', 'net-check', { disabled: nc.status === 'running' })),
     nc.status !== 'idle' && h('div', { class: 'net-result', 'data-status': nc.status, role: 'status' },
@@ -666,7 +761,7 @@ function importerHead(eyebrow, title) {
 function renderPasteForm(imp) {
   return [
     importerHead('Import', 'Paste questions'),
-    h('p', { class: 'fine' }, 'Paste from Word, Google Docs, an email or a web page. One question per block with a blank line between blocks; mark the right answer with a * or an “Answer:” line. You can fix anything in the editor afterwards.'),
+    h('p', { class: 'fine' }, 'Paste from Word, Google Docs, an email or a web page. One question per block with a blank line between blocks; mark the right answer with a * or an “Answer:” line. Pasting loses bold and underlining, so they cannot mark the answer here (in an imported .docx file they can). You can fix anything in the editor afterwards.'),
     h('div', { class: 'importer-grid' },
       h('label', { class: 'field' },
         h('span', null, 'Questions'),
@@ -707,24 +802,42 @@ function renderImportPreview(imp) {
   }
   const qs = p.quiz.questions;
   const n = qs.length;
+  if (!n) {
+    // Nothing usable: say so, show the format, and offer the ways forward. No "the editor opens next" (P0-47).
+    return [
+      importerHead(eyebrow, 'Nothing to import yet'),
+      h('p', null, 'No questions were recognised. Each question needs at least two option lines under it (A. B. C. D. or a dash), with a blank line between questions.'),
+      h('pre', { class: 'format-example' }, IMPORT_EXAMPLE),
+      p.warnings.length ? h('ul', { class: 'problems' }, p.warnings.slice(0, 10).map((w) => h('li', null, importWarningText(w)))) : null,
+      h('div', { class: 'btn-row end importer-actions' },
+        btn('Cancel', 'import-cancel', { cls: 'ghost', attrs: { id: 'import-cancel' } }),
+        h('a', { class: 'btn', href: 'template-questions.docx', download: true }, 'Download the Word template'),
+        imp.source === 'paste'
+          ? btn('Edit text', 'import-edit-text', { cls: 'primary', attrs: { id: 'import-edit' } })
+          : btn('Choose another file', 'import-text', { cls: 'primary', attrs: { id: 'import-another' } })),
+    ];
+  }
+  const blocks = (p.blocks || []).length;
   return [
     importerHead(eyebrow, 'Check the import'),
     h('label', { class: 'field' },
       h('span', null, `Quiz title (1–${LIMITS.title} characters)`),
-      h('input', { class: 'input', id: 'import-quiz-title', type: 'text', maxlength: LIMITS.title, value: p.quiz.title, 'data-field': 'import-title', autocomplete: 'off' })),
+      h('input', { class: 'input', id: 'import-quiz-title', type: 'text', maxlength: LIMITS.title, value: p.quiz.title, placeholder: 'Type a title for this quiz', 'data-field': 'import-title', autocomplete: 'off' })),
+    p.quiz.title ? null : h('p', { class: 'fine' }, 'The file’s heading looks like the template’s, so type a title here (or in the editor).'),
     h('p', { class: 'importer-count mono', role: 'status' }, `${plural(n, 'question')} found` + (p.skipped ? ` · ${plural(p.skipped, 'block')} skipped` : '')),
+    blocks ? h('p', { class: 'fine' }, `${plural(blocks, 'incomplete block')} will be added at the end as ${blocks === 1 ? 'a question' : 'questions'} to finish, so nothing is lost; the editor marks what is missing.`) : null,
     renderImportWarnings(p.warnings),
-    n
-      ? h('div', { class: 'quiz-list' }, qs.map((qq, i) => renderPreviewQuestion(qq, i, p.warnings)))
-      : h('p', { class: 'empty' }, 'No questions were recognised. Each question needs at least two option lines under it (A. B. C. D. or a dash), with a blank line between questions.'),
+    h('div', { class: 'quiz-list' }, qs.map((qq, i) => renderPreviewQuestion(qq, i, p.warnings))),
     h('div', { class: 'btn-row end importer-actions' },
       btn('Cancel', 'import-cancel', { cls: 'ghost', attrs: { id: 'import-cancel' } }),
       imp.source === 'paste' ? btn('Edit text', 'import-edit-text', { attrs: { id: 'import-edit' } }) : null,
-      btn('Add to my quizzes', 'import-add', { cls: 'primary', disabled: n === 0, attrs: { id: 'import-add' } })),
+      btn('Add to my quizzes', 'import-add', { cls: 'primary', attrs: { id: 'import-add' } })),
   ];
 }
 
-function importWarningText(w) { return (w.question ? `Question ${w.question}: ` : '') + w.message; }
+// The parser's own messages may already start with "Question N:"; never say it twice (P0-46).
+function importWarningText(w) { return (w.question && !/^Question \d+:/.test(w.message) ? `Question ${w.question}: ` : '') + w.message; }
+function bareWarning(m) { return String(m).replace(/^Question \d+:\s*/, ''); }
 
 function renderImportWarnings(warnings) {
   if (!warnings.length) return h('p', { class: 'fine', style: 'color:var(--ok)' }, '✓ Nothing to fix.');
@@ -736,7 +849,7 @@ function renderImportWarnings(warnings) {
 }
 
 function renderPreviewQuestion(qq, i, warnings) {
-  const notes = warnings.filter((w) => w.question === i + 1).map((w) => w.message);
+  const notes = warnings.filter((w) => w.question === i + 1).map((w) => bareWarning(w.message));
   const unmarked = qq.correct < 0;
   if (unmarked && !notes.some((m) => /correct/i.test(m))) notes.push('No correct answer marked — tick it in the editor.');
   return h('section', { class: 'card q-card preview-q' + (unmarked ? ' needs-answer' : ''), 'aria-label': `Question ${i + 1}` },
@@ -763,29 +876,84 @@ function renderEditor() {
   if (!q) { state.screen = 'home'; return renderHome(); }
   const total = q.questions.length;
   const allTimers = TIME_LIMITS.includes(state.allTimers) ? state.allTimers : ((q.questions[0] && q.questions[0].timeLimit) || 20);
-  return h('div', { class: 'wrap page' },
-    h('div', null, h('button', { type: 'button', class: 'link-btn', 'data-action': 'home' }, '← All quizzes')),
-    h('div', { class: 'page-head' },
-      h('div', null, h('p', { class: 'eyebrow' }, 'Editor'), h('h1', null, 'Edit quiz')),
-      h('div', { class: 'toolbar' },
-        btn('Export .json', 'export', { attrs: { 'data-id': q.id } }),
-        btn('Host this quiz →', 'setup', { cls: 'primary', attrs: { 'data-id': q.id } }))),
+  const issues = q.readOnly ? new Map() : fieldIssues(q);
+  const problems = q.readOnly ? [] : validateQuiz(q);
+  // A quiz saved by a newer version of the page is shown, never changed (PROTOCOL §12): one disabled fieldset.
+  const form = h('fieldset', { class: 'editor-fields', disabled: q.readOnly },
+    h('legend', { class: 'sr-only' }, 'Quiz'),
     h('section', { class: 'card' },
       h('label', { class: 'field' },
         h('span', null, `Title (1–${LIMITS.title} characters)`),
-        h('input', { class: 'input', id: 'title-input', type: 'text', maxlength: LIMITS.title, value: q.title || '', 'data-field': 'title', autocomplete: 'off' })),
+        fieldInput('input', { class: 'input', id: 'title-input', type: 'text', maxlength: LIMITS.title, value: q.title || '', 'data-field': 'title', autocomplete: 'off' }, issues)),
+      fieldError('title-input', issues),
       h('div', { class: 'field' },
-        h('span', { class: 'field-label' }, 'Set all timers to…'),
+        h('span', { class: 'field-label', id: 'all-timers-label' }, 'Set every timer, including new questions'),
         h('div', { class: 'btn-row' },
-          h('select', { class: 'input', id: 'all-timers', 'data-field': 'all-timers', 'aria-label': 'Time limit for every question', style: 'width:auto;flex:1 1 140px' },
+          h('select', { class: 'input', id: 'all-timers', 'data-field': 'all-timers', 'aria-labelledby': 'all-timers-label', style: 'width:auto;flex:1 1 140px' },
             TIME_LIMITS.map((t) => h('option', { value: t, selected: t === allTimers || null }, `${t} seconds`))),
-          btn('Apply to all', 'all-timers'))),
-      h('div', { id: 'problems-box' }, renderProblems(validateQuiz(q))),
-      h('p', { class: 'autosave', id: 'autosave' }, state.storageBlocked ? NOT_SAVED_MSG : 'Saved automatically in this browser.')),
-    h('div', { class: 'quiz-list' }, q.questions.map((qq, i) => renderQuestionCard(qq, i, total))),
+          btn('Apply to all', 'all-timers', { attrs: { id: 'all-timers-btn' } }))),
+      h('div', { id: 'problems-box' }, renderProblems(problems))),
+    h('div', { class: 'quiz-list' }, q.questions.map((qq, i) => renderQuestionCard(qq, i, total, issues))),
     h('div', { class: 'btn-row' },
-      btn('+ Add question', 'add-question', { cls: 'primary', disabled: total >= LIMITS.questions }),
+      btn('+ Add question', 'add-question', { cls: 'primary', disabled: total >= LIMITS.questions, attrs: { id: 'add-question-btn' } }),
       h('span', { class: 'fine mono' }, `${total} / ${LIMITS.questions}`)));
+  return h('div', { class: 'wrap page editor' },
+    h('div', null, h('button', { type: 'button', class: 'link-btn', 'data-action': 'home' }, '← All quizzes')),
+    h('div', { class: 'page-head' },
+      h('div', null, h('p', { class: 'eyebrow' }, 'Editor'), h('h1', null, q.readOnly ? 'View quiz' : (q.draft ? 'New quiz' : 'Edit quiz'))),
+      h('div', { class: 'toolbar' },
+        q.draft ? null : btn('Export .json', 'export', { attrs: { 'data-id': q.id } }),
+        btn('Host this quiz →', 'setup', { cls: 'primary', disabled: q.readOnly || q.draft, attrs: { 'data-id': q.id } }))),
+    q.readOnly ? h('div', { class: 'notice', role: 'status' },
+      h('b', null, 'Made with a newer version of HomPub Quiz'),
+      h('p', { class: 'fine' }, 'This page can show it but not change or host it, so nothing in it is lost. Reload the page to get the newer version; Export keeps a copy as it is.')) : null,
+    form,
+    // Always in view while editing: what is left to fix, and whether it is saved (P0-38).
+    h('div', { class: 'editor-bar', id: 'editor-bar' },
+      h('span', { class: 'bar-problems', id: 'bar-problems', 'data-kind': problems.length ? 'warn' : 'ok' }, problemsLine(problems)),
+      h('span', { class: 'autosave', id: 'autosave' }, q.draft ? 'Not saved yet: it is saved as soon as you type something.' : syncStatusText())));
+}
+
+function problemsLine(problems) {
+  return problems.length ? `${plural(problems.length, 'thing')} to fix before hosting` : '✓ Ready to host';
+}
+
+// Where each problem is, by the id of the field to fix (P0-38). Mirrors validateQuiz().
+function fieldIssues(q) {
+  const m = new Map();
+  const title = String(q.title || '').trim();
+  if (title.length < 1) m.set('title-input', 'Give the quiz a title.');
+  else if (title.length > LIMITS.title) m.set('title-input', `Shorten the title to ${LIMITS.title} characters.`);
+  (q.questions || []).forEach((qq, i) => {
+    const text = String(qq.text || '').trim();
+    if (text.length < 1) m.set(`q-${i}-text`, 'Type the question.');
+    else if (text.length > LIMITS.text) m.set(`q-${i}-text`, `Shorten this to ${LIMITS.text} characters (it has ${text.length}).`);
+    (qq.options || []).forEach((o, j) => {
+      const t = String(o || '').trim();
+      if (t.length < 1) m.set(`q-${i}-opt-${j}`, `Type option ${LETTERS[j]}, or remove it.`);
+      else if (t.length > LIMITS.option) m.set(`q-${i}-opt-${j}`, `Shorten option ${LETTERS[j]} to ${LIMITS.option} characters.`);
+    });
+    if (!Number.isInteger(qq.correct) || qq.correct < 0 || qq.correct >= (qq.options || []).length) m.set(`q-${i}-opts`, 'Tick the correct option.');
+  });
+  return m;
+}
+function fieldInput(tag, attrs, issues, text) {
+  const bad = issues.has(attrs.id);
+  return h(tag, Object.assign({}, attrs, { 'aria-invalid': bad ? 'true' : null, 'aria-describedby': 'err-' + attrs.id }), text);
+}
+function fieldError(id, issues) {
+  return h('p', { class: 'field-error', id: 'err-' + id, hidden: !issues.has(id) }, issues.get(id) || '');
+}
+// Typing does not rebuild the form, so the inline markers are updated in place.
+function applyFieldMarks(issues) {
+  for (const el of document.querySelectorAll('#app .field-error')) {
+    const id = el.id.slice(4);
+    const msg = issues.get(id) || '';
+    if (el.textContent !== msg) el.textContent = msg;
+    el.hidden = !msg;
+    const target = $(id);
+    if (target) { if (msg) target.setAttribute('aria-invalid', 'true'); else target.removeAttribute('aria-invalid'); }
+  }
 }
 
 function renderProblems(problems) {
@@ -795,43 +963,54 @@ function renderProblems(problems) {
     h('ul', { class: 'problems' }, problems.map((p) => h('li', null, p))));
 }
 
-function renderQuestionCard(qq, i, total) {
+function renderQuestionCard(qq, i, total, issues) {
   const opts = qq.options;
   return h('section', { class: 'card q-card', 'aria-label': `Question ${i + 1}` },
     h('div', { class: 'q-head' },
       h('h3', null, `Question ${i + 1}`),
       h('div', { class: 'btn-row' },
-        btn('↑', 'move-q', { cls: 'small icon', disabled: i === 0, attrs: { 'data-q': i, 'data-dir': -1, 'aria-label': `Move question ${i + 1} up` } }),
-        btn('↓', 'move-q', { cls: 'small icon', disabled: i === total - 1, attrs: { 'data-q': i, 'data-dir': 1, 'aria-label': `Move question ${i + 1} down` } }),
-        btn('Remove', 'remove-q', { cls: 'small danger', disabled: total <= 1, attrs: { 'data-q': i } }))),
+        btn('↑', 'move-q', { cls: 'small icon', disabled: i === 0, attrs: { id: `q-${i}-up`, 'data-q': i, 'data-dir': -1, 'aria-label': `Move question ${i + 1} up` } }),
+        btn('↓', 'move-q', { cls: 'small icon', disabled: i === total - 1, attrs: { id: `q-${i}-down`, 'data-q': i, 'data-dir': 1, 'aria-label': `Move question ${i + 1} down` } }),
+        btn('Remove', 'remove-q', { cls: 'small danger', disabled: total <= 1, attrs: { id: `q-${i}-remove`, 'data-q': i, 'aria-label': `Remove question ${i + 1}` } }))),
     h('label', { class: 'field' },
       h('span', null, `Question text (1–${LIMITS.text} characters)`),
-      h('textarea', { class: 'input', id: `q-${i}-text`, maxlength: LIMITS.text, rows: 2, 'data-field': 'q-text', 'data-q': i }, qq.text || '')),
+      fieldInput('textarea', { class: 'input', id: `q-${i}-text`, maxlength: LIMITS.text, rows: 2, 'data-field': 'q-text', 'data-q': i }, issues, qq.text || '')),
+    fieldError(`q-${i}-text`, issues),
     h('div', { class: 'field' },
-      h('span', { class: 'field-label' }, `Options (2–4, each 1–${LIMITS.option} characters) — tick the correct one`),
-      h('div', { class: 'opt-list', role: 'radiogroup', 'aria-label': `Correct option for question ${i + 1}` },
-        opts.map((o, j) => h('div', { class: 'opt-row' },
+      h('span', { class: 'field-label', id: `q-${i}-opts-label` }, `Options (2–4, each 1–${LIMITS.option} characters) — tick the correct one`),
+      h('div', { class: 'opt-list', id: `q-${i}-opts`, role: 'radiogroup', 'aria-labelledby': `q-${i}-opts-label`, 'aria-describedby': `err-q-${i}-opts`, 'aria-invalid': issues.has(`q-${i}-opts`) ? 'true' : null },
+        opts.map((o, j) => [h('div', { class: 'opt-row' },
           swatch(j),
-          h('input', { class: 'input', id: `q-${i}-opt-${j}`, type: 'text', maxlength: LIMITS.option, value: o || '', 'data-field': 'opt', 'data-q': i, 'data-i': j, autocomplete: 'off', 'aria-label': `Option ${LETTERS[j]} (${SHAPES[j].name})` }),
+          fieldInput('input', { class: 'input', id: `q-${i}-opt-${j}`, type: 'text', maxlength: LIMITS.option, value: o || '', 'data-field': 'opt', 'data-q': i, 'data-i': j, autocomplete: 'off', 'aria-label': `Option ${LETTERS[j]} (${SHAPES[j].name})` }, issues),
           h('span', { class: 'radio-wrap' },
-            h('input', { type: 'radio', name: `correct-${i}`, value: j, checked: qq.correct === j || null, 'data-field': 'correct', 'data-q': i, 'aria-label': `Option ${LETTERS[j]} is the correct answer` })),
-          btn('×', 'remove-opt', { cls: 'small icon', disabled: opts.length <= 2, attrs: { 'data-q': i, 'data-i': j, 'aria-label': `Remove option ${LETTERS[j]}` } }))),
-        opts.length < 4 && h('div', null, btn('+ Add option', 'add-opt', { cls: 'small', attrs: { 'data-q': i } })))),
+            h('input', { type: 'radio', id: `q-${i}-correct-${j}`, name: `correct-${i}`, value: j, checked: qq.correct === j || null, 'data-field': 'correct', 'data-q': i, 'aria-label': `Option ${LETTERS[j]} is the correct answer` })),
+          btn('×', 'remove-opt', { cls: 'small icon', disabled: opts.length <= 2, attrs: { id: `q-${i}-opt-${j}-remove`, 'data-q': i, 'data-i': j, 'aria-label': `Remove option ${LETTERS[j]}` } })),
+          fieldError(`q-${i}-opt-${j}`, issues)]),
+        opts.length < 4 && h('div', null, btn('+ Add option', 'add-opt', { cls: 'small', attrs: { id: `q-${i}-addopt`, 'data-q': i } }))),
+      fieldError(`q-${i}-opts`, issues)),
     h('div', { class: 'inline-fields' },
       h('label', { class: 'field' }, h('span', null, 'Time limit'),
-        h('select', { class: 'input', 'data-field': 'timeLimit', 'data-q': i },
+        h('select', { class: 'input', id: `q-${i}-time`, 'data-field': 'timeLimit', 'data-q': i },
           TIME_LIMITS.map((t) => h('option', { value: t, selected: qq.timeLimit === t || null }, `${t} seconds`)))),
       h('label', { class: 'field' }, h('span', null, 'Points'),
-        h('select', { class: 'input', 'data-field': 'points', 'data-q': i },
+        h('select', { class: 'input', id: `q-${i}-points`, 'data-field': 'points', 'data-q': i },
           POINTS.map((p) => h('option', { value: p, selected: qq.points === p || null }, p === 0 ? '0 — survey, nobody scores' : String(p)))))));
 }
 
-// Typing must not rebuild the form (it would steal the caret), so text edits only refresh these two bits.
-function refreshEditorStatus(q, saved) {
+// Typing must not rebuild the form (it would steal the caret), so text edits only refresh the
+// problem list, the inline markers and the status bar. A change in the number of problems is announced.
+let lastProblemCount = -1;
+function refreshEditorStatus(q) {
+  if (!q) return;
+  const problems = q.readOnly ? [] : validateQuiz(q);
   const box = $('problems-box');
-  if (box) box.replaceChildren(renderProblems(validateQuiz(q)));
+  if (box) box.replaceChildren(renderProblems(problems));
+  if (!q.readOnly) applyFieldMarks(fieldIssues(q));
+  const bar = $('bar-problems');
+  if (bar) { bar.textContent = problemsLine(problems); bar.dataset.kind = problems.length ? 'warn' : 'ok'; }
+  if (problems.length !== lastProblemCount) { if (lastProblemCount >= 0) announce(problemsLine(problems)); lastProblemCount = problems.length; }
   const auto = $('autosave');
-  if (auto) auto.textContent = saved === false ? NOT_SAVED_MSG : 'Saved ' + new Date().toLocaleTimeString();
+  if (auto) auto.textContent = q.draft ? 'Not saved yet: it is saved as soon as you type something.' : syncStatusText();
 }
 
 /* ---------- 4c. SETUP (settings before hosting) ---------- */
@@ -852,12 +1031,7 @@ function renderSetup() {
       h('b', null, 'This quiz cannot be hosted yet'),
       h('ul', { class: 'problems' }, problems.map((p) => h('li', null, p))),
       h('div', { class: 'btn-row' }, btn('Fix in editor', 'edit', { attrs: { 'data-id': q.id } }))) : null,
-    !isExported(q) && h('div', { class: 'notice' },
-      h('b', null, 'Export a copy before hosting'),
-      h('p', { class: 'fine' },
-        q.exportedAt ? 'This quiz has changed since it was last exported. ' : 'This quiz exists only in this browser. ',
-        'If the browser clears its storage, the latest version is gone. Save a .json copy first — it takes one click.'),
-      h('div', { class: 'btn-row' }, btn('Export .json', 'export', { attrs: { 'data-id': q.id } }))),
+    unsyncedNote(q),
     h('section', { class: 'card' },
       h('h2', null, 'Scoring'),
       h('div', { class: 'radio-group' }, MODES.map((m) => radio('s-mode', m.id, s.mode === m.id, m.label, m.desc)))),
@@ -870,13 +1044,41 @@ function renderSetup() {
         h('span', { class: 'field-label' }, 'Names'),
         h('div', { class: 'radio-group' }, NAME_MODES.map((m) => radio('s-nameMode', m.id, s.nameMode === m.id, m.label, m.desc)))),
       toggle('s-allowRename', s.allowRename !== false, 'Students can change their name', 'In the lobby only: up to 3 changes each. It switches off when you press Start; you can switch it on again from Options. You can rename anyone at any time.')),
+    renderFocusSetting(s),
     renderNetCheck(),
     state.auth.status === 'out' ? renderSignIn('Sign in to host this quiz') : h('section', { class: 'card accent' },
       h('h2', null, 'Host'),
       h('p', { class: 'fine' }, 'Creates a room with a 6-digit PIN. Keep this tab open on the projector for the whole game.'),
       state.error && h('div', { class: 'notice bad', role: 'alert' }, state.error),
       h('div', { class: 'btn-row' },
-        btn(state.busy ? 'Creating room…' : 'Host this quiz', 'host', { cls: 'primary big', disabled: problems.length > 0 || state.busy || state.auth.status === 'checking', attrs: { 'data-id': q.id } }))));
+        btn(state.busy ? 'Creating room…' : 'Host this quiz', 'host', { cls: 'primary big', disabled: problems.length > 0 || state.busy || state.auth.status === 'checking', attrs: { 'data-id': q.id, 'aria-describedby': problems.length ? 'host-why' : null } }),
+        // Why it is greyed out, right next to it (P0-39).
+        problems.length ? h('span', { class: 'why', id: 'host-why' }, `${plural(problems.length, 'thing')} to fix first. `, h('button', { type: 'button', class: 'link-btn', 'data-action': 'edit', 'data-id': q.id }, 'Fix in editor')) : null)));
+}
+
+// Hosting does not need the library, but the teacher should know when a quiz is not in it yet.
+function unsyncedNote(q) {
+  const e = lib && lib.get(q.id);
+  if (!e || !lib.needsSync(e)) return null;
+  return h('div', { class: 'notice' }, h('b', null, 'Not in your library yet'),
+    h('p', { class: 'fine' }, 'The latest changes are saved on this device and go to your library when the page can reach it. You can host it now.'));
+}
+
+// Focus check (PROTOCOL §13): what it does, what students see, and what it cannot do.
+function renderFocusSetting(s) {
+  return h('section', { class: 'card' },
+    h('h2', null, 'Focus check'),
+    toggle('s-focusCheck', !!s.focusCheck, 'Show me who leaves the quiz page during a question',
+      'Phones report when a student switches app or tab, minimises, or locks the screen while a question is open, and for how long. When questions are shown on phones, copying the question is blocked too. You see it in “All players” and in the results file; after each question the screen shows only how many left, never names.'),
+    h('p', { class: 'fine' }, 'Students see this on their phones whenever it is on: “', FOCUS_NOTICE, '”'),
+    h('details', { class: 'fine' },
+      h('summary', null, 'What it cannot do'),
+      h('ul', { class: 'problems' },
+        h('li', null, 'It cannot see a second phone, a photo of the projector, or a friend helping.'),
+        h('li', null, 'A screen lock, a phone call or a notification looks the same as switching app.'),
+        h('li', null, 'Some Android split-screen and floating-window modes are not noticed.'),
+        h('li', null, 'Screenshots cannot be blocked. If the browser closes the page entirely, nothing is reported.'),
+        h('li', null, 'It is a signal, not proof. Nothing happens automatically and scores never change.'))));
 }
 
 /* ---------- 4d. STAGE scaffolding (shared by lobby / question / reveal / podium / ended) ---------- */
@@ -938,9 +1140,12 @@ function stableControlId(el) {
 
 function renderStageHead(g) {
   const count = g.playerCount | 0;
+  // The full join link next to the PIN, and a small QR while late joining is on (P0-64).
+  const lateQr = g.phase && g.phase !== 'lobby' && g.phase !== 'ended' && g.settings && g.settings.lateJoin && g.pin && !state.reauth;
   return h('header', { class: 'stage-head' },
     h('span', { class: 'pin' }, 'PIN ', h('b', null, g.pin || '')),
-    h('span', null, location.host + '/play'),
+    h('span', { class: 'join-link mono' }, location.host + '/play?pin=' + (g.pin || '')),
+    lateQr ? h('span', { class: 'mini-qr', title: 'Late joiners can scan this' }, qrNode(qrUrl(g.pin, g.roomKey), g.pin)) : null,
     h('span', { class: 'grow' },
       h('span', { id: 'head-count' }, plural(count, 'player') + (g.locked ? ' · locked' : '')),
       h('span', { id: 'host-note', class: 'host-note' }, hostNote(g))),
@@ -964,7 +1169,8 @@ function renderStageMenu(g) {
       toggle('g-showOnDevices', !!s.showOnDevices, 'Show question on phones', 'Off: phones show only the four shapes.'),
       toggle('g-lateJoin', !!s.lateJoin, 'Allow late joiners', null),
       toggle('g-lock', !!g.locked, 'Lock room', 'No new players; reconnects still work.'),
-      state.serverNote === 'old' ? null : toggle('g-allowRename', s.allowRename !== false, 'Students can change their name', inLobby ? 'Switches off when you press Start.' : 'Lets students fix their name now.'),
+      state.serverProto < 2 ? null : toggle('g-allowRename', s.allowRename !== false, 'Students can change their name', inLobby ? 'Switches off when you press Start.' : 'Lets students fix their name now.'),
+      state.serverProto < 3 ? null : focusToggle(g),
       inLobby ? [
         h('hr'),
         h('label', { class: 'field-label', for: 'g-mode' }, 'Scoring'),
@@ -975,8 +1181,59 @@ function renderStageMenu(g) {
       ] : null,
       h('hr'),
       btn(g.phase === 'lobby' ? 'Cancel game' : 'End game now', 'abort', { cls: 'danger', attrs: { id: 'menu-abort' } }),
-      h('p', { class: 'fine', style: 'color:var(--stage-ink-soft);font-size:0.8rem' },
-        g.phase === 'lobby' ? 'Ends the game at once. Nothing has been played, so no results file is made.' : 'Ends the game at once and downloads the results so far.')));
+      h('p', { class: 'fine menu-note' },
+        g.phase === 'lobby' ? 'Ends the game at once. Nothing has been played, so no results file is made.'
+          : gameWasCancelled(Object.assign({}, g, { phase: 'ended' })) ? 'Ends the game at once. Nobody has answered yet, so there will be no results file.'   // P0-56
+            : 'Ends the game at once and downloads the results so far.')));
+}
+
+// Focus check can change between questions only (the server refuses it during intro and open).
+function focusToggle(g) {
+  const s = g.settings || DEFAULT_SETTINGS;
+  const busy = g.phase === 'intro' || g.phase === 'open';
+  const el = toggle('g-focusCheck', !!s.focusCheck, 'Focus check', busy ? 'Can be changed after this question.' : 'Phones report leaving the page during a question; students are told.');
+  if (busy) { const input = el.querySelector('input'); if (input) input.disabled = true; }
+  return el;
+}
+
+/* ---------- Focus check on the host (PROTOCOL §13) ---------- */
+
+function focusOn(g) { return state.serverProto >= 3 && !!(g && g.settings && g.settings.focusCheck); }
+function focusRecords() { return (state.game && state.game.focusMap) || new Map(); }
+// Everything one student did across the checked questions.
+function focusSummary(pid) {
+  const out = { n: 0, ms: 0, copies: 0, old: 0, qs: [] };
+  for (const r of focusRecords().values()) {
+    if (r.pid !== pid) continue;
+    out.n += r.n | 0; out.ms += r.ms | 0; out.copies += r.copies | 0;
+    if (r.old && !(r.n | 0)) out.old += 1;
+    if ((r.n | 0) || (r.copies | 0)) out.qs.push(r.q);
+  }
+  return out;
+}
+function focusLabel(sum) {
+  const parts = [];
+  if (sum.n) parts.push(`left ${sum.n}×, ${Math.max(1, Math.round(sum.ms / 1000))} s`);
+  if (sum.copies) parts.push(`copy blocked ${sum.copies}×`);
+  if (sum.old && !parts.length) parts.push('not checked (old page)');
+  return parts.join(' · ');
+}
+// For one question: how many active players left the page, and how many could not be checked.
+function focusCounts(g, q) {
+  const active = new Set((Array.isArray(g.roster) ? g.roster : []).map((p) => p.pid));
+  let left = 0, unchecked = 0;
+  for (const r of focusRecords().values()) {
+    if (r.q !== q || !active.has(r.pid)) continue;
+    if (r.n | 0) left += 1; else if (r.old) unchecked += 1;
+  }
+  return { left, unchecked };
+}
+function focusRevealLine(g) {
+  const checked = Array.isArray(g.focusQs) && g.focusQs.includes(g.q);
+  if (!checked || state.serverProto < 3) return null;
+  const c = focusCounts(g, g.q);
+  const text = c.left ? `${plural(c.left, 'student')} left the page during this question` : 'Nobody left the page during this question';
+  return h('p', { class: 'focus-line', id: 'focus-line' }, text, c.unchecked ? ` · ${c.unchecked} not checked (old page)` : '');
 }
 
 function abortOnlyControls() { return [btn('End game', 'abort', { cls: 'danger' })]; }
@@ -1020,6 +1277,7 @@ function renderLobby() {
         h('h2', { id: 'lobby-count' }, plural(count, 'player')),
         h('p', { class: 'lobby-empty', id: 'lobby-empty', hidden: count > 0 }, 'Waiting for players to join…'),
         h('p', { class: 'fine', style: 'color:var(--stage-ink-soft)' }, `Newest names. Click one to remove that player; “All players” has everyone, with search and rename.`),
+        focusOn(g) ? h('p', { class: 'focus-line' }, 'Focus check is on: phones tell students “', FOCUS_NOTICE, '”') : null,
         h('div', { class: 'players-grid', id: 'lobby-recent' }, recentChips(g)),
         h('div', { class: 'btn-row' }, btn(`All players (${count})`, 'players-open', { attrs: { id: 'players-open-lobby' } })))),
     [
@@ -1060,6 +1318,7 @@ function renderPlayersPanel() {
       h('h2', { id: 'panel-title' }, `All players (${count})`),
       btn('Close', 'players-close', { cls: 'ghost', attrs: { id: 'players-close' } })),
     h('input', { type: 'search', id: 'players-search', 'data-field': 'players-search', placeholder: 'Search names', 'aria-label': 'Search players', value: state.panel.q || '', autocomplete: 'off' }),
+    focusRecords().size || focusOn(g) ? btn('Only students who left the page', 'players-left-only', { cls: 'small', attrs: { id: 'players-left-only', 'aria-pressed': state.focusFilter ? 'true' : 'false' } }) : null,
     h('ul', { class: 'players-list', id: 'players-list' }, playerRows()),
     h('p', { class: 'fine' }, g.phase === 'ended'
       ? 'A new name goes into the results file at once; download it again afterwards.'
@@ -1069,11 +1328,12 @@ function renderPlayersPanel() {
 function playerRows() {
   const g = state.game;
   const q = (state.panel && state.panel.q || '').trim().toLowerCase();
-  const roster = (Array.isArray(g.roster) ? g.roster : []).filter((p) => !q || String(p.nick).toLowerCase().includes(q));
-  if (!roster.length) return [h('li', { class: 'empty', id: 'row-empty' }, q ? 'No player matches that search.' : 'No players yet.')];
+  let roster = (Array.isArray(g.roster) ? g.roster : []).filter((p) => !q || String(p.nick).toLowerCase().includes(q));
+  if (state.focusFilter) roster = roster.filter((p) => { const f = focusSummary(p.pid); return f.n > 0 || f.copies > 0; });
+  if (!roster.length) return [h('li', { class: 'empty', id: 'row-empty' }, q ? 'No player matches that search.' : state.focusFilter ? 'Nobody has left the page.' : 'No players yet.')];
   // After End only names can still change (the results file follows); an older server cannot rename or lock.
   const ended = g.phase === 'ended';
-  const old = state.serverNote === 'old';
+  const old = state.serverProto < 2;
   return roster.map((p) => {
     if (state.panel.editPid === p.pid) {
       const draft = typeof state.panel.draft === 'string' ? state.panel.draft : p.nick;
@@ -1083,8 +1343,10 @@ function playerRows() {
         btn('Save', 'rename-save', { cls: 'primary small', attrs: { 'data-pid': p.pid } }),
         btn('Cancel', 'rename-cancel', { cls: 'ghost small' }));
     }
+    const focus = focusLabel(focusSummary(p.pid));
     return h('li', { id: 'row-' + p.pid },
-      h('span', { class: 'nick' + (p.connected === false ? ' offline' : '') }, p.nick, p.connected === false ? ' (offline)' : ''),
+      h('span', { class: 'nick' + (p.connected === false ? ' offline' : '') }, p.nick, p.connected === false ? ' (offline)' : '',
+        focus ? h('span', { class: 'focus-mark', title: 'Focus check' }, ' · ', focus) : null),
       old ? null : btn('Rename', 'rename-start', { cls: 'small', attrs: { 'data-pid': p.pid, id: 'rename-' + p.pid, 'aria-label': `Rename ${p.nick}` } }),
       ended ? null : btn('Remove', 'kick', { cls: 'small danger', attrs: { 'data-pid': p.pid, 'data-nick': p.nick, id: 'kick-' + p.pid, 'aria-label': `Remove ${p.nick}` } }),
       ended || old ? null : btn('Remove and lock', 'kick-lock', { cls: 'small danger', attrs: { 'data-pid': p.pid, 'data-nick': p.nick, id: 'kicklock-' + p.pid, 'aria-label': `Remove ${p.nick} and lock the room` } }));
@@ -1153,22 +1415,29 @@ function renderQuestion(phase) {
   if (!q) return stageFrame(h('p', { class: 'lobby-empty' }, 'Waiting for the question…'), abortOnlyControls());
   const tally = g.tally || emptyTally(q.optionCount, g.playerCount);
   const options = Array.isArray(q.options) ? q.options : [];
+  const offline = hostOffline();
   return stageFrame(
     [
       renderCounter(q, g),
-      h('h1', { class: 'q-text' }, q.text || ''),
-      h('div', { class: 'q-meta' },
-        renderRing(),
-        phase === 'intro'
-          ? h('p', { class: 'answered' }, 'Get ready…', h('small', null, 'the clock starts in a moment'))
-          : h('p', { class: 'answered', id: 'answered' }, answeredText(tally), h('small', null, 'answered'))),
+      // On a wide screen the clock sits beside the question, so long questions still fit (P0-62).
+      h('div', { class: 'q-top' },
+        h('h1', { class: 'q-text' }, q.text || ''),
+        h('div', { class: 'q-meta' },
+          renderRing(),
+          phase === 'intro'
+            ? h('p', { class: 'answered' }, 'Get ready…', h('small', null, 'the clock starts in a moment'))
+            : h('p', { class: 'answered', id: 'answered' }, answeredText(tally), h('small', null, 'answered')))),
+      // The server keeps time while this laptop is offline; say so instead of a frozen "…" (P0-57).
+      offline && phase === 'open' ? h('p', { class: 'offline-note', role: 'status', id: 'offline-note' }, 'This laptop is offline. The question closes on time on the server; the answers appear when the connection returns.') : null,
       h('div', { class: 'options' }, options.map((o, i) => optionTile(i, o))),
     ],
     phase === 'open'
-      ? [primaryBtn('Close now', 'close')]
+      ? [offline ? btn('Close now', 'close', { cls: 'primary big', disabled: true, attrs: { title: 'Not available while offline' } }) : primaryBtn('Close now', 'close')]
       : [btn('Get ready…', 'noop', { cls: 'big', disabled: true })],
-    phase === 'open' ? 'Space / Enter: close now' : null);
+    phase === 'open' ? (offline ? 'Offline: waiting for the connection' : 'Space / Enter: close now') : null);
 }
+
+function hostOffline() { return isLive() && (navigator.onLine === false || (state.conn.status !== 'live' && state.conn.status !== 'connecting')); }
 
 // "12 of 30 answered". A late joiner can answer without being counted as expected; never show "3 of 2" (P0-60).
 function answeredText(t) {
@@ -1180,8 +1449,9 @@ function answeredText(t) {
 
 function renderBoard(list, withDelta) {
   if (!list.length) return h('p', { class: 'fine', style: 'color:var(--stage-ink-soft)' }, 'No scores yet.');
+  // Equal scores share a place (P0-19); a server from before protocol 3 sends no rank.
   return h('ol', { class: 'board' }, list.slice(0, 10).map((p, i) => h('li', null,
-    h('span', { class: 'rank' }, `${i + 1}.`),
+    h('span', { class: 'rank', title: p.tied ? 'Tied' : null }, `${p.rank || i + 1}.`, p.tied ? h('span', { class: 'sr-only' }, ' (tied)') : null),
     h('span', { class: 'nick' }, p.nick),
     h('span', { class: 'score' }, fmtInt(p.score)),
     withDelta ? h('span', { class: 'delta' + (p.delta ? '' : ' zero') }, (p.delta > 0 ? '+' : '') + fmtInt(p.delta || 0)) : null)));
@@ -1200,16 +1470,19 @@ function renderReveal() {
   const lb = Array.isArray(g.leaderboard) ? g.leaderboard : (Array.isArray(r.leaderboard) ? r.leaderboard : []);
   return stageFrame(
     [
-      renderCounter(q, g),
-      h('h1', { class: 'q-text' }, q.text || ''),
+      // The leaderboard gets the whole height beside the question, so all ten rows fit (P0-62).
       h('div', { class: 'reveal-row' },
         h('div', { class: 'stage-body' },
-          h('div', { class: 'options' }, options.map((o, i) => optionTile(i, o, { count: counts[i] | 0, max, correct: i === r.correct, dim: i !== r.correct }))),
-          h('p', { class: 'answered' }, answeredText(r), h('small', null, 'answered')),
-          h('p', { class: 'fastest' },
-            r.fastest && r.fastest.nick
-              ? ['Fastest correct: ', h('b', null, r.fastest.nick), ` (${fmtSec(r.fastest.ms)})`]
-              : (q.points === 0 ? 'Survey question — no points awarded.' : 'Nobody got this one right.'))),
+          renderCounter(q, g),
+          h('h1', { class: 'q-text q-small' }, q.text || ''),
+          h('div', { class: 'options reveal-options' }, options.map((o, i) => optionTile(i, o, { count: counts[i] | 0, max, correct: i === r.correct, dim: i !== r.correct }))),
+          h('div', { class: 'reveal-facts' },
+            h('p', { class: 'answered' }, answeredText(r), h('small', null, 'answered')),
+            h('p', { class: 'fastest' },
+              r.fastest && r.fastest.nick
+                ? ['Fastest correct: ', h('b', null, r.fastest.nick), ` (${fmtSec(r.fastest.ms)})`]
+                : (q.points === 0 ? 'Survey question — no points awarded.' : 'Nobody got this one right.'))),
+          focusRevealLine(g)),
         h('div', null, h('p', { class: 'board-title' }, 'Leaderboard'), renderBoard(lb, true))),
     ],
     [primaryBtn(isLast ? 'Show podium ▸' : 'Next question ▸', 'next')],
@@ -1225,17 +1498,23 @@ function renderPodium() {
   const top = g.podium && Array.isArray(g.podium.top) && g.podium.top.length ? g.podium.top : lb.slice(0, 3);
   const places = [1, 0, 2].map((idx) => {           // 2nd · 1st · 3rd, so 1st stands in the middle
     const p = top[idx];
+    // Equal scores share a place (P0-19): the block shows the shared place, the label says tied.
+    const place = p && p.rank ? p.rank : idx + 1;
+    const label = `${p && p.tied ? 'Tied ' : ''}${place}${['st', 'nd', 'rd'][place - 1] || 'th'} place`;
     return h('div', { class: `place place-${idx + 1}` + (p ? '' : ' empty') },
       h('div', { class: 'nick' }, p ? p.nick : '—'),
-      h('div', { class: 'score' }, p ? fmtInt(p.score) + ' pts' : ''),
-      h('div', { class: 'block', 'aria-label': `${idx + 1}${['st', 'nd', 'rd'][idx]} place` }, String(idx + 1)));
+      h('div', { class: 'score' }, p ? fmtInt(p.score) + ' pts' + (p.tied ? ' · tied' : '') : ''),
+      h('div', { class: 'block', 'aria-label': label }, String(place)));
   });
   return stageFrame(
     [
-      h('p', { class: 'eyebrow' }, g.title || ''),
-      h('h1', { class: 'podium-title' }, 'Podium'),
-      h('div', { class: 'podium' }, places),
-      lb.length ? [h('p', { class: 'board-title' }, 'Top 10'), renderBoard(lb, false)] : null,
+      // The top 10 gets the whole height beside the podium, so all ten rows fit (P0-62).
+      h('div', { class: 'podium-row' },
+        h('div', { class: 'podium-left' },
+          h('p', { class: 'eyebrow' }, g.title || ''),
+          h('h1', { class: 'podium-title' }, 'Podium'),
+          h('div', { class: 'podium' }, places)),
+        lb.length ? h('div', null, h('p', { class: 'board-title' }, 'Top 10'), renderBoard(lb, false)) : null),
     ],
     [primaryBtn('End game', 'end')],
     'Space twice / Enter: end game · the results file downloads next');
@@ -1262,6 +1541,7 @@ function gameWasCancelled(g) {
 }
 // "Download started", never "downloaded": the page cannot see whether the browser saved the file.
 function resultsStatus(r) {
+  if (r.before) return ' was already downloaded on this browser. Download it again if you need another copy.';
   return r.downloaded ? ' — download started. Check your Downloads folder before wiping.' : ' is ready to download.';
 }
 function downloadButton(r) {
@@ -1278,8 +1558,8 @@ function renderEnded() {
       r ? [
         h('p', null, 'The results file ', h('b', { class: 'mono' }, r.filename), resultsStatus(r)),
         h('p', { class: 'fine' }, 'It is the only copy. Once you confirm below, nothing about this game remains on the server. The phones already show “Game over”.'),
-        h('div', { class: 'btn-row' }, downloadButton(r),
-          state.serverNote === 'old' ? null : btn(`All players (${g.playerCount | 0})`, 'players-open', { attrs: { id: 'players-open-ended' } })),
+        h('div', { class: 'btn-row' }, downloadButton(r), resultsFallbacks(),
+          state.serverProto < 2 ? null : btn(`All players (${g.playerCount | 0})`, 'players-open', { attrs: { id: 'players-open-ended' } })),
         h('div', { class: 'btn-row' }, btn('I have the results — wipe the game', 'ack', { cls: 'primary big' })),
         state.auth.status === 'in' ? h('div', { class: 'btn-row' }, h('button', { type: 'button', class: 'link-btn', 'data-action': 'sign-out' }, 'Sign out on this device')) : null,
       ] : [
@@ -1313,8 +1593,12 @@ function finalScreenResults(g) {
   return [
     h('p', null, 'Results file ', h('b', { class: 'mono' }, r.filename),
       r.downloaded ? ' — download started. Check your Downloads folder.' : ' is still held by this page — download it before leaving.'),
-    h('div', { class: 'btn-row' }, downloadButton(r)),
+    h('div', { class: 'btn-row' }, downloadButton(r), resultsFallbacks()),
   ];
+}
+// Where a download does not work (a phone, an in-app browser): copy the CSV, or share it (P0-71).
+function resultsFallbacks() {
+  return [btn('Copy results', 'copy-results'), canShare() ? btn('Share…', 'share-results') : null];
 }
 
 function renderWiped() {
@@ -1363,36 +1647,64 @@ function renderPill() {
   text.textContent = label;
 }
 function setConn(status, detail) {
+  const was = state.conn.status;
   state.conn = { status, detail: detail || '', blocked: status === 'live' ? false : !!state.conn.blocked };
   renderPill();
+  // An open question shows the offline note and greys Close while the connection is down (P0-57).
+  if ((was === 'live') !== (status === 'live') && currentPhase() === 'open') scheduleRender();
 }
 
 /* ======================================================================
    5. Actions (event delegation)
    ====================================================================== */
 
-function openEditor(id) { state.editorId = id; state.screen = 'editor'; state.error = null; render(); }
+function openEditor(id, focusId) {
+  state.editorId = id; state.screen = 'editor'; state.error = null;
+  render();
+  if (focusId) focusLater(focusId);
+}
 
-// Mutate the quiz being edited, persist, then either rebuild (structural change) or just refresh the status line.
+// Mutate the quiz being edited, store it, then either rebuild (structural change) or just refresh the status line.
 function editQuiz(mutate, structural) {
   const q = findQuiz(state.editorId);
-  if (!q) return;
+  if (!q || q.readOnly) return;
   mutate(q);
-  q.updatedAt = Date.now();
-  const saved = persistQuizzes();
+  const saved = saveQuiz(q);
   if (structural) render(); else refreshEditorStatus(q, saved);
+}
+
+// "Title (copy)", then "Title (copy 2)", "(copy 3)"… — never "(copy) (copy)" (P0-41).
+function copyTitle(title) {
+  const base = String(title || 'Untitled quiz').replace(/\s*\(copy(?: \d+)?\)$/, '').trim() || 'Untitled quiz';
+  const taken = new Set(allQuizzes().map((q) => String(q.title || '').trim()));
+  for (let n = 1; n < 1000; n++) {
+    const t = `${base} (copy${n === 1 ? '' : ' ' + n})`;
+    const cut = t.length > LIMITS.title ? `${base.slice(0, LIMITS.title - t.length + base.length - 1)}… (copy${n === 1 ? '' : ' ' + n})` : t;
+    if (!taken.has(cut)) return cut;
+  }
+  return base.slice(0, LIMITS.title);
+}
+
+// A new question takes the "Set all timers" value, else the previous question's timer (P0-42).
+function nextTimer(q) {
+  if (TIME_LIMITS.includes(state.allTimers)) return state.allTimers;
+  const last = q.questions[q.questions.length - 1];
+  return last && TIME_LIMITS.includes(last.timeLimit) ? last.timeLimit : 20;
 }
 
 const actions = {
   noop() {},
-  home() { state.screen = 'home'; state.error = null; render(); },
+  home() { state.screen = 'home'; state.error = null; state.draft = null; render(); },
   'new-quiz'() {
-    const q = makeStored({ title: '', questions: [newQuestion()] });
-    state.quizzes.push(q); persistQuizzes(); openEditor(q.id);
+    state.draft = { id: uid(), body: { title: '', questions: [newQuestion(state.allTimers)] }, at: Date.now() };
+    openEditor(state.draft.id, 'title-input');
   },
   'load-sample'() {
-    const q = makeStored(JSON.parse(JSON.stringify(SAMPLE_QUIZ)));
-    state.quizzes.push(q); persistQuizzes(); openEditor(q.id);
+    const have = lib && lib.get(SAMPLE_ID);
+    if (have && !have.deletedAt) { openEditor(SAMPLE_ID, 'title-input'); toast('The sample quiz is already in your quizzes. Here it is.'); return; }
+    if (have) lib.restore(SAMPLE_ID);
+    else if (!addQuiz(JSON.parse(JSON.stringify(SAMPLE_QUIZ)), { id: SAMPLE_ID })) return;
+    openEditor(SAMPLE_ID, 'title-input');
     toast('Sample quiz loaded. Edit it or host it as is.');
   },
   import() { $('import-file').click(); },
@@ -1406,38 +1718,68 @@ const actions = {
   setup(d) { state.editorId = d.id; state.screen = 'setup'; state.error = null; render(); },
   duplicate(d) {
     const q = findQuiz(d.id); if (!q) return;
-    const copy = makeStored({ title: `${q.title || 'Untitled quiz'} (copy)`.slice(0, LIMITS.title), questions: JSON.parse(JSON.stringify(q.questions)) });
-    state.quizzes.push(copy); persistQuizzes(); render();
+    const copy = addQuiz({ title: copyTitle(q.title), questions: JSON.parse(JSON.stringify(q.questions)) });
+    if (!copy) return;
+    render();
+    toast(`Copy created: “${copy.title}”.`);
   },
   export(d) { exportQuiz(d.id); },
+  'export-all'() { exportAll(); },
+  // Deleting moves the quiz to the Trash (kept 30 days), so it needs no confirm, only an Undo (P0-36).
   delete(d) {
-    const q = findQuiz(d.id); if (!q) return;
-    if (!window.confirm(`Delete “${q.title || 'Untitled quiz'}”? This cannot be undone.`)) return;
-    state.quizzes = state.quizzes.filter((x) => x.id !== d.id);
-    persistQuizzes();
+    const q = findQuiz(d.id); if (!q || !lib) return;
+    if (q.draft) { state.draft = null; actions.home(); return; }
+    lib.remove(d.id);
     if (state.editorId === d.id) { state.editorId = null; state.screen = 'home'; }
     render();
+    toast(`“${q.title || 'Untitled quiz'}” moved to the Trash.`, 10000, { label: 'Undo', action: 'undo-delete', data: { id: d.id } });
   },
-  'add-question'() { editQuiz((q) => { if (q.questions.length < LIMITS.questions) q.questions.push(newQuestion()); }, true); },
-  'remove-q'(d) {
-    editQuiz((q) => {
-      if (q.questions.length <= 1) return;
-      const qq = q.questions[+d.q];
-      if (qq && (qq.text || qq.options.some(Boolean)) && !window.confirm(`Remove question ${+d.q + 1}?`)) return;
-      q.questions.splice(+d.q, 1);
-    }, true);
+  'undo-delete'(d) { if (!lib) return; lib.restore(d.id); hideToast(); render(); toast('Back in your quizzes.'); },
+  'trash-restore'(d) { if (!lib) return; lib.restore(d.id); render(); toast('Back in your quizzes.'); },
+  async 'trash-purge'(d) {
+    const e = lib && lib.get(d.id); if (!e) return;
+    if (!(await confirmBox('Delete for good?', `“${e.body.title || 'Untitled quiz'}” will be removed from your library on every device. It cannot be brought back.`, 'Delete for good', { danger: true }))) return;
+    lib.purge(d.id); render();
   },
+  'sync-now'() { if (lib && state.auth.status === 'in') lib.sync(); else if (state.auth.status !== 'in') { state.auth.status = 'out'; render(); focusLater('passcode'); } },
+  'notice-dismiss'(d) { if (!lib) return; const n = lib.notices()[+d.i]; if (n) lib.dismissNotice(n); render(); },
+  'backup-download'(d) { downloadBackup(d.key); },
+  'add-question'() {
+    let at = -1;
+    editQuiz((q) => { if (q.questions.length < LIMITS.questions) { q.questions.push(newQuestion(nextTimer(q))); at = q.questions.length - 1; } }, true);
+    if (at >= 0) { focusLater(`q-${at}-text`); announce(`Question ${at + 1} added.`); }
+  },
+  async 'remove-q'(d) {
+    const q = findQuiz(state.editorId); if (!q) return;
+    const i = +d.q;
+    const qq = q.questions[i];
+    if (q.questions.length <= 1 || !qq) return;
+    if ((qq.text || qq.options.some(Boolean)) && !(await confirmBox(`Remove question ${i + 1}?`, qq.text ? `“${qq.text}”` : 'It has options typed in.', 'Remove question', { danger: true }))) return;
+    editQuiz((q2) => { q2.questions.splice(i, 1); }, true);
+    const next = Math.min(i, findQuiz(state.editorId).questions.length - 1);
+    focusLater(`q-${next}-text`);
+    announce(`Question ${i + 1} removed.`);
+  },
+  // Focus stays on the same button of the moved question (P0-37), and the move is announced.
   'move-q'(d) {
-    editQuiz((q) => {
-      const i = +d.q, j = i + (+d.dir);
-      if (j < 0 || j >= q.questions.length) return;
-      const tmp = q.questions[i]; q.questions[i] = q.questions[j]; q.questions[j] = tmp;
-    }, true);
+    const i = +d.q, dir = +d.dir, j = i + dir;
+    const q = findQuiz(state.editorId);
+    if (!q || j < 0 || j >= q.questions.length) return;
+    editQuiz((q2) => { const tmp = q2.questions[i]; q2.questions[i] = q2.questions[j]; q2.questions[j] = tmp; }, true);
+    const total = findQuiz(state.editorId).questions.length;
+    const btnId = dir < 0 ? (j === 0 ? `q-${j}-down` : `q-${j}-up`) : (j === total - 1 ? `q-${j}-up` : `q-${j}-down`);
+    focusLater(btnId);
+    announce(`Question ${i + 1} moved to position ${j + 1}.`);
   },
-  'add-opt'(d) { editQuiz((q) => { const qq = q.questions[+d.q]; if (qq && qq.options.length < 4) qq.options.push(''); }, true); },
+  'add-opt'(d) {
+    let n = -1;
+    editQuiz((q) => { const qq = q.questions[+d.q]; if (qq && qq.options.length < 4) { qq.options.push(''); n = qq.options.length - 1; } }, true);
+    if (n >= 0) focusLater(`q-${d.q}-opt-${n}`);
+  },
   'remove-opt'(d) {
+    const qi = +d.q, i = +d.i;
     editQuiz((q) => {
-      const qq = q.questions[+d.q]; const i = +d.i;
+      const qq = q.questions[qi];
       if (!qq || qq.options.length <= 2) return;
       qq.options.splice(i, 1);
       // Removing the ticked option clears the tick (-1): validateQuiz then says "tick the correct
@@ -1445,13 +1787,16 @@ const actions = {
       if (qq.correct === i) qq.correct = -1;
       else if (qq.correct > i) qq.correct -= 1;
     }, true);
+    focusLater(`q-${qi}-opt-${Math.max(0, i - 1)}`);
+    announce(`Option ${LETTERS[i]} removed.`);
   },
   'all-timers'() {
     const sel = $('all-timers'); const t = sel ? +sel.value : NaN;
     if (!TIME_LIMITS.includes(t)) return;
-    state.allTimers = t;                                       // the rebuilt select keeps showing this value
+    state.allTimers = t;                                       // the rebuilt select keeps showing this value; new questions use it too
     editQuiz((q) => { q.questions.forEach((qq) => { qq.timeLimit = t; }); }, true);
-    toast(`All timers set to ${t} seconds.`);
+    focusLater('all-timers-btn');
+    toast(`Every timer is now ${t} seconds, and new questions start at ${t} seconds.`);
   },
   'net-check'() { checkNetwork(); },
   host(d) { hostQuiz(d.id); },
@@ -1463,38 +1808,46 @@ const actions = {
   },
   reload() { location.reload(); },
   'sign-out'() { signOut(); },
-  'forget-host'() {
-    if (!window.confirm('Forget this game on this browser? Students still connected will see it time out.')) return;
+  async 'forget-host'() {
+    if (!(await confirmBox('Forget this game on this browser?', 'The game keeps running on the server until it times out. You can still resume it from “Games you started” while you are signed in.', 'Forget it'))) return;
     removeKey(KEYS.host); render();
   },
   // ---- in-game ----
-  start() {
+  async start() {
     if (!state.game || isPending('start')) return;
-    if ((state.game.playerCount | 0) === 0 && !window.confirm('No players have joined yet. Start anyway?')) return;
+    if ((state.game.playerCount | 0) === 0 && !(await confirmBox('Start with no players?', 'Nobody has joined yet. You can start anyway, for example to test the quiz.', 'Start anyway'))) return;
     primarySend('start', 0);
   },
   // Close is ignored for 0.5 s after a question opens and Next for 0.8 s after the reveal, so a
   // double-click or a double Space cannot skip the answers (P0-51).
-  close() { primarySend('close', 500); },
+  close() { if (hostOffline()) return; primarySend('close', 500); },
   next() { primarySend('next', 800); },
   end() { primarySend('end', 800); },
-  abort() {
-    if (!state.game) return;
-    const inLobby = state.game.phase === 'lobby';
-    if (!window.confirm(inLobby ? 'Cancel this game? Players will be sent away.' : 'End the game now? You will get the results so far.')) return;
-    send({ t: 'end' });
+  async abort() {
+    const g = state.game;
+    if (!g) return;
+    const inLobby = g.phase === 'lobby';
+    const nothing = gameWasCancelled(Object.assign({}, g, { phase: 'ended' }));
+    const ok = inLobby
+      ? await confirmBox('Cancel this game?', 'Players are sent away. Nothing has been played, so there is no results file.', 'Cancel the game', { danger: true, cancelLabel: 'Keep the game' })
+      : await confirmBox('End the game now?', nothing ? 'Nobody has answered yet, so there will be no results file.' : 'You get the results so far as a file.', 'End the game', { danger: true, cancelLabel: 'Keep playing' });
+    if (ok) send({ t: 'end' });
   },
   // P0-07: a removed student can join again under another name, unless the room is locked. Say so.
-  kick(d) {
-    if (!window.confirm(`Remove ${d.nick || 'this player'}? They can join again under another name unless you lock the room.`)) return;
+  async kick(d) {
+    if (!(await confirmBox(`Remove ${d.nick || 'this player'}?`, 'Their answers so far stay in the results file, marked “removed”. They can join again under another name unless you lock the room.', 'Remove', { danger: true }))) return;
     send({ t: 'kick', pid: d.pid });
   },
-  'kick-lock'(d) {
-    if (!window.confirm(`Remove ${d.nick || 'this player'} and lock the room? Nobody new can join until you unlock it; everyone else stays.`)) return;
+  async 'kick-lock'(d) {
+    if (!(await confirmBox(`Remove ${d.nick || 'this player'} and lock the room?`, 'Nobody new can join until you unlock it; everyone else stays.', 'Remove and lock', { danger: true }))) return;
     send({ t: 'kick', pid: d.pid, lock: true });
   },
-  'players-open'() { state.panel = { q: '', editPid: null }; render(); focusLater('players-search'); },
+  'players-open'() {
+    const menu = $('stage-menu'); if (menu) menu.open = false;   // the panel opens below; the menu must not cover it
+    state.panel = { q: '', editPid: null }; render(); focusLater('players-search');
+  },
   'players-close'() { state.panel = null; render(); focusLater('players-open-lobby') || focusLater('players-open-ended') || focusLater('stage-menu-summary'); },
+  'players-left-only'() { state.focusFilter = !state.focusFilter; const list = $('players-list'); if (list) list.replaceChildren(...playerRows()); const b = $('players-left-only'); if (b) b.setAttribute('aria-pressed', state.focusFilter ? 'true' : 'false'); },
   'rename-start'(d) {
     if (!state.panel) return;
     const p = ((state.game && state.game.roster) || []).find((x) => x.pid === d.pid);
@@ -1507,20 +1860,22 @@ const actions = {
   'toggle-lock'() { if (state.game) setLock(!state.game.locked); },
   'toggle-show'() { if (state.game) updateSettings({ showOnDevices: !(state.game.settings && state.game.settings.showOnDevices) }); },
   download() { downloadResults(); },
-  ack() {
+  'copy-results'() { copyResults(); },
+  'share-results'() { shareResults(); },
+  async ack() {
     if (!state.results) { toast('No results file has arrived yet.'); return; }
-    if (!window.confirm('Wipe the game? The server deletes everything about it. Make sure the CSV is saved.')) return;
+    if (!(await confirmBox('Wipe the game?', 'The server deletes everything about it. Make sure the results file is saved first.', 'Wipe the game', { danger: true }))) return;
     send({ t: 'ack_results' });
   },
-  'ack-anyway'() {
-    if (!window.confirm('No results file was received. Wipe the game anyway? The scores will be lost for good.')) return;
+  async 'ack-anyway'() {
+    if (!(await confirmBox('Wipe without the results?', 'No results file was received. The scores will be lost for good.', 'Wipe anyway', { danger: true }))) return;
     send({ t: 'ack_results' });
   },
   'ack-cancelled'() { send({ t: 'ack_results' }); },          // nothing was played, so nothing to confirm
-  leave() {
+  async leave() {
     const g = state.game;
     const r = heldResults(g);
-    if (r && !r.downloaded && !gameWasCancelled(g) && !window.confirm('The results file has not been downloaded, and this page holds the only copy. Leave anyway?')) return;
+    if (r && !r.downloaded && !gameWasCancelled(g) && !(await confirmBox('Leave without the results?', 'The results file has not been downloaded, and this page holds the only copy.', 'Leave anyway', { danger: true }))) return;
     leaveGame();
   },
   'toggle-contrast'() { toggleContrast(); },
@@ -1589,6 +1944,8 @@ document.addEventListener('change', (e) => {
     case 's-earlyClose': state.prefs.settings.earlyClose = !!el.checked; savePrefs(); break;
     case 's-nameMode': if (NAME_MODES.some((m) => m.id === el.value)) { state.prefs.settings.nameMode = el.value; savePrefs(); } break;
     case 's-allowRename': state.prefs.settings.allowRename = !!el.checked; savePrefs(); break;
+    case 's-focusCheck': state.prefs.settings.focusCheck = !!el.checked; savePrefs(); break;
+    case 'g-focusCheck': updateSettings({ focusCheck: !!el.checked }); break;
     case 'g-showOnDevices': updateSettings({ showOnDevices: !!el.checked }); break;
     case 'g-lateJoin': updateSettings({ lateJoin: !!el.checked }); break;
     case 'g-allowRename': updateSettings({ allowRename: !!el.checked }); break;
@@ -1601,52 +1958,83 @@ document.addEventListener('change', (e) => {
   }
 });
 
+// "Open a quiz file (.json)": one quiz, or the array "Export all" makes. A Word or text file picked
+// here goes to the Word/text importer; anything else gets a dialog that says why and what to do (P0-45).
 $('import-file').addEventListener('change', async () => {
   const input = $('import-file');
   const file = input.files && input.files[0];
   input.value = '';
   if (!file) return;
+  const name = String(file.name || 'file');
+  if (IMPORT_FILE_RE.test(name) || /\.doc$/i.test(name)) { importTextFile(file, 'import-text-btn'); return; }
   let data;
-  try { data = JSON.parse(await file.text()); } catch (e) { toast('That file is not valid JSON.'); return; }
+  try { data = JSON.parse(await file.text()); } catch (e) {
+    return jsonImportProblem(`“${name}” is not a quiz file: it could not be read as JSON${/\.json$/i.test(name) ? ' (it may be damaged, or cut short)' : ''}.`);
+  }
   const items = Array.isArray(data) ? data : [data];
-  const added = [];
-  const dropped = { questions: 0, options: 0 };
+  const ready = [];
+  const dropped = { questions: 0, options: 0, timers: 0, points: 0 };
+  let foreign = 0;
   for (const item of items) {
     const n = normaliseQuiz(item);
     if (!n) continue;
-    dropped.questions += n.dropped.questions;
-    dropped.options += n.dropped.options;
-    added.push(makeStored(n, true));                 // a file exists outside the browser, so it counts as exported
+    // Another app's file (for example {question, choices}) passes the shape check but carries no
+    // text this page can read: refuse it instead of importing blank questions (P0-43).
+    if (!n.questions.some((q) => q.text.trim() || q.options.some((o) => o.trim()))) { foreign += 1; continue; }
+    for (const k of Object.keys(dropped)) dropped[k] += n.dropped[k];
+    ready.push(n);
   }
-  if (!added.length) { toast('No quiz found in that file. Expected {"title": "…", "questions": [ … ]}.'); return; }
-  state.quizzes.push(...added);
-  persistQuizzes();
+  if (!ready.length) {
+    return jsonImportProblem(foreign
+      ? `“${name}” is not a HomPub Quiz file: its questions have no text this page can read. If it comes from another quiz app, copy the questions out and use “Paste questions”, or save them in Word and use “Import Word or text”.`
+      : `No quiz found in “${name}”. A HomPub Quiz file has a title and a list of questions, as “Export .json” makes it.`);
+  }
+  const added = [];
+  for (const n of ready) {
+    const q = addQuiz({ title: n.title, questions: n.questions }, { exportedAt: Date.now() });   // a file exists outside the browser
+    if (q) added.push(q);
+  }
+  if (!added.length) return;
   const problems = added.reduce((n, q) => n + validateQuiz(q).length, 0);
-  let msg = `Imported ${added.length === 1 ? '1 quiz' : added.length + ' quizzes'}` + (problems ? ` — ${plural(problems, 'thing')} to fix.` : '.');
+  let msg = `Imported ${plural(added.length, 'quiz', 'quizzes')}` + (problems ? ` — ${plural(problems, 'thing')} to fix.` : '.');
   if (dropped.options || dropped.questions) {
     msg += ` ${plural(dropped.options, 'option')} and ${plural(dropped.questions, 'question')} over the limits (4 per question, 100 per quiz) were dropped — re-check the ticked answers.`;
   }
-  toast(msg, 9000);
+  if (dropped.timers) msg += ` ${plural(dropped.timers, 'timer was', 'timers were')} not an allowed value and became 20 seconds.`;
+  if (dropped.points) msg += ` ${plural(dropped.points, 'points value was', 'points values were')} not 0, 1000 or 2000 and became 1000.`;
+  if (foreign) msg += ` ${plural(foreign, 'entry', 'entries')} without readable questions ${foreign === 1 ? 'was' : 'were'} left out.`;
+  toast(msg, 12000);
   if (added.length === 1) openEditor(added[0].id); else { state.screen = 'home'; render(); }
 });
+
+async function jsonImportProblem(message) {
+  const again = await ask({
+    title: 'Could not open this file', body: [message], cancel: 'close', focus: 'another',
+    buttons: [{ id: 'close', label: 'Close', cls: 'ghost' }, { id: 'paste', label: 'Paste questions' }, { id: 'another', label: 'Choose another file', cls: 'primary' }],
+  });
+  if (again === 'another') $('import-file').click();
+  else if (again === 'paste') actions['paste-open']();
+}
 
 /* ---------- import from Word / text (import-text.js does the parsing) ---------- */
 
 // "Import Word or text": the file is read in this browser by HomPubImport.textFromFile (a .docx is unzipped
 // locally), parsed by parseQuizText, and shown in the preview dialog for the teacher to check before anything
 // is stored. Nothing here can throw out of the handler: every failure becomes a message in the dialog.
-$('import-text-file').addEventListener('change', async () => {
+$('import-text-file').addEventListener('change', () => {
   const input = $('import-text-file');
   const file = input.files && input.files[0];
   input.value = '';
-  if (!file) return;
+  if (file) importTextFile(file, 'import-text-btn');
+});
+async function importTextFile(file, openerId) {
   const name = String(file.name || 'file');
   const imp = { mode: 'preview', source: 'file', sourceName: name, text: '', preview: null, error: null, busy: false };
   const problem = importFileProblem(file);
-  if (problem) { openImporter(Object.assign(imp, { error: problem }), 'import-text-btn'); return; }
+  if (problem) { openImporter(Object.assign(imp, { error: problem }), openerId); return; }
   const api = importApi();
-  if (!api || typeof api.textFromFile !== 'function') { openImporter(Object.assign(imp, { error: IMPORT_HELPER_MISSING }), 'import-text-btn'); return; }
-  openImporter(Object.assign(imp, { busy: true }), 'import-text-btn');
+  if (!api || typeof api.textFromFile !== 'function') { openImporter(Object.assign(imp, { error: IMPORT_HELPER_MISSING }), openerId); return; }
+  openImporter(Object.assign(imp, { busy: true }), openerId);
   let text = '';
   let error = null;
   try { text = String(await api.textFromFile(file)); } catch (e) { error = importReadError(name, e); }
@@ -1656,7 +2044,7 @@ $('import-text-file').addEventListener('change', async () => {
   else Object.assign(imp, runImportParse(text, importTitleFromName(name)));
   render();
   focusImporter();
-});
+}
 
 function importApi() {
   const api = window.HomPubImport;
@@ -1701,14 +2089,19 @@ function shapeImportResult(r, fallbackTitle) {
   const quiz = r && r.quiz && typeof r.quiz === 'object' ? r.quiz : {};
   const rawQuestions = Array.isArray(quiz.questions) ? quiz.questions : [];
   const n = rawQuestions.length ? normaliseQuiz({ title: '', questions: rawQuestions }) : null;
-  const title = String(quiz.title == null ? '' : quiz.title).replace(/\s+/g, ' ').trim().slice(0, LIMITS.title) || fallbackTitle;
+  let title = String(quiz.title == null ? '' : quiz.title).replace(/\s+/g, ' ').trim().slice(0, LIMITS.title) || fallbackTitle;
+  // The Word template's own heading is a placeholder, not a title: ask for one instead (P0-50).
+  if (/question template/i.test(title) || /^template[ -]questions$/i.test(title)) title = '';
   const warnings = (Array.isArray(r && r.warnings) ? r.warnings : [])
     .map((w) => (w && typeof w === 'object'
       ? { question: Number.isInteger(w.question) && w.question > 0 ? w.question : null, message: String(w.message == null ? '' : w.message) }
       : { question: null, message: String(w == null ? '' : w) }))
     .filter((w) => w.message);
   const skipped = r && Number.isFinite(r.skipped) ? Math.max(0, Math.floor(r.skipped)) : 0;
-  return { quiz: { title, questions: n ? n.questions : [] }, warnings, skipped };
+  const blocks = (Array.isArray(r && r.skippedBlocks) ? r.skippedBlocks : [])
+    .filter((b) => b && typeof b === 'object')
+    .map((b) => ({ text: String(b.text == null ? '' : b.text), options: Array.isArray(b.options) ? b.options.map((o) => String(o == null ? '' : o)) : [] }));
+  return { quiz: { title, questions: n ? n.questions : [] }, warnings, skipped, blocks };
 }
 function importToastMessage(count, toFix, warningCount) {
   let msg = `Imported ${plural(count, 'question')}`;
@@ -1751,34 +2144,53 @@ function previewPastedText() {
   render();
   focusImporter();
 }
-// Same path as "Import .json": normaliseQuiz → makeStored → persistQuizzes, then the editor, where any
-// question without a marked answer shows up as "tick the correct option" (normaliseQuiz keeps correct = -1).
+// Same path as "Open a quiz file": normaliseQuiz → the library, then the editor, where any question
+// without a marked answer shows up as "tick the correct option" (normaliseQuiz keeps correct = -1).
+// Blocks the parser skipped come along at the end as questions to finish (P0-44).
 function addImportedQuiz() {
   const imp = state.importer;
   const p = imp && imp.preview;
   if (!p || !p.quiz.questions.length) return;
   const titleEl = $('import-quiz-title');
   const typed = String((titleEl ? titleEl.value : p.quiz.title) || '').replace(/\s+/g, ' ').trim().slice(0, LIMITS.title);
-  const n = normaliseQuiz({ title: typed || p.quiz.title, questions: p.quiz.questions });
+  const room = Math.max(0, LIMITS.questions - p.quiz.questions.length);
+  const extra = (p.blocks || []).slice(0, room).map((b) => ({ text: b.text, options: b.options, correct: -1 }));
+  const n = normaliseQuiz({ title: typed, questions: p.quiz.questions.concat(extra) });
   if (!n) return;
-  const stored = makeStored(n, false);                       // no .json copy exists yet, so the "export a copy" notice stays on
-  state.quizzes.push(stored);
-  persistQuizzes();
+  const stored = addQuiz({ title: n.title, questions: n.questions });
+  if (!stored) return;
   if (imp.source === 'paste') lastPasteText = '';
   state.importer = null;
   openEditor(stored.id);
-  toast(importToastMessage(stored.questions.length, validateQuiz(stored).length, p.warnings.length), 9000);
+  let msg = importToastMessage(stored.questions.length, validateQuiz(stored).length, p.warnings.length);
+  if (extra.length) msg += ` The last ${extra.length === 1 ? 'question was an incomplete block' : plural(extra.length, 'question') + ' were incomplete blocks'}: finish or remove ${extra.length === 1 ? 'it' : 'them'}.`;
+  toast(msg, 12000);
 }
 
+// A quiz with fields this page does not know (a newer version's) is exported exactly as stored.
+function exportBody(q) {
+  const e = lib && lib.get(q.id);
+  return q.readOnly && e ? Object.assign({}, e.body) : cleanQuiz(q);
+}
 function exportQuiz(id) {
   const q = findQuiz(id); if (!q) return;
-  const clean = cleanQuiz(q);
-  const slug = clean.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'quiz';
-  downloadText(JSON.stringify(clean, null, 2), `hompub-quiz-${slug}.json`, 'application/json');
-  q.exportedAt = Date.now();
-  persistQuizzes();
+  const body = exportBody(q);
+  const slug = String(body.title || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'untitled';   // P0-41
+  if (!downloadText(JSON.stringify(body, null, 2), `hompub-quiz-${slug}.json`, 'application/json')) return;
+  if (lib && !q.draft) lib.markExported(id);
   render();
   toast('Exported. Keep that file somewhere safe.');
+}
+// Export all: a plain array of quizzes, which "Open a quiz file" (and the Phase 1 page) can read back.
+function exportAll() {
+  const list = allQuizzes();
+  if (!list.length) { toast('There are no quizzes to export yet.'); return; }
+  const d = new Date();
+  const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+  if (!downloadText(JSON.stringify(list.map(exportBody), null, 2), `hompub-quiz-library-${ymd}.json`, 'application/json')) return;
+  for (const q of list) if (lib) lib.markExported(q.id);
+  render();
+  toast(`Exported ${plural(list.length, 'quiz', 'quizzes')} in one file. “Open a quiz file” reads it back.`, 7000);
 }
 
 /* ---------- network preflight: WebSocket echo ---------- */
@@ -1864,6 +2276,7 @@ async function signIn() {
 }
 
 function afterSignIn() {
+  if (lib) lib.sync();                                       // send what waited for the sign-in, fetch the rest
   if (state.reauth && state.game) {
     state.reauth = false;
     const key = loadHostKey() || { pin: state.game.pin, hostToken: state.game.hostToken || '', title: state.game.title || '' };
@@ -1881,7 +2294,11 @@ function afterSignIn() {
 async function signOut() {
   const g = state.game;
   const r = heldResults(g);
-  if (r && !r.downloaded && !gameWasCancelled(g) && !window.confirm('The results file has not been downloaded, and this page holds the only copy. Sign out anyway?')) return;
+  if (r && !r.downloaded && !gameWasCancelled(g) && !(await confirmBox('Sign out without the results?', 'The results file has not been downloaded, and this page holds the only copy.', 'Sign out anyway', { danger: true }))) return;
+  if (lib && lib.pendingCount()) {
+    await lib.sync(false);                                   // one last try before the cookie goes
+    if (lib.pendingCount() && !(await confirmBox('Some changes are not in your library yet', `${plural(lib.pendingCount(), 'quiz', 'quizzes')} changed on this device could not be saved to your library just now. They stay in this browser and are saved when you sign in here again.`, 'Sign out anyway'))) return;
+  }
   // The cookie is HttpOnly: only the server can clear it, so a failed request means still signed in.
   let ok = false;
   try { ok = (await fetch('/api/session', { method: 'DELETE' })).ok; } catch (e) { ok = false; }
@@ -1892,7 +2309,10 @@ async function signOut() {
   forgetGameScreen();
   state.auth = { status: 'out', shared: false, busy: false, error: '', problem: '', message: '' };
   state.liveRooms = [];
-  toast('Signed out on this device.');
+  // The quizzes are in the library; leave no copy on this computer unless a change is still waiting.
+  const cleared = lib ? lib.clearCache() : true;
+  if (lib) lib.setStatus('signin');
+  toast(cleared ? 'Signed out on this device. Your quizzes stay in your library.' : 'Signed out. Changes not yet saved stay in this browser until you sign in here again.', 6000);
   render();
 }
 function forgetGameScreen() {
@@ -1909,6 +2329,7 @@ function forgetGameScreen() {
 function sessionLost(wasShared) {
   const shared = typeof wasShared === 'boolean' ? wasShared : state.auth.shared;
   state.auth = { status: 'out', shared: false, busy: false, error: '', problem: '', message: '' };
+  if (lib) lib.setStatus('signin');
   if (shared || !state.game) {
     if (state.game) toast('Signed out: this shared computer was not used for a while.', 7000);
     forgetGameScreen();
@@ -1969,7 +2390,7 @@ async function hostQuiz(id) {
   const problems = validateQuiz(q);
   if (problems.length) { state.error = problems[0]; render(); return; }
   if (state.auth.status !== 'in') { state.auth.status = 'out'; render(); focusLater('passcode'); return; }
-  if (loadHostKey() && !window.confirm('Another game is still live from this browser. Starting a new one forgets the old one here (its room times out on the server). Continue?')) return;
+  if (loadHostKey() && !(await confirmBox('Start a new game?', 'Another game is still live from this browser. Starting a new one forgets the old one here; its room times out on the server, and you can still resume it from “Games you started”.', 'Start a new game'))) return;
   const quiz = cleanQuiz(q);
   const settings = prefSettings(state.prefs.settings);
   state.busy = true; state.error = null; render();
@@ -2007,24 +2428,19 @@ function createErrorMessage(status, body) {
   }
 }
 
-// Protocol 2: the host token travels in a first {t:'auth'} frame, not in the URL (PROTOCOL §11). A signed-in
+// The host token travels in a first {t:'auth'} frame, never in the URL (PROTOCOL §11). A signed-in
 // session is also checked by the Worker, so a device without the token (resume elsewhere) gets in too.
-// After a 4001 the URL form is tried once, for a server rolled back to before protocol 2.
-function connectHost(key, keepFallback) {
+function connectHost(key) {
   if (socket) { socket.close(); socket = null; }
-  if (!keepFallback) state.urlTokenTried = false;
   state.game = { pin: key.pin, title: key.title || '', hostToken: key.hostToken };   // minimal until the first sync
   state.closeInfo = null; state.wiped = false; state.busy = false; state.error = null; state.reauth = false;
   state.pending = null; state.storageError = ''; state.panel = null; state.limitedUntil = 0;
   if (state.results && state.results.pin !== key.pin) state.results = null;
   qrCache = null;
-  const urlFor = () => {
-    const tok = state.game && state.game.hostToken;
-    return `${wsBase()}/api/room/${key.pin}/ws?role=host&v=${PROTO}` + (state.urlTokenTried && tok ? `&token=${encodeURIComponent(tok)}` : '');
-  };
+  const urlFor = () => `${wsBase()}/api/room/${key.pin}/ws?role=host&v=${PROTO}`;
   const onOpen = (sendRaw) => {
     const tok = state.game && state.game.hostToken;
-    if (tok && !state.urlTokenTried) sendRaw({ t: 'auth', token: tok });
+    if (tok) sendRaw({ t: 'auth', token: tok });
   };
   socket = createSocket({ urlFor, onOpen, onFrame: applyFrame, onStatus: setConn, onClose: onSocketClosed, onFail: onHandshakeFail });
   requestWakeLock();
@@ -2094,15 +2510,19 @@ function applyFrame(f) {
       if (snap.question && !snap.tally) snap.tally = emptyTally(snap.question.optionCount, snap.playerCount);
       if (!Array.isArray(snap.roster)) snap.roster = [];
       if (!g || g.phase !== snap.phase || g.q !== snap.q) markPhase();
+      snap.focusMap = new Map();
+      if (Array.isArray(snap.focus)) for (const r of snap.focus) if (r && typeof r.pid === 'string') snap.focusMap.set(`${r.pid}|${r.q}`, r);
+      delete snap.focus;
       state.game = snap;
-      state.serverNote = typeof f.proto !== 'number' ? 'old' : (f.proto > PROTO ? 'new' : '');
+      state.serverProto = typeof f.proto === 'number' ? f.proto : 1;
+      state.serverNote = state.serverProto < PROTO ? 'old' : (state.serverProto > PROTO ? 'new' : '');
       if (snap.hostToken) state.keyNotSaved = !saveHostKey({ pin: snap.pin, hostToken: snap.hostToken, title: snap.title });
       if (snap.expiry && snap.expiry.warnAt) wakeAt(snap.expiry.warnAt);
       break;
     }
-    case 'roster':                                           // a server from before protocol 2
-      g.roster = Array.isArray(f.players) ? f.players : [];
-      if (typeof f.playerCount === 'number') g.playerCount = f.playerCount;
+    case 'focus':                                            // Focus check records that changed (PROTOCOL §13)
+      if (!g.focusMap) g.focusMap = new Map();
+      if (Array.isArray(f.records)) for (const r of f.records) if (r && typeof r.pid === 'string') g.focusMap.set(`${r.pid}|${r.q}`, r);
       refresh();
       return;
     case 'player_joined':
@@ -2138,6 +2558,8 @@ function applyFrame(f) {
       g.phase = 'intro';
       g.question = f.question || null;
       if (g.question) { g.q = g.question.q; if (g.question.total) g.total = g.question.total; }
+      // The server checks a question opened while Focus check is on (it cannot change mid-question).
+      if (g.question && focusOn(g)) g.focusQs = (Array.isArray(g.focusQs) ? g.focusQs : []).concat(g.q);
       g.reveal = null;
       g.tally = emptyTally(g.question ? g.question.optionCount : 0, g.playerCount);
       break;
@@ -2177,10 +2599,12 @@ function applyFrame(f) {
       if (typeof f.csv === 'string') {
         const held = heldResults(g);
         if (!held || held.csv !== f.csv) {
-          state.results = { pin: g.pin, csv: f.csv, filename: safeFilename(f.filename, g.pin), downloaded: false };
+          // Already downloaded by this browser (the page was reopened after Game over): do not drop another copy (P0-70).
+          const before = loadJSON(KEYS.downloaded + g.pin, null) === textSig(f.csv);
+          state.results = { pin: g.pin, csv: f.csv, filename: safeFilename(f.filename, g.pin), downloaded: before, before };
           // `update`: a player was renamed after End. Keep the new file without dropping another download.
           if (f.update === true) toast('The results file now has the new name. Download it again to keep this version.', 7000);
-          else if (!gameWasCancelled(g)) downloadResults();  // "Download the results" stays available either way
+          else if (!before && !gameWasCancelled(g)) downloadResults();  // "Download the results" stays available either way
         }
       }
       break;
@@ -2231,11 +2655,6 @@ function onSocketClosed(code, reason, willRetry) {
     recheckAfter4011(state.auth.shared);                     // checkSession() resets state.auth.shared
     return;
   }
-  if (code === 4001 && !state.urlTokenTried && g && g.hostToken) {
-    state.urlTokenTried = true;                              // an older server: try the token in the URL once
-    connectHost({ pin: g.pin, hostToken: g.hostToken, title: g.title || '' }, true);
-    return;
-  }
   // This game's host key cannot work any more (the stored key may belong to another live game).
   if ((code === 4004 || code === 4001) && g) { const k = loadHostKey(); if (k && k.pin === g.pin) removeKey(KEYS.host); }
   if (code === 4004 && state.autoResume && g && !g.phase) {
@@ -2271,6 +2690,7 @@ function recheckAfter4011(wasShared) {
 function finishWipe() {
   state.wiped = true;
   removeKey(KEYS.host);
+  if (state.game && state.game.pin) removeKey(KEYS.downloaded + state.game.pin);
   if (socket) { socket.close(); socket = null; }
   releaseWakeLock();
   setConn('idle');
@@ -2279,6 +2699,7 @@ function finishWipe() {
 
 function leaveGame() {
   if (socket) { socket.close(); socket = null; }
+  releaseUrls();
   state.game = null; state.closeInfo = null; state.wiped = false; state.results = null;
   state.reauth = false; state.panel = null; state.pending = null; state.autoResume = false; state.storageError = '';
   state.limitedUntil = 0;
@@ -2296,8 +2717,18 @@ function downloadResults() {
   const r = state.results; if (!r) return;
   // A UTF-8 BOM makes Excel open accented nicknames correctly; it changes nothing for other tools.
   const csv = r.csv.charCodeAt(0) === 0xFEFF ? r.csv : '﻿' + r.csv;
-  if (downloadText(csv, r.filename, 'text/csv;charset=utf-8')) r.downloaded = true;   // "started", the page cannot see more
+  if (downloadText(csv, r.filename, 'text/csv;charset=utf-8')) {
+    r.downloaded = true;                                     // "started", the page cannot see more
+    r.before = false;
+    saveJSON(KEYS.downloaded + r.pin, textSig(r.csv));       // cleared when the game is wiped
+  }
   render();
+}
+// A short fingerprint of a text (not for security): has this exact results file been downloaded here?
+function textSig(t) {
+  let a = 5381, b = 52711;
+  for (let i = 0; i < t.length; i++) { const c = t.charCodeAt(i); a = (a * 33) ^ c; b = (b * 33) ^ c; }
+  return t.length + ':' + (a >>> 0).toString(36) + (b >>> 0).toString(36);
 }
 
 /* ======================================================================
@@ -2486,11 +2917,11 @@ function toggleFullscreen() {
       (doc.exitFullscreen || doc.webkitExitFullscreen).call(doc);
     } else if (root.requestFullscreen) {
       const p = root.requestFullscreen();
-      if (p && p.catch) p.catch(() => toast('Fullscreen is not available here. Try the browser’s own fullscreen (F11).'));
+      if (p && p.catch) p.catch(() => toast(touchScreen ? 'Fullscreen is not available here.' : 'Fullscreen is not available here. Try the browser’s own fullscreen (F11).'));
     } else if (root.webkitRequestFullscreen) {
       root.webkitRequestFullscreen();
     } else {
-      toast('Fullscreen is not available in this browser. Try the browser’s own fullscreen (F11).');
+      toast(touchScreen ? 'Fullscreen is not available in this browser.' : 'Fullscreen is not available in this browser. Try the browser’s own fullscreen (F11).');
     }
   } catch (e) { toast('Fullscreen is not available here.'); }
 }
@@ -2508,14 +2939,221 @@ function applyContrast() {
 }
 function toggleContrast() { state.prefs.highContrast = !state.prefs.highContrast; savePrefs(); applyContrast(); }
 
-function toast(message, ms) {
+// act: {label, action, data} adds a button (for example Undo) that runs that data-action.
+function toast(message, ms, act) {
   const el = $('toast'); if (!el) return;
-  el.textContent = message;
+  el.replaceChildren(h('span', null, message));
+  if (act) {
+    const b = h('button', { type: 'button', class: 'btn small', 'data-action': act.action }, act.label);
+    for (const k of Object.keys(act.data || {})) b.dataset[k] = act.data[k];
+    el.appendChild(b);
+  }
   el.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), ms || 4500);
+  toastTimer = setTimeout(hideToast, ms || 4500);
+}
+function hideToast() { const el = $('toast'); if (el) el.classList.remove('show'); }
+
+// Changes a screen reader should hear that are not a new screen: a moved question, a count (P0-37).
+function announce(text) {
+  const el = $('announce'); if (!el) return;
+  el.textContent = '';
+  setTimeout(() => { el.textContent = text; }, 50);
 }
 
+/* ---------- dialogs: one accessible <dialog> outside #app, so a re-render never closes it ---------- */
+
+let askOpen = null;
+// ask({title, body: string | Node | array, buttons: [{id, label, cls}], cancel, focus}) → Promise<button id>.
+// Escape gives `cancel`. Focus starts on the button `focus` names (else the first) and returns to the opener.
+function ask(o) {
+  if (askOpen) askOpen('__replaced');
+  return new Promise((resolve) => {
+    const opener = document.activeElement;
+    const dlg = h('dialog', { class: 'ask', 'aria-labelledby': 'ask-title', 'aria-describedby': 'ask-body' });
+    let done = false;
+    const finish = (val) => {
+      if (done) return;
+      done = true;
+      askOpen = null;
+      try { dlg.close(); } catch (e) { /* not open */ }
+      dlg.remove();
+      if (val !== '__replaced' && opener && opener.isConnected) { try { opener.focus({ preventScroll: true }); } catch (e) { /* ignore */ } }
+      resolve(val === '__replaced' ? o.cancel : val);
+    };
+    dlg.addEventListener('cancel', (e) => { e.preventDefault(); finish(o.cancel); });
+    const parts = (Array.isArray(o.body) ? o.body : [o.body]).filter(Boolean).map((t) => (typeof t === 'string' ? h('p', null, t) : t));
+    const row = h('div', { class: 'btn-row end' });
+    for (const b of o.buttons) {
+      const el = h('button', { type: 'button', class: 'btn ' + (b.cls || ''), 'data-ask': b.id }, b.label);
+      el.addEventListener('click', () => finish(b.id));
+      row.appendChild(el);
+    }
+    dlg.appendChild(h('div', { class: 'card ask-panel' }, h('h2', { id: 'ask-title' }, o.title), h('div', { class: 'ask-body', id: 'ask-body' }, parts), row));
+    document.body.appendChild(dlg);
+    askOpen = finish;
+    try { dlg.showModal(); } catch (e) { dlg.setAttribute('open', ''); }
+    const first = (o.focus && row.querySelector(`[data-ask="${o.focus}"]`)) || row.querySelector('button');
+    if (first) first.focus();
+  });
+}
+// A yes/no question. Dangerous actions start with focus on Cancel, so Enter does not do the damage.
+function confirmBox(title, body, okLabel, opts) {
+  const o = opts || {};
+  return ask({
+    title, body, cancel: 'cancel', focus: o.danger ? 'cancel' : 'ok',
+    buttons: [{ id: 'cancel', label: o.cancelLabel || 'Cancel', cls: 'ghost' }, { id: 'ok', label: okLabel, cls: o.danger ? 'danger' : 'primary' }],
+  }).then((v) => v === 'ok');
+}
+
+/* ---------- the quiz library on screen: status, conflicts, backups ---------- */
+
+function syncStatusText() {
+  if (!lib) return 'The quiz library did not load. Reload the page; nothing can be saved until then.';
+  const local = lib.storageBlocked() ? 'Not saved on this device (this browser blocks storage)' : 'Saved on this device';
+  const waiting = lib.pendingCount();
+  switch (lib.status()) {
+    case 'synced': return waiting ? `${local} · saving to your library…` : 'Saved to your library';
+    case 'saving': return `${local} · saving to your library…`;
+    case 'conflict': return `${local} · a quiz needs your choice`;
+    case 'signin': return `${local} · sign in to save it to your library`;
+    case 'offline': return `${local} · offline: it is saved to your library when the connection is back`;
+    case 'unavailable': return `${local} · the library cannot be reached just now; it will try again`;
+    case 'full': return `${local} · your library is full (500 quizzes). Delete some, or empty the Trash`;
+    case 'old-server': return `${local} · this server has no quiz library (it runs an older version)`;
+    default: return state.auth.status === 'in' ? `${local} · saving to your library…` : `${local} · sign in to save it to your library`;
+  }
+}
+function syncStatusKind() {
+  if (!lib || lib.storageBlocked()) return 'bad';
+  const st = lib.status();
+  if (st === 'synced' && !lib.pendingCount()) return 'ok';
+  if (st === 'conflict' || st === 'full' || st === 'old-server') return 'warn';
+  return 'pending';
+}
+function renderSyncStatus(id) {
+  return h('p', { class: 'sync-status', id: id || 'sync-status', 'data-kind': syncStatusKind(), role: 'status' }, syncStatusText());
+}
+
+// The library changed (a sync finished, another device's edit arrived, a choice is needed).
+function libChanged() {
+  if (typeof state === 'undefined') return;
+  state.storageBlocked = !!(lib && lib.storageBlocked());
+  if (isLive() || state.game) return;                         // the projector shows the game, not the library
+  const phase = currentPhase();
+  if (phase === 'editor') {
+    // Never rebuild the form under the teacher's fingers: only the status lines change, unless the quiz went away.
+    if (!findQuiz(state.editorId)) { state.screen = 'home'; scheduleRender(); }
+    else refreshEditorStatus(findQuiz(state.editorId));
+  } else if (!state.importer) scheduleRender();
+  maybeAskConflict();
+}
+
+// One choice at a time, never over a live game, never over the import dialog.
+let conflictAsking = false;
+async function maybeAskConflict() {
+  if (!lib || conflictAsking || state.game || state.importer) return;
+  const c = lib.conflicts()[0];
+  if (!c) return;
+  conflictAsking = true;
+  const mineTitle = (c.mine && c.mine.title) || 'Untitled quiz';
+  const theirTitle = c.server && c.server.body ? c.server.body.title || 'Untitled quiz' : '';
+  const when = c.server && c.server.updatedAt ? fmtDate(c.server.updatedAt) : '';
+  const copies = (labelMine, labelTheirs) => h('ul', { class: 'problems' },
+    h('li', null, labelMine, ': “', mineTitle, '”', c.mine ? ` (${plural((c.mine.questions || []).length, 'question')})` : ''),
+    c.server ? h('li', null, labelTheirs, ': “', theirTitle, '”', c.server.body ? ` (${plural((c.server.body.questions || []).length, 'question')})` : '', when ? `, saved ${when}` : '') : null);
+  let o;
+  switch (c.kind) {
+    case 'gone': o = { title: 'This quiz was deleted on another device', body: [`“${mineTitle}” was deleted for good elsewhere, but this browser has changes to it that were never saved.`],
+      buttons: [{ id: 'theirs', label: 'Let it go', cls: 'ghost' }, { id: 'mine', label: 'Keep my copy', cls: 'primary' }] }; break;
+    case 'deleted': o = { title: 'This quiz was moved to the Trash on another device', body: ['This browser has changes to it that were not saved yet.', copies('This browser', 'Other device')],
+      buttons: [{ id: 'theirs', label: 'Leave it in the Trash', cls: 'ghost' }, { id: 'copy', label: 'Save mine as a copy' }, { id: 'mine', label: 'Keep mine', cls: 'primary' }] }; break;
+    case 'edited': o = { title: 'Delete a quiz that changed elsewhere?', body: ['You deleted this quiz here, but it was changed on another device meanwhile.', copies('Deleted here', 'Changed version')],
+      buttons: [{ id: 'theirs', label: 'Keep the changed version', cls: 'primary' }, { id: 'mine', label: 'Delete it anyway', cls: 'danger' }] }; break;
+    case 'newer': o = { title: 'Saved by a newer version of HomPub Quiz', body: ['Another device saved this quiz with a newer version of the page. This page cannot save over it.', copies('This browser', 'Newer version')],
+      buttons: [{ id: 'theirs', label: 'Use the newer version', cls: 'primary' }, { id: 'copy', label: 'Save mine as a copy' }] }; break;
+    case 'migrate': o = { title: 'Two versions of one quiz', body: ['This browser’s old quiz list has a different version of a quiz that is already in your library.', h('ul', { class: 'problems' }, h('li', null, 'In your library: “', (lib.get(c.id) && lib.get(c.id).body.title) || 'Untitled quiz', '”'), h('li', null, 'In this browser’s old list: “', mineTitle, '”'))],
+      buttons: [{ id: 'theirs', label: 'Keep the library’s', cls: 'ghost' }, { id: 'copy', label: 'Add the old one as a copy', cls: 'primary' }, { id: 'mine', label: 'Replace with the old one' }] }; break;
+    default: o = { title: 'This quiz was changed on another device', body: ['Both this browser and another device changed it. Nothing is overwritten until you choose.', copies('This browser', 'Other device')],
+      buttons: [{ id: 'theirs', label: 'Use theirs', cls: 'ghost' }, { id: 'copy', label: 'Save mine as a copy' }, { id: 'mine', label: 'Keep mine', cls: 'primary' }] };
+  }
+  const choice = await ask(Object.assign(o, { cancel: null }));
+  conflictAsking = false;
+  if (choice) {
+    const copy = lib.resolve(c.id, choice);
+    if (copy) toast(`Saved as “${copy.body.title}”.`);
+    lib.sync(false);
+    render();
+    setTimeout(maybeAskConflict, 0);
+  }
+}
+
+// The home screen's banners for library events: a restore from backup, damaged data set aside, the move from the old list.
+function renderLibNotices() {
+  if (!lib) return h('div', { class: 'notice bad', role: 'alert' }, 'The quiz library (library.js) did not load. Reload the page; nothing can be saved until then.');
+  const out = [];
+  lib.notices().forEach((n, i) => {
+    const dismiss = h('button', { type: 'button', class: 'link-btn', 'data-action': 'notice-dismiss', 'data-i': i }, 'Dismiss');
+    if (n.kind === 'restored') {
+      out.push(h('div', { class: 'notice', role: 'status' },
+        h('b', null, 'Your quiz library was restored from a backup'),
+        h('p', { class: 'fine' }, `This page’s copies from before (${plural(n.count, 'quiz', 'quizzes')}) are kept in this browser, in case you need something from them. The list below is the restored library.`),
+        h('div', { class: 'btn-row' }, btn('Download the copies from before (.json)', 'backup-download', { attrs: { 'data-key': n.key } }), dismiss)));
+    } else if (n.kind === 'damaged' || n.kind === 'damaged-old') {
+      out.push(h('div', { class: 'notice bad', role: 'alert' },
+        h('b', null, 'Some saved data in this browser could not be read'),
+        h('p', { class: 'fine' }, 'It was set aside, not deleted, and the rest loaded normally. Download it if you are missing a quiz; it may need fixing by hand.'),
+        h('div', { class: 'btn-row' }, btn('Download what could not be read', 'backup-download', { attrs: { 'data-key': n.key } }), dismiss)));
+    } else if (n.kind === 'migrated') {
+      out.push(h('div', { class: 'notice', role: 'status' },
+        h('b', null, `${plural(n.added, 'quiz', 'quizzes')} from this browser added to your library`),
+        h('p', { class: 'fine' }, n.added ? 'They were saved only in this browser before; now they are in your library, on every device you sign in on. The old copy in this browser is left as it was.' : '',
+          n.same ? ` ${plural(n.same, 'quiz', 'quizzes')} ${n.same === 1 ? 'was' : 'were'} already there.` : '',
+          n.conflicts ? ` ${plural(n.conflicts, 'quiz', 'quizzes')} had a different version in your library; you choose which to keep.` : ''),
+        h('div', { class: 'btn-row' }, dismiss)));
+    }
+  });
+  if (lib.storageBlocked()) {
+    out.push(h('div', { class: 'notice bad', role: 'alert' },
+      h('b', null, 'This browser is blocking storage'),
+      h('p', { class: 'fine' }, state.auth.status === 'in'
+        ? 'Your edits are sent to your library, but nothing is kept in this browser. Do not close this tab until the status says “Saved to your library”.'
+        : 'Nothing you change is kept in this browser, and you are not signed in, so closing this tab loses it. Sign in, or export your quizzes.'),
+      h('div', { class: 'btn-row' }, btn('Export all (.json)', 'export-all'))));
+  }
+  return out.length ? out : null;
+}
+
+function downloadBackup(key) {
+  if (!lib || typeof key !== 'string') return;
+  const v = lib.readBackup(key);
+  let text;
+  if (v && Array.isArray(v.entries)) text = JSON.stringify(v.entries.map((e) => Object.assign({ title: '', questions: [] }, e.body)), null, 2);
+  else text = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+  downloadText(text || '', 'hompub-quiz-backup-' + key.replace(/[^0-9a-z-]+/gi, '-').replace(/^-+|-+$/g, '').slice(-40) + '.json', 'application/json');
+}
+
+/* ---------- results: copy and share where downloads do not work (P0-71) ---------- */
+
+async function copyResults() {
+  const r = state.results; if (!r) return;
+  try { await navigator.clipboard.writeText(r.csv); toast('Results copied. Paste them into a spreadsheet or a note.'); }
+  catch (e) { toast('This browser does not allow copying here. Use Download or Share.'); }
+}
+async function shareResults() {
+  const r = state.results; if (!r) return;
+  try {
+    const file = new File(['\ufeff' + r.csv], r.filename, { type: 'text/csv' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) await navigator.share({ files: [file], title: r.filename });
+    else if (navigator.share) await navigator.share({ title: r.filename, text: r.csv });
+    else { toast('Sharing is not available here. Use Download or Copy.'); return; }
+  } catch (e) { if (e && e.name !== 'AbortError') toast('Sharing did not work here. Use Download or Copy.'); }
+}
+function canShare() { return typeof navigator.share === 'function'; }
+const touchScreen = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+
+const heldUrls = [];
+function releaseUrls() { while (heldUrls.length) { try { URL.revokeObjectURL(heldUrls.pop()); } catch (e) { /* ignore */ } } }
 // Returns true when the download was handed to the browser; whether it saved the file is invisible here.
 function downloadText(text, filename, type) {
   try {
@@ -2525,7 +3163,8 @@ function downloadText(text, filename, type) {
     document.body.appendChild(a);
     a.click();
     a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    // Kept until the page leaves the game: some phone browsers read the file long after the click (P0-71).
+    heldUrls.push(url);
     return true;
   } catch (e) { toast('The download could not start. Use the download button.'); return false; }
 }
@@ -2542,6 +3181,7 @@ function primaryAction(phase) {
 }
 document.addEventListener('keydown', (e) => {
   if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
+  if (askOpen) return;                                         // a question dialog is in front
   if (e.key === 'Escape' && state.importer) { e.preventDefault(); closeImporter(); return; }
   const t = e.target && typeof e.target.closest === 'function' ? e.target : null;
   if (t && (t.closest('input, textarea, select') || t.isContentEditable)) return;   // typing
@@ -2568,7 +3208,9 @@ document.addEventListener('keydown', (e) => {
 });
 
 window.addEventListener('beforeunload', (e) => {
-  if (isLive()) { e.preventDefault(); e.returnValue = ''; }   // browsers show their own generic warning
+  // Live game, or edits that exist only in this tab's memory (storage blocked, not yet in the library) (P0-34).
+  const unsaved = !!(lib && lib.storageBlocked() && lib.pendingCount());
+  if (isLive() || unsaved) { e.preventDefault(); e.returnValue = ''; }   // browsers show their own generic warning
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
@@ -2576,24 +3218,36 @@ document.addEventListener('visibilitychange', () => {
   if (isLive()) requestWakeLock();
   renderPill();
 });
-window.addEventListener('online', () => { if (socket) socket.nudge(); renderPill(); retrySessionCheck(); });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') retrySessionCheck(); });
+window.addEventListener('online', () => { if (socket) socket.nudge(); renderPill(); if (currentPhase() === 'open') scheduleRender(); retrySessionCheck(); syncLibrary(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { retrySessionCheck(); syncLibrary(); } });
 for (const type of ['keydown', 'pointerdown']) document.addEventListener(type, () => { usedSinceCheck = true; }, { capture: true, passive: true });
-window.addEventListener('offline', renderPill);
+window.addEventListener('offline', () => { renderPill(); if (currentPhase() === 'open') scheduleRender(); });
 document.addEventListener('fullscreenchange', onFullscreenChange);
 document.addEventListener('webkitfullscreenchange', onFullscreenChange);
-window.addEventListener('storage', (e) => {                  // another tab changed the quiz list
-  if (e.key === KEYS.quizzes && state.screen === 'home' && !state.game) { state.quizzes = loadQuizzes(); render(); }
+// Another tab changed a quiz (each quiz is its own key, so nothing is overwritten wholesale: P0-32).
+window.addEventListener('storage', (e) => {
+  if (!lib || (e.key && !e.key.startsWith('hompub-quiz:lib:'))) return;
+  if (!lib.onStorage(e.key)) return;
+  const editing = currentPhase() === 'editor' && e.key === 'hompub-quiz:lib:q:' + state.editorId;
+  if (editing && document.activeElement && document.activeElement.closest && document.activeElement.closest('#app')) {
+    render();                                                  // render() hands focus back to the same field
+    toast('This quiz was changed in another tab; the editor shows that version.');
+  } else libChanged();
 });
 
+function syncLibrary() { if (lib && state.auth.status === 'in' && document.visibilityState === 'visible') lib.sync(); }
+
 /* ---------- init ---------- */
-state.quizzes = loadQuizzes();
 applyContrast();
 render();
+// Quizzes saved by the Phase 1 page (one list in this browser) join the library once (PROTOCOL §12).
+if (lib) lib.migrateOld().then(() => { if (!state.game) render(); }).catch(() => { /* the old list stays as it is */ });
 // After a refresh mid-game, go straight back to the stage (P0-53); the connecting screen offers "Not now".
 function sessionReady() {
   const key = loadHostKey();
+  if (state.auth.status === 'out' && lib) lib.setStatus('signin');
   if (state.auth.status === 'in') {
+    syncLibrary();
     loadLiveRooms();
     if (key && !state.game) { state.autoResume = true; connectHost(key); return; }
   }
@@ -2601,5 +3255,6 @@ function sessionReady() {
 }
 checkSession().then(sessionReady);
 setInterval(keepSessionAlive, SESSION_CHECK_MS);
+setInterval(syncLibrary, SYNC_EVERY_MS);
 
 })();

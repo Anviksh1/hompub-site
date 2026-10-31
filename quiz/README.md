@@ -567,10 +567,16 @@ Answer: A
   - a line after the options: `Answer: B`, `Ans: b`, `Correct: B`, `Key: B`, or
     the option's text, `Answer: Mitochondrion` (case and punctuation do not matter).
 
-  **Bold does not count** — bold is invisible once the text is extracted, so a
-  question whose answer is only marked in bold comes through with no answer
-  marked. That is not fatal: the preview lists it, the question is still
-  imported, and the editor asks you to tick the correct option before hosting.
+  - **in a Word file (.docx) only:** the one option that is **bold**,
+    underlined or highlighted while the others are not. If every option is
+    bold (or none is), nothing is marked. Check the ticks in the preview: bold
+    used just for emphasis gives a wrong tick.
+
+  **Pasted text loses formatting**, so in “Paste questions” bold, underlining
+  and highlighting cannot mark the answer: use `*` or an `Answer:` line. A
+  question with no answer marked is not fatal: the preview lists it, the
+  question is still imported, and the editor asks you to tick the correct
+  option before hosting.
 - **Time limit.** `(30s)` at the end of the question line, or a line `Time: 30`,
   `Timer: 30 s` or `30 seconds` after the options. Snapped to the nearest
   allowed value: 5, 10, 15, 20, 30, 60, 90, 120 or 240 seconds. Default 20.

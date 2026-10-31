@@ -137,6 +137,7 @@ const MSG = {
   conflict: 'This quiz was changed on another device.',
   gone: 'This quiz was deleted on another device and is no longer in the Trash.',
   newer: 'This quiz was saved by a newer version of HomPub Quiz. Reload the page to edit it.',
+  generation: 'The quiz library was restored from a backup. This page will reload it before saving.',
   full: `The library is full (${LIBRARY.maxLive} quizzes, or ${LIBRARY.maxRows} counting the Trash). Delete some quizzes, or empty the Trash, first.`,
 } as const;
 
@@ -204,9 +205,19 @@ export async function handleLibrary(request: Request, url: URL, db: D1Database, 
   if (!m || !QUIZ_ID_RE.test(m[1])) return { status: 404, body: { error: 'not_found' } };
   const id = m[1];
 
+  // A change made from a copy older than a restore from backup must not be applied over it:
+  // pages send the generation they know with every change (PROTOCOL.md §12).
+  const stale = async (claimed: unknown): Promise<LibraryReply | null> => {
+    if (claimed === undefined || claimed === null || claimed === '') return null;
+    const g = await gen();
+    return Number(claimed) === g ? null : { status: 409, body: { generation: g, error: 'generation_changed', message: MSG.generation } };
+  };
+
   // POST /api/library/quizzes/:id/restore: take a quiz out of the Trash.
   if (m[2]) {
     if (request.method !== 'POST') return { status: 405, body: { error: 'method_not_allowed' } };
+    const old = await stale(url.searchParams.get('generation'));
+    if (old) return old;
     const res = await db.prepare(
       `UPDATE quizzes SET deleted_at = NULL, version = version + 1
          WHERE library_id = ?1 AND id = ?2 AND deleted_at IS NOT NULL
@@ -228,6 +239,8 @@ export async function handleLibrary(request: Request, url: URL, db: D1Database, 
     if (base === null) return { status: 400, body: { error: 'bad_base_version', message: 'baseVersion must be a whole number (0 to create).' } };
     const checked = checkLibraryBody(parsed.quiz);
     if (!checked.ok) return { status: 400, body: { error: 'invalid_quiz', message: checked.error } };
+    const old = await stale(parsed.generation);
+    if (old) return old;
     const b = checked.value;
     const hash = await contentHash(b.text);
 
@@ -267,8 +280,15 @@ export async function handleLibrary(request: Request, url: URL, db: D1Database, 
   // DELETE /api/library/quizzes/:id?baseVersion=n moves a quiz to the Trash;
   // ?forever=1 removes one that is already there.
   if (request.method === 'DELETE') {
+    const old = await stale(url.searchParams.get('generation'));
+    if (old) return old;
     if (url.searchParams.get('forever') === '1') {
-      await db.prepare('DELETE FROM quizzes WHERE library_id = ?1 AND id = ?2 AND deleted_at IS NOT NULL').bind(lib, id).run();
+      const res = await db.prepare('DELETE FROM quizzes WHERE library_id = ?1 AND id = ?2 AND deleted_at IS NOT NULL').bind(lib, id).run();
+      if (!res.meta.changes) {
+        const r = await row(db, lib, id);
+        // Still live: deleting for good is for the Trash only, so a page can never lose a quiz it thought was binned.
+        if (r) return { status: 409, body: { generation: await gen(), error: 'not_in_trash', message: 'Move the quiz to the Trash first.', server: meta(r) } };
+      }
       return { status: 200, body: { generation: await gen() } };
     }
     const base = parseBaseVersion(url.searchParams.get('baseVersion'));

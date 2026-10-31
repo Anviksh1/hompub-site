@@ -7,7 +7,7 @@
   window.HomPubImport (and module.exports when `module` exists, so node --test
   can load it) with:
 
-    parseQuizText(text, { title })  -> { quiz, warnings, skipped }
+    parseQuizText(text, { title })  -> { quiz, warnings, skipped, skippedBlocks }
     docxToText(arrayBuffer)         -> Promise<string>   (reads the .docx ZIP itself, no library)
     textFromFile(file)              -> Promise<string>   (browser only: File/Blob -> text)
 
@@ -314,6 +314,9 @@ function parseQuizText(text, options) {
   const warnings = [];
   const kept = [];
   let skipped = 0, overflow = 0;
+  // Blocks too incomplete to be questions (fewer than 2 options), kept so the host page can add them
+  // as questions to finish instead of letting them vanish after "Add" (P0-44).
+  const skippedBlocks = [];
   const warn = (question, message) => { warnings.push({ question, message }); };
 
   let items = String(text == null ? '' : text).split(/\r\n|\r|\n/).map(classify).filter((it) => it.kind !== 'comment');
@@ -403,6 +406,7 @@ function parseQuizText(text, options) {
     if (q.options.length < LIMITS.minOptions) {
       skipped++;
       warn(null, `Skipped ${label}: a question needs at least 2 options (found ${q.options.length}).`);
+      if (text || q.options.length) skippedBlocks.push({ text: cut(text, LIMITS.text), options: q.options.map((o) => cut(o.text, LIMITS.option)) });
       return;
     }
     if (kept.length >= LIMITS.questions) { overflow++; return; }
@@ -493,7 +497,7 @@ function parseQuizText(text, options) {
   title = clean(title) || fallbackTitle;
   if (title.length > LIMITS.title) { title = cut(title, LIMITS.title); warn(null, `Title shortened to ${LIMITS.title} characters.`); }
   if (!kept.length) warn(null, items.some((it) => it.kind !== 'blank') ? 'No questions were found in this text.' : 'The text is empty — nothing to import.');
-  return { quiz: { title, questions: kept }, warnings, skipped };
+  return { quiz: { title, questions: kept }, warnings, skipped, skippedBlocks };
 }
 
 /* ===================================================================== 4. .docx -> text */

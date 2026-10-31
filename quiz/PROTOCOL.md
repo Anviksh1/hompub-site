@@ -451,10 +451,16 @@ keeps the change and retries.
 |---|---|
 | `GET /api/library` | `200 {generation, quizzes:[Meta], trash:[Meta], limits:{maxLive, maxRows, trashDays}}`, newest first. Quizzes deleted more than 30 days ago are purged first. |
 | `GET /api/library/quizzes?ids=a,b,…` | `200 {generation, quizzes:[Meta + body]}`, at most 50 ids (`400 bad_ids` otherwise). Unknown ids are left out. |
-| `PUT /api/library/quizzes/:id` body `{baseVersion, quiz}` | `baseVersion` 0 creates, otherwise it must be the version the change was made from. `200 {generation, quiz: Meta}`. `409 {error:"conflict", message, server: Meta + body}` when the server's version differs (another device saved first); `409 {error:"gone", server:null}` when the quiz was deleted for good; `409 {error:"newer_schema", server}` when the stored quiz has a newer `schema` (never lowered); `422 {error:"library_full"}`; `413` over 200 KB; `400 invalid_quiz` / `bad_base_version`. Saving unchanged content is not a write (the version stays). Saving a quiz that is in the Trash takes it out. |
-| `DELETE /api/library/quizzes/:id?baseVersion=n` | Moves it to the Trash (version + 1). `409 conflict` with the server copy if `n` is not current. Deleting again is harmless. |
-| `DELETE /api/library/quizzes/:id?forever=1` | Removes a quiz that is in the Trash. |
+| `PUT /api/library/quizzes/:id` body `{baseVersion, generation, quiz}` | `baseVersion` 0 creates, otherwise it must be the version the change was made from. `200 {generation, quiz: Meta}`. `409 {error:"conflict", message, server: Meta + body}` when the server's version differs (another device saved first); `409 {error:"gone", server:null}` when the quiz was deleted for good; `409 {error:"newer_schema", server}` when the stored quiz has a newer `schema` (never lowered); `422 {error:"library_full"}`; `413` over 200 KB; `400 invalid_quiz` / `bad_base_version`. Saving unchanged content is not a write (the version stays). Saving a quiz that is in the Trash takes it out. |
+| `DELETE /api/library/quizzes/:id?baseVersion=n&generation=g` | Moves it to the Trash (version + 1). `409 conflict` with the server copy if `n` is not current. Deleting again is harmless. |
+| `DELETE /api/library/quizzes/:id?forever=1` | Removes a quiz that is in the Trash; `409 not_in_trash` if it is not (move it to the Trash first). Already gone: `200`. |
 | `POST /api/library/quizzes/:id/restore` | Takes it out of the Trash (version + 1); `422 library_full` if there is no room. |
+
+Every change (PUT, DELETE, restore) also names the `generation` the page's copy
+is from (body field or query parameter; optional, but the host page always
+sends it once it knows it). A different generation is refused with
+`409 {error:"generation_changed", generation}`, so an edit made before a
+restore from backup can never land on the restored library.
 
 `Meta = {id, title, schema, questions, version, hash, updatedAt, deletedAt}`.
 `id` matches `^[A-Za-z0-9_-]{1,64}$` (the page makes UUIDs; the sample quiz

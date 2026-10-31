@@ -119,7 +119,10 @@ await step('a newer schema is never replaced by an older one', async () => {
   assert.equal(down.json.error, 'newer_schema');
 });
 
-await step('deleted for good: a later save is told the quiz is gone', async () => {
+await step('deleted for good: only from the Trash, and a later save is told the quiz is gone', async () => {
+  const live = await call('DELETE', `/api/library/quizzes/${A}?forever=1`);
+  assert.equal(live.status, 409);
+  assert.equal(live.json.error, 'not_in_trash');
   await call('DELETE', `/api/library/quizzes/${A}?baseVersion=5`);
   assert.equal((await call('DELETE', `/api/library/quizzes/${A}?forever=1`)).status, 200);
   const r = await call('PUT', `/api/library/quizzes/${A}`, { baseVersion: 6, quiz: quiz('Mine') });
@@ -127,6 +130,18 @@ await step('deleted for good: a later save is told the quiz is gone', async () =
   assert.equal(r.json.error, 'gone');
   assert.equal(r.json.server, null);
   made.splice(made.indexOf(A), 1);
+});
+
+await step('a change from another generation (before a restore from backup) is refused', async () => {
+  const B = id('gen');
+  const r = await call('PUT', `/api/library/quizzes/${B}`, { baseVersion: 0, generation: generation + 1, quiz: quiz('Old copy') });
+  assert.equal(r.status, 409);
+  assert.equal(r.json.error, 'generation_changed');
+  assert.equal(r.json.generation, generation);
+  const ok2 = await call('PUT', `/api/library/quizzes/${B}`, { baseVersion: 0, generation, quiz: quiz('Current copy') });
+  assert.equal(ok2.status, 200);
+  made.push(B);
+  assert.equal((await call('DELETE', `/api/library/quizzes/${B}?baseVersion=1&generation=${generation + 1}`)).status, 409);
 });
 
 await step('bad input: size, shape, ids, baseVersion', async () => {
