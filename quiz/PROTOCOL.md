@@ -234,6 +234,8 @@ Every frame has `t`. Frames with times carry `serverNow` (ms since epoch, server
     "text": "...", "options": ["..."]        // host always; players only when settings.showOnDevices
   },
   // ---- player only ----
+  // During intro and open, score and rank are as before the current question, and streak is null once
+  // the player has answered it: nothing a player gets may tell whether this answer was right before `closed`.
   "me": { "pid": "p_ab12", "nick": "Priya", "score": 2310, "rank": 12, "tied": false, "streak": 2,
           "answered": true, "choice": 1,       // answered/choice refer to the current question
           "spins": 1,                          // name spins used so far (max 3)
@@ -339,6 +341,7 @@ When Focus check was on for at least one question (§13), the columns
 follow: `2x 14 s` (left twice, 14 s away in all), `0`, `not checked` (the
 player's page could not report), or empty for a question that was not checked.
 Players the host removed follow, in join order, with `removed` in the rank column and the answers they gave.
+The `rank` column is the strict order of §3 (1, 2, 3 … even for equal scores); the screens show equal scores sharing a place.
 Filename: `hompub-quiz-<pin>-<YYYYMMDD>.csv`.
 
 ## 9. Limits (pilot defaults; all enforced server-side)
@@ -418,7 +421,7 @@ puts `proto: 3` in every `sync`.
 - **Version-1 pages** (from before protocol 2) are no longer served: a player
   socket without `v` is closed with `4010` "This page is out of date. Reload it
   to join the game." (a code those pages do not retry, and they show the
-  reason); a host socket without `v` gets the same from the Worker. The name
+  reason); a host socket without `v` gets the same, signed in or not. The name
   fallbacks they needed (silent spun names, re-spin by `join`, the 3-socket
   rule, full `roster` frames) are gone, so `nameMode` and `allowRename` hold
   for every player.
@@ -444,8 +447,9 @@ puts `proto: 3` in every `sync`.
 The signed-in teacher's quizzes live in D1 (binding `DB`, one database per
 Cloudflare account; schema in `migrations/`, applied by the deploy workflows
 before `wrangler deploy`). Every request needs the session cookie and the
-stricter Origin rule (§1); `401 {"error":"sign_in"}` signed out. Every reply
-carries `generation` (below). `503 {"error":"library_unavailable","message"}`
+stricter Origin rule (§1); `401 {"error":"sign_in"}` signed out. Every `200`,
+`409` and `422` reply carries `generation` (below); errors about the request
+itself (`400`, `404`, `405`, `413`) and the Worker's `401`/`403`/`503` do not. `503 {"error":"library_unavailable","message"}`
 when D1 cannot be reached or its daily free allowance is used up; the page
 keeps the change and retries.
 
@@ -453,7 +457,7 @@ keeps the change and retries.
 |---|---|
 | `GET /api/library` | `200 {generation, quizzes:[Meta], trash:[Meta], limits:{maxLive, maxRows, trashDays}}`, newest first. Quizzes deleted more than 30 days ago are purged first. |
 | `GET /api/library/quizzes?ids=a,b,…` | `200 {generation, quizzes:[Meta + body]}`, at most 50 ids (`400 bad_ids` otherwise). Unknown ids are left out. |
-| `PUT /api/library/quizzes/:id` body `{baseVersion, generation, quiz}` | `baseVersion` 0 creates, otherwise it must be the version the change was made from. `200 {generation, quiz: Meta}`. `409 {error:"conflict", message, server: Meta + body}` when the server's version differs (another device saved first); `409 {error:"gone", server:null}` when the quiz was deleted for good; `409 {error:"newer_schema", server}` when the stored quiz has a newer `schema` (never lowered); `422 {error:"library_full"}`; `413` over 200 KB; `400 invalid_quiz` / `bad_base_version`. Saving unchanged content is not a write (the version stays). Saving a quiz that is in the Trash takes it out. |
+| `PUT /api/library/quizzes/:id` body `{baseVersion, generation, quiz}` | `baseVersion` 0 creates, otherwise it must be the version the change was made from (saving a quiz that is in the Trash takes it out, and counts against the 500-quiz limit like a restore). `200 {generation, quiz: Meta}`. `409 {error:"conflict", message, server: Meta + body}` when the server's version differs (another device saved first); `409 {error:"gone", server:null}` when the quiz was deleted for good; `409 {error:"newer_schema", server}` when the stored quiz has a newer `schema` (never lowered); `422 {error:"library_full"}`; `413` over 200 KB; `400 invalid_quiz` / `bad_base_version`. Saving unchanged content is not a write (the version stays). Saving a quiz that is in the Trash takes it out. |
 | `DELETE /api/library/quizzes/:id?baseVersion=n&generation=g` | Moves it to the Trash (version + 1). `409 conflict` with the server copy if `n` is not current. Deleting again is harmless. |
 | `DELETE /api/library/quizzes/:id?forever=1` | Removes a quiz that is in the Trash; `409 not_in_trash` if it is not (move it to the Trash first). Already gone: `200`. |
 | `POST /api/library/quizzes/:id/restore` | Takes it out of the Trash (version + 1); `422 library_full` if there is no room. |

@@ -166,6 +166,17 @@ if (args.cap) {
     const over = await call('PUT', `/api/library/quizzes/${id('over')}`, { baseVersion: 0, quiz: quiz('Over') });
     assert.equal(over.status, 422);
     assert.equal(over.json.error, 'library_full');
+    // Saving a quiz from the Trash counts against the limit too.
+    const binned = id('cap0');
+    await call('DELETE', `/api/library/quizzes/${binned}?baseVersion=1`);
+    const filler = await call('PUT', `/api/library/quizzes/${id('fill')}`, { baseVersion: 0, quiz: quiz('Fill') });
+    assert.equal(filler.status, 200);
+    made.push(id('fill'));
+    const back = await call('PUT', `/api/library/quizzes/${binned}`, { baseVersion: 2, quiz: quiz('Back from the Trash') });
+    assert.equal(back.status, 422);
+    assert.equal(back.json.error, 'library_full');
+    await call('DELETE', `/api/library/quizzes/${binned}?forever=1`);
+    made.splice(made.indexOf(binned), 1);
   });
 }
 

@@ -190,11 +190,29 @@ jobs:
           set -u
           # --json skips the interactive "OK to proceed" prompt, which would answer no in CI.
           npx wrangler d1 time-travel restore DB --env="" --bookmark="$BOOKMARK" --json | tee ../restore-out.json
-          PREV=$(jq -r '.previous_bookmark // empty' ../restore-out.json)
+          PREV=$(jq -r '.previous_bookmark // empty' ../restore-out.json || true)
           if [ -z "$PREV" ]; then echo "::error::Wrangler did not confirm the restore; check the log above."; exit 1; fi
-          # A new generation tells every host page that its cached quizzes are from before the restore.
-          npx wrangler d1 execute DB --remote --env="" --yes --command "UPDATE library SET generation = $(date +%s%3N)"
+          # The undo point goes in the summary first, whatever happens next.
           echo "Restored the quiz library to $BOOKMARK. To undo, run d1-restore with bookmark $PREV." >> "$GITHUB_STEP_SUMMARY"
+          # A new generation tells every host page that its cached quizzes are from before the restore
+          # (PROTOCOL.md §12). An upsert, so it works even if the row is missing; tried three times.
+          GEN=$(date +%s%3N)
+          SQL="INSERT INTO library (id, generation) VALUES ('main', $GEN) ON CONFLICT(id) DO UPDATE SET generation = excluded.generation"
+          done_gen=""
+          for i in 1 2 3; do
+            if npx wrangler d1 execute DB --remote --env="" --yes --command "$SQL" 2>&1 | tee ../gen-out.txt; then done_gen=1; break; fi
+            if grep -q "no such table" ../gen-out.txt; then break; fi
+            sleep $((i * 5))
+          done
+          if [ -z "$done_gen" ]; then
+            if grep -q "no such table" ../gen-out.txt; then
+              echo "::error::The restore went back to before the quiz library existed. Run this workflow with deploy (or redeploy-ref) to recreate its tables; host pages then ask about every quiz they still hold."
+            else
+              echo "::error::The restore worked, but the library generation could not be changed, so host pages would not notice the restore. From a laptop run: npx wrangler d1 execute DB --remote --command \"$SQL\""
+            fi
+            exit 1
+          fi
+          echo "Library generation set to $GEN: host pages set their cached copies aside and reload." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Deploy or roll back
         if: env.ACTION != 'd1-restore'

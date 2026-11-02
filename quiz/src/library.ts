@@ -256,16 +256,21 @@ export async function handleLibrary(request: Request, url: URL, db: D1Database, 
       changes = res.meta.changes;
     } else {
       // Unchanged content on a live quiz is not a write; a lower schema never replaces a higher one.
+      // Taking a quiz out of the Trash this way counts against the live limit, as a restore does.
       const res = await db.prepare(
         `UPDATE quizzes SET title = ?3, body = ?4, schema = ?5, question_count = ?6, version = version + 1,
                 content_hash = ?7, updated_at = ?8, deleted_at = NULL
            WHERE library_id = ?1 AND id = ?2 AND version = ?9 AND schema <= ?5
-             AND (content_hash <> ?7 OR deleted_at IS NOT NULL)`,
-      ).bind(lib, id, b.title, b.text, b.schema, b.questionCount, hash, now, base).run();
+             AND (content_hash <> ?7 OR deleted_at IS NOT NULL)
+             AND (deleted_at IS NULL OR (SELECT COUNT(*) FROM quizzes WHERE library_id = ?1 AND deleted_at IS NULL) < ?10)`,
+      ).bind(lib, id, b.title, b.text, b.schema, b.questionCount, hash, now, base, LIBRARY.maxLive).run();
       changes = res.meta.changes;
     }
     const r = await row(db, lib, id, true);
     if (changes) return { status: 200, body: { generation: await gen(), quiz: meta(r!) } };
+    if (r && base !== 0 && r.version === base && r.deleted_at !== null && r.schema <= b.schema) {
+      return { status: 422, body: { generation: await gen(), error: 'library_full', message: MSG.full } };
+    }
     if (!r) {
       if (base === 0) return { status: 422, body: { generation: await gen(), error: 'library_full', message: MSG.full } };
       return { status: 409, body: { generation: await gen(), error: 'gone', message: MSG.gone, server: null } };

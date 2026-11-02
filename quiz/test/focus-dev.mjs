@@ -109,6 +109,16 @@ B.send({ t: 'away', q: 0, n: 1, ms: 300 });          // under a second: ignored
 B.send({ t: 'away', q: 7, n: 1, ms: 3000 });         // no such checked question: ignored
 A.send({ t: 'answer', q: 0, choice: 0 });
 B.send({ t: 'answer', q: 0, choice: 0 });
+await A.wait((f) => f.t === 'ack' && f.q === 0, 4000, 'ack');
+// A reconnect during the open question must not show the new score (it would tell whether the answer was right).
+const peek = open(`${WS}/api/room/${pin}/ws?role=player&v=3&token=${A.welcome.token}`, { Origin: BASE });
+const psync = await peek.wait((f) => f.t === 'sync', 6000, 'peek sync');
+assert.equal(psync.me.answered, true);
+assert.equal(psync.me.score, 0, 'score as before the question');
+assert.equal(psync.me.streak, null, 'no streak once answered');
+ok('during an open question a reconnect shows the score from before it');
+// That reconnect replaced Asha's first socket (one live page per player): carry on with the new one.
+Object.assign(A, { ws: peek.ws, frames: peek.frames, send: peek.send, wait: peek.wait });
 const focus = await host.wait((f) => f.t === 'focus' && f.records.some((r) => r.pid === A.welcome.pid && r.n === 2), 4000, 'focus frame');
 const recA = focus.records.find((r) => r.pid === A.welcome.pid && r.q === 0);
 assert.deepEqual({ n: recA.n, ms: recA.ms, copies: recA.copies, old: recA.old }, { n: 2, ms: 5200, copies: 1, old: false });

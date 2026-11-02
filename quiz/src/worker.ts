@@ -321,14 +321,11 @@ async function roomRequest(request: Request, url: URL, env: Env, ctx: ExecutionC
   let library: string | null = null;
   let sessionExp = 0;
   if (isHost) {
-    // A host socket needs a valid session. A page from before protocol 2 cannot sign in at all.
+    // A host socket needs a valid session. A page from before protocol 2 is refused whatever its cookie.
+    if (v < 2) return wsReject(4010, `This page is out of date. Reload it and sign in to continue game ${pin}.`);
     if (!sessionOrigin(request, url)) return wsReject(4011, 'Sign in again to continue this game.');
     const si = await signedIn(request, url, env);
-    if (!si) {
-      return v < 2
-        ? wsReject(4010, `This page is out of date. Reload it and sign in to continue game ${pin}.`)
-        : wsReject(4011, 'Sign in again to continue this game.');
-    }
+    if (!si) return wsReject(4011, 'Sign in again to continue this game.');
     library = si.session.lib;
     // The cookie's own expiry: a WebSocket response cannot carry a renewed cookie, and a reconnect is not use.
     sessionExp = si.held.exp;

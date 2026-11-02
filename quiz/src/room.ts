@@ -357,6 +357,8 @@ export class Room extends DurableObject<Env> {
       const keys = await this.keys();
       const s = this.state;
       if (!s) return reject(4004, 'Room not found');
+      // A page from before protocol 2 cannot follow the roster deltas, even with a valid sign-in.
+      if (v < 2) return reject(4010, `This page is out of date. Reload it and sign in to continue game ${s.pin}.`);
       // The Worker vouches for a signed-in host with a short-lived signed header; a client cannot forge it.
       const sx = keys ? await verifyHostHeader(keys.host, request.headers.get('X-HQ-Host'), s.pin, Date.now()) : null;
       let authed: boolean;
@@ -718,7 +720,9 @@ export class Room extends DurableObject<Env> {
     this.focusChanged.add(key);
     this.scheduleFocus();
     // At most a few rows per player and question while it is open; the rest is saved when it closes.
-    if (rec.writes < LIMITS.awayWrites) this.persistAway(pid, q, rec);
+    // A report that arrives after the close is saved at once (two more at most): with no timer
+    // running, the Room may sleep before anything else would save it.
+    if (rec.writes < LIMITS.awayWrites + (s.phase === 'open' ? 0 : 2)) this.persistAway(pid, q, rec);
   }
 
   /** A player whose page cannot report (an older page) is "not checked" for a checked question. */
@@ -1205,15 +1209,21 @@ export class Room extends DurableObject<Env> {
       const p = this.players.get(pid);
       if (p) {
         const ans = inQuestion ? p.answers[String(s.q)] : undefined;
-        const r = ranks.get(pid);
+        // While a question is starting or open, nothing a player receives may tell whether this
+        // question's answer was right: scores and ranks are as before it, and once the player has
+        // answered, the streak is left out. The answer itself is unchanged (scoring is not touched).
+        const hide = s.phase === 'intro' || s.phase === 'open';
+        const before = (x: Player) => x.score - (hide ? (x.answers[String(s.q)]?.p ?? 0) : 0);
+        const shown = hide ? displayRanks(sorted.map(x => ({ pid: x.pid, score: before(x) })).sort((a, b) => b.score - a.score)) : ranks;
+        const r = shown.get(pid);
         base.me = {
-          pid: p.pid, nick: p.nick, score: p.score, rank: r?.rank ?? playerCount, tied: r?.tied ?? false,
-          streak: p.streak, answered: !!ans, choice: ans ? ans.c : null, spins: p.spins,
+          pid: p.pid, nick: p.nick, score: before(p), rank: r?.rank ?? playerCount, tied: r?.tied ?? false,
+          streak: hide && ans ? null : p.streak, answered: !!ans, choice: ans ? ans.c : null, spins: p.spins,
           renamesLeft: Math.max(0, LIMITS.maxRenames - p.renames),
         };
         if (s.phase === 'closed') base.result = this.resultFor(p, s.q, ranks, playerCount);
         // A phone that was away for the reveal and is back for the next question gets what it missed (P0-18).
-        if ((s.phase === 'intro' || s.phase === 'open') && s.q > 0) base.recap = this.recapFor(p, s.q - 1, ranks, playerCount);
+        if (hide && s.q > 0) base.recap = this.recapFor(p, s.q - 1, before(p), shown, playerCount);
         if (finished) base.podium = this.podiumFor(p, sorted.slice(0, 3), ranks);
         if (s.phase === 'ended') base.played = this.played();
       }
@@ -1249,12 +1259,12 @@ export class Room extends DurableObject<Env> {
    * What a phone away at the reveal missed (P0-18). It says whether this student was right
    * (`right`) but carries no `correct` index: no frame a player gets before `closed` has one.
    */
-  private recapFor(p: Player, q: number, ranks: Ranks, playerCount: number): object {
+  private recapFor(p: Player, q: number, score: number, ranks: Ranks, playerCount: number): object {
     const ans = p.answers[String(q)];
     const r = ranks.get(p.pid);
     return {
       q, right: ans ? ans.c === this.state!.quiz.questions[q].correct : null, choice: ans ? ans.c : null, points: ans ? ans.p : 0,
-      score: p.score, rank: r?.rank ?? playerCount, tied: r?.tied ?? false, playerCount,
+      score, rank: r?.rank ?? playerCount, tied: r?.tied ?? false, playerCount,
     };
   }
 
