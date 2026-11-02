@@ -239,7 +239,9 @@ Every frame has `t`. Frames with times carry `serverNow` (ms since epoch, server
           "spins": 1,                          // name spins used so far (max 3)
           "renamesLeft": 3 },                  // student renames still allowed (max 3)
   "result": { ...same fields as the result frame, without t... },   // only in phase closed
-  "recap": { ...same fields as the result frame, for question q-1... }, // intro / open of question 2 onwards: the result a phone away at the reveal missed
+  "recap": { "q": 2, "right": true, "choice": 1, "points": 912, "score": 2310, "rank": 12, "tied": false, "playerCount": 97 },
+                                             // intro / open of question 2 onwards: the result of question q-1, for a phone away at its reveal.
+                                             // `right`: true / false / null (no answer). No `correct` index: players never get one before `closed`.
   "podium": { "top": [{"nick":"...","score":1234,"rank":1,"tied":false}, ...], "you": {"score": 2310, "rank": 12, "tied": false} }, // podium / ended
   "played": true,                                                    // ended only: whether any question was answered
   // ---- host only ----

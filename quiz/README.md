@@ -12,10 +12,14 @@ teacher signs in with one host passcode; a student is a
 nickname and a score for the length of one lesson; the small server that keeps
 score — we call it the referee — deletes everything when the teacher confirms
 the results download, or on a timer if the teacher forgets. The only lasting
-copy of a game is the CSV the teacher downloads. The referee is open source
-(MIT) so a school can run its own copy and own the data end to end.
+copy of a game is the CSV the teacher downloads. The teacher's quizzes are kept
+in a quiz library on the server, so every device the teacher signs in on has
+them; the library holds no student data. An optional **Focus check** tells the
+teacher who left the quiz page during a question (students are told it is on).
+The referee is open source (MIT) so a school can run its own copy and own the
+data end to end.
 
-## Architecture in five lines
+## Architecture in six lines
 
 1. The join, player and host pages are plain HTML/CSS/JS served as
    [Workers Static Assets](https://developers.cloudflare.com/workers/static-assets/)
@@ -26,8 +30,11 @@ copy of a game is the CSV the teacher downloads. The referee is open source
    referee: it owns the phase, the clock, the answers and the scores.
 4. A single `Directory` Durable Object (`src/directory.ts`) maps PINs to rooms
    and enforces the rooms-per-day caps.
-5. Nothing persists after a wipe: `deleteAll()` on the room, PIN released,
-   every socket closed. No database, no logs, nothing to back up.
+5. Nothing about a game persists after a wipe: `deleteAll()` on the room, PIN
+   released, every socket closed. No logs.
+6. The teacher's quizzes live in one D1 database (`src/library.ts`, binding
+   `DB`, schema in `migrations/`), cached in the host browser by
+   `public/library.js` so editing works offline. It holds quizzes only.
 
 Everything the pieces agree on — URLs, frames, phases, scoring, reconnect rules,
 limits — is in [PROTOCOL.md](PROTOCOL.md). If code and that document disagree,
@@ -51,17 +58,21 @@ $0. The one optional cost is a domain, which the site already plans to buy.
 ```
 quiz/
   PROTOCOL.md        the contract every piece is built against
-  wrangler.jsonc     Cloudflare config: assets, Durable Objects, vars, observability off
+  wrangler.jsonc     Cloudflare config: assets, Durable Objects, D1, vars, observability off
+  migrations/        D1 schema changes (0001_library.sql …), applied by the deploy workflows
   src/worker.ts      edge entry point: /api/* routing, origin check, echo endpoint
+  src/library.ts     the quiz library API on D1 (versions, conflicts, Trash)
   src/room.ts        Room Durable Object: one game, SQLite-backed, the referee
   src/directory.ts   Directory Durable Object: PIN table and daily caps
   src/shared.ts      validation, scoring, nickname filter (pure functions, unit-tested)
   src/env.ts         the Env binding types
   public/            index.html (join), play.html/.js/.css (phone), host.html/.js/.css (laptop)
   public/import-text.js         Word (.docx) and plain-text → quiz parser, no dependencies; used by the host page
+  public/library.js             the host page's copy of the quiz library: cache, unsent changes, sync, conflicts
   public/template-questions.docx  the Word template teachers download from the host page
   public/vendor/     qrcode.js (qrcode-generator, MIT) — the only vendored library
-  test/              shared.test.ts (unit tests), load.mjs (150-client load harness), sample-quiz.json
+  test/              unit tests (*.test.ts / *.test.mjs), load.mjs (load harness), library-dev.mjs and
+                     focus-dev.mjs (checks against a running server), sample-quiz.json
 ```
 
 ## Running locally
@@ -72,11 +83,14 @@ built-in TypeScript support) and a terminal.
 ```
 cd quiz
 npm install
+npx wrangler d1 migrations apply DB --local
 npm run dev
 ```
 
 `npm run dev` starts Wrangler's local runtime at <http://localhost:8787>, with
-Durable Objects emulated on your machine. Nothing talks to Cloudflare and no
+Durable Objects and the D1 quiz library emulated on your machine (the
+`migrations apply --local` line creates the local library's tables; run it
+again after pulling a new migration). Nothing talks to Cloudflare and no
 account is needed.
 
 - Open <http://localhost:8787/host> for the host page.
@@ -105,14 +119,21 @@ account is needed.
   carries the correct answer before reveal, duplicate refusals, tally sums,
   rankings and the CSV, and exits non-zero on any violation. Flags:
   `--url --players (up to 400) --questions --time-limit --answer-window --drop
-  --join-burst --seed --quiz <file> --passcode --v1 <share of version-1 phones>
-  --ip-per-bot --dev-stats --verbose --help` (e.g.
+  --join-burst --seed --quiz <file> --passcode --v2 <share of Phase 1 phones>
+  --focus --ip-per-bot --dev-stats --verbose --help` (e.g.
   `node test/load.mjs --players 12 --questions 2` for a 30-second smoke run).
-  Delete `.wrangler/state/` to reset local rooms, counters and lockouts.
+  `--focus` turns Focus check on and checks every report reaches the host.
+  Delete `.wrangler/state/` to reset local rooms, counters, lockouts and the
+  local quiz library.
+- `node test/library-dev.mjs --base http://localhost:8787 --passcode '…'` checks
+  the library API (versions, conflicts, Trash, the 500-quiz cap with `--cap`);
+  `node test/focus-dev.mjs` (same flags) plays a short game with Focus check.
 - `npm run typecheck` runs the TypeScript compiler over `src/`.
   `npm test` runs the unit tests: scoring, validation, the name filter and
   name rules, sessions, the Origin rule, the guess limiters, the idle-wipe
-  timing, and the staging config.
+  timing, ties and Focus check rules, the library's checks and the host page's
+  library code (sync, conflicts, restore, moving old quizzes), and the staging
+  and migration config.
   `npm run check` does both. The deploy workflow runs them before every deploy.
 
 Rooms created locally live in `.wrangler/state/` (git-ignored) and vanish when
@@ -149,15 +170,25 @@ A browser tab opens asking you to allow Wrangler (Cloudflare's command-line
 tool) to act on your account. Allow it and close the tab. The token is stored
 in your user profile; you do not need to repeat this.
 
-### 3. Deploy
+### 3. Create the quiz library, then deploy
 
 ```
+npx wrangler d1 create hompub-quiz-library
+```
+
+It prints a `database_id`. Put it in `wrangler.jsonc` under `d1_databases`
+(replacing the id there, which belongs to the HomPub deployment), then create
+the tables and deploy:
+
+```
+npx wrangler d1 migrations apply DB --remote
 npx wrangler deploy
 ```
 
-The first deploy creates a Worker called `hompub-quiz`, uploads the pages in
-`public/` as static assets, and runs the `v1` migration that registers the
-`Room` and `Directory` Durable Object classes. It prints the URL:
+Without `--remote`, Wrangler migrates a local file and reports success, so do
+not leave it out. The first deploy creates a Worker called `hompub-quiz`,
+uploads the pages in `public/` as static assets, and runs the `v1` migration
+that registers the `Room` and `Directory` Durable Object classes. It prints the URL:
 
 ```
 https://hompub-quiz.<yourname>.workers.dev
@@ -307,8 +338,10 @@ account**, or lists only that account under *Account Resources*.
    `CLOUDFLARE_ACCOUNT_ID`: repository secrets reach every branch's workflows.
 5. Set the Worker secrets (previous section) on both Workers.
 
-**Production run.** Choose `deploy` and a release tag such as `quiz-phase-1`.
-The job type-checks, tests, deploys with
+**Production run.** Choose `deploy` and a release tag such as `quiz-phase-2`.
+The job type-checks, tests, prints the quiz library's current D1 Time Travel
+bookmark (the "before" point), applies new migrations from `migrations/`
+(`wrangler d1 migrations apply DB --remote`), then deploys with
 `--durable-objects-code-update-mode immediate` (the Worker and the Durable
 Objects switch together), prints the new version id in the run summary, and
 tags the deployed commit.
@@ -332,6 +365,22 @@ tags the deployed commit.
   (`apps/hompub-quiz/privacy.html`) describes Phase 1: for a rollback that
   lasts, put its previous text back too.
 - Static pages roll back with the Worker version.
+- **Rolling back to Phase 1** (`redeploy-ref` with `quiz-phase-1`) leaves the
+  quiz library's table in place, unused (migrations only ever add). The Phase 1
+  host page keeps quizzes in one browser's storage again, so first do **Export
+  all** on the host page, then roll back, then **Open a quiz file** with that
+  export in the Phase 1 page. Only quizzes saved before Phase 2 are still in
+  that browser's old list.
+- **Restoring the quiz library** (for damaged data, never for a code
+  rollback): Actions → *Deploy quiz (production)* → `d1-restore` with a
+  bookmark from an earlier run's summary, and tick *confirm_d1_restore* after
+  doing **Export all**. D1 Time Travel restores to any minute of the last 7
+  days on the Free plan (30 on Paid); the restore overwrites the database and
+  prints the bookmark that undoes it. The workflow then changes the library's
+  generation, so every host page sets its cached copy aside (downloadable from
+  a banner) and reloads instead of sending stale edits. For a copy kept outside
+  Cloudflare, run `npx wrangler d1 export DB --remote --output library.sql`
+  from a laptop, or use **Export all**.
 
 ### Deploys interrupt live games
 
@@ -357,6 +406,8 @@ and
 | SQLite rows written | 100,000 |
 | SQLite rows read | 5,000,000 |
 | SQLite storage | 5 GB total |
+| D1 rows read / written | 5,000,000 / 100,000 (separate from the Durable Object counts) |
+| D1 storage | 500 MB per database |
 | Inbound WebSocket messages | billed 20 : 1 — 20 incoming messages count as one request |
 | Outbound WebSocket messages | free |
 
@@ -372,11 +423,21 @@ Our estimate for one full game, **100 students × 20 questions**:
 So the Free plan carries **roughly 40 full games a day** of that size,
 bounded by rows written and object duration, not by requests.
 
+The quiz library is in D1, with its own allowance. A save is one or two rows
+written; reading the list reads one row per quiz, and a page open on the
+library reads it every two minutes. A teacher editing all day stays far below
+the caps, and the library (at most 500 quizzes of up to 200 KB) fits in its
+500 MB. Focus check adds at most a few rows per student and question to the
+game's own rows written (see below).
+
 For a **300 × 30** lecture the binding cap is rows written: measured locally
 at 9,323 rows up to the podium (one row per answer, three per join because of
 the two indexes, one per phase change and per alarm), about **10,000–11,000
 per game** with the wipe, so **about 8–9 such games a day** (6–7 at 400
-players). Requests (~3–5k), duration (~340 GB-s) and WebSockets (at most 850
+players). With Focus check on and about a tenth of the class leaving the page
+once per question, the same game measured 12,187 rows up to the podium (836
+reports, plus "not checked" marks for 15 phones on an older page), about 8 games
+a day. Requests (~3–5k), duration (~340 GB-s) and WebSockets (at most 850
 per room, against a limit of 32,768) are far from their caps. Running out of
 writes stops the game until 00:00 UTC (05:30 IST); the host page then says so
 in words instead of freezing. Staging is in its own account, so its tests do
@@ -455,10 +516,19 @@ holds it up as follows:
   see the roadmap.)
 - **The answer key never reaches a player.** Players receive the correct option
   only in the `result` frame after a question closes; `sync` frames to a
-  player-tagged socket carry neither the key nor the other players' answers.
+  player-tagged socket carry neither the key nor the other players' answers
+  (the recap of a missed reveal says only whether that student was right).
+- **The quiz library holds quizzes only**: content, version, content hash and
+  times, per library. No student data, no games. Deleted quizzes stay in the
+  Trash for 30 days, then are purged; D1 Time Travel keeps 7 days of history.
+- **Focus check is off by default and never secret.** While it is on, every
+  phone screen says "Your teacher can see if you leave this page during a
+  question." Phones report only counts and seconds away for checked questions;
+  the records live in the game's Room and are deleted with it.
 - **What is kept on devices** is in the host's and students' own browser
-  storage only: the host's quizzes, PIN and host token; a student's reconnect
-  token for the current PIN, cleared when the game ends.
+  storage only: a copy of the host's quiz library (removed by "Sign out on this
+  device" unless a change could not be saved yet), the PIN and host token; a
+  student's reconnect token for the current PIN, cleared when the game ends.
 
 ## Operating notes for a teacher
 
@@ -470,10 +540,24 @@ holds it up as follows:
 - **Keep the laptop plugged in** and set it not to sleep. The host page asks
   the browser to keep the screen awake, but the operating system's power
   settings win.
-- **Export your quizzes as `.json`.** Quizzes live only in the browser's
-  localStorage on that one laptop. School laptops lose it — profile resets,
-  "clear data on exit" policies, shared sign-ins. Export after every edit;
-  import on the day. The host page nags about this for a reason.
+- **Your quizzes are in your library.** Sign in on any laptop and they are
+  there; edits made offline are saved on the device and sent when it is back
+  online (the status line says which). If two devices change the same quiz,
+  the page asks which version to keep, or keeps both. Deleted quizzes go to the
+  Trash for 30 days. **Export all** (on the quiz list) gives you one `.json`
+  file of every quiz — a copy outside Cloudflare, worth making now and then.
+  The first time you sign in on a laptop that has quizzes from before the
+  library, they are added to your library and the page says so.
+- **Focus check** (optional, on the setup screen and in Options between
+  questions): phones report when a student switches app or tab, minimises or
+  locks the screen during a question, and for how long; when questions are
+  shown on phones, copying them is blocked too. You see "left 2×, 14 s" in
+  **All players** and in the results file, and after each question the screen
+  shows only a count, never names. Students are always told it is on. It cannot
+  see a second phone, a photo of the projector or a friend's help; a phone
+  call, a notification or the screen locking look the same as leaving; some
+  Android split-screen modes are not noticed. Treat it as a signal to look
+  into, not as proof.
 - **If WebSockets are blocked:** connect the **host laptop only** to the guest
   network or to your phone's hotspot. Students do not connect to the laptop,
   they connect to the referee on the internet, so they can stay on the school
@@ -592,9 +676,10 @@ Answer: A
   save as `.docx` first, or copy the text and use **Paste questions**. Tables are
   read cell by cell, one cell per line.
 
-After importing, export a `.json` copy as usual: the Word file is not a backup
-of the quiz as the editor sees it (it may lack the ticked answers), and the
-`.json` is what the host page imports back losslessly.
+After importing, the quiz is in your library like any other. The Word file is
+not a backup of the quiz as the editor sees it (it may lack the ticked
+answers); **Export .json** (one quiz) or **Export all** is what the host page
+reads back losslessly.
 
 ## Protocol
 

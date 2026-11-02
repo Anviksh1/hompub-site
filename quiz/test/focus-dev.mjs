@@ -142,6 +142,8 @@ const D = open(`${WS}/api/room/${pin}/ws?role=player&v=3&token=${B.welcome.token
 const dsync = await D.wait((f) => f.t === 'sync', 6000, 'reconnect sync');
 assert.equal(dsync.recap.q, 0);
 assert.equal(typeof dsync.recap.points, 'number');
+assert.equal('correct' in dsync.recap, false, 'no answer key in a frame before closed');
+assert.equal(typeof dsync.recap.right, 'boolean');
 ok('a phone back during the next intro gets a recap of the result it missed');
 await A.wait((f) => f.t === 'open' && f.q === 1, 8000, 'open q1');
 A.send({ t: 'away', q: 1, n: 1, ms: 3000 });
