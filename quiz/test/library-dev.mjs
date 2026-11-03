@@ -111,9 +111,10 @@ await step('restore takes it out of the Trash', async () => {
 });
 
 await step('a newer schema is never replaced by an older one', async () => {
-  const r = await call('PUT', `/api/library/quizzes/${A}`, { baseVersion: 4, quiz: { schema: 2, title: 'Future', questions: [{ kind: 'new' }] } });
+  // Schema 3 stands for a version of HomPub Quiz newer than this server (which knows 1 and 2).
+  const r = await call('PUT', `/api/library/quizzes/${A}`, { baseVersion: 4, quiz: { schema: 3, title: 'Future', questions: [{ kind: 'new' }] } });
   assert.equal(r.status, 200, JSON.stringify(r.json));
-  assert.equal(r.json.quiz.schema, 2);
+  assert.equal(r.json.quiz.schema, 3);
   const down = await call('PUT', `/api/library/quizzes/${A}`, { baseVersion: 5, quiz: quiz('Older page') });
   assert.equal(down.status, 409);
   assert.equal(down.json.error, 'newer_schema');

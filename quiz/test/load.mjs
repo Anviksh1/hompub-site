@@ -54,6 +54,7 @@ const DEFAULTS = {
   quiz: '',
   passcode: process.env.HQ_PASSCODE || '',
   v2: 0.1,
+  v3: 0.1,
   focus: false,
   'ip-per-bot': false,
   'dev-stats': false,
@@ -72,6 +73,7 @@ const USAGE = `Usage: node test/load.mjs [options]
   --quiz <file>                  use this Quiz JSON (e.g. test/sample-quiz.json) instead of generating one
   --passcode <text>              host passcode (default: the HQ_PASSCODE environment variable)
   --v2 <fraction>                share of phones that behave as version-2 pages from Phase 1 (default ${DEFAULTS.v2})
+  --v3 <fraction>                share of phones that behave as version-3 pages from Phase 2 (default ${DEFAULTS.v3})
   --focus                        turn Focus check on; about 10 % of version-3 phones report leaving the page each question
   --ip-per-bot                   give each phone its own client address (needs DEV_CLIENT_IP_HEADER in .dev.vars);
                                  without it every phone shares one address, like a school network
@@ -119,6 +121,7 @@ function parseCli(argv) {
     quizFile: raw.quiz,
     passcode: raw.passcode,
     v2: raw.v2,
+    v3: raw.v3,
     focus: raw.focus,
     ipPerBot: raw['ip-per-bot'],
     devStats: raw['dev-stats'],
@@ -127,6 +130,7 @@ function parseCli(argv) {
   if (!/^https?:\/\/[^/\s]+$/.test(o.url)) die(`--url must look like http://host:port (got "${o.url}")`);
   if (!Number.isInteger(o.players) || o.players < 1 || o.players > MAX_PLAYERS) die(`--players must be an integer from 1 to ${MAX_PLAYERS}`);
   if (!(o.v2 >= 0 && o.v2 <= 1)) die('--v2 must be between 0 and 1');
+  if (!(o.v3 >= 0 && o.v2 + o.v3 <= 1)) die('--v3 must be between 0 and 1, and --v2 + --v3 at most 1');
   if (!Number.isInteger(o.questions) || o.questions < 1 || o.questions > 100) die('--questions must be an integer from 1 to 100');
   if (!TIME_LIMITS.includes(o.timeLimit)) die(`--time-limit must be one of ${TIME_LIMITS.join(', ')}`);
   if (o.answerWindow < 0) die('--answer-window must be >= 0');
@@ -341,7 +345,8 @@ class Player {
   constructor(i) {
     this.i = i;                       // 1-based, "Student <i>"
     this.spin = i % 7 === 0;          // every 7th player asks for a spun two-word name
-    this.v2 = false;                  // behaves as a version-2 page from Phase 1 (set in main); else version 3
+    this.v2 = false;                  // behaves as a version-2 page from Phase 1 (set in main)
+    this.v3 = false;                  // behaves as a version-3 page from Phase 2 (set in main); else version 4
     this.isDup = false;               // deliberately answers twice (set in main)
     this.ws = null;
     this.token = null; this.pid = null; this.nick = null;
@@ -373,7 +378,7 @@ class Player {
     if (game.over || this.dead) return;
     this.clear('reconnect');
     const reconnecting = this.token !== null;
-    const v = game.legacy ? '' : this.v2 ? '&v=2' : '&v=3';
+    const v = game.legacy ? '' : this.v2 ? '&v=2' : this.v3 ? '&v=3' : '&v=4';
     const query = reconnecting ? `role=player${v}&token=${encodeURIComponent(this.token)}` : `role=player${v}`;
     let ws;
     try {
@@ -938,7 +943,7 @@ class Host {
 
   onSync(s) {
     stats.hostSyncs += 1;
-    if (!game.legacy && s.proto !== 3) violate(`host: sync.proto is ${s.proto}, expected 3`);
+    if (!game.legacy && s.proto !== 4) violate(`host: sync.proto is ${s.proto}, expected 4`);
     if (Array.isArray(s.focus)) for (const r of s.focus) game.focusSeen.set(`${r.pid}|${r.q}`, r);
     this.roster = new Map((Array.isArray(s.roster) ? s.roster : []).map((p) => [p.pid, p]));
     if (s.role !== 'host') violate(`host: sync.role is "${s.role}"`);
@@ -1556,8 +1561,12 @@ async function main() {
   // 5. Players: who answers twice, and when each one joins.
   for (let i = 1; i <= opts.players; i++) players.push(new Player(i));
   const v2Count = game.legacy ? 0 : Math.round(opts.players * opts.v2);
-  for (const p of shuffle([...players], mulberry32(mix(opts.seed, 5))).slice(0, v2Count)) p.v2 = true;
-  if (!game.legacy) log(`${v2Count} of ${opts.players} phones behave as version-2 pages`);
+  const v3Count = game.legacy ? 0 : Math.round(opts.players * opts.v3);
+  const mixed = shuffle([...players], mulberry32(mix(opts.seed, 5)));
+  for (const p of mixed.slice(0, v2Count)) p.v2 = true;
+  // Version-3 pages (Phase 2) still play a quiz of single-answer questions, which is what the harness hosts.
+  for (const p of mixed.slice(v2Count, v2Count + v3Count)) p.v3 = true;
+  if (!game.legacy) log(`${v2Count} of ${opts.players} phones behave as version-2 pages, ${v3Count} as version-3 pages`);
   if (!game.legacy) await checkV1Refused();
   const dupCount = Math.max(1, Math.round(opts.players * 0.05));
   for (const p of shuffle([...players], mulberry32(mix(opts.seed, 2))).slice(0, dupCount)) p.isDup = true;

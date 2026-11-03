@@ -44,26 +44,36 @@
 
 const TIME_LIMITS = [5, 10, 15, 20, 30, 60, 90, 120, 240];
 const POINT_VALUES = [0, 1000, 2000];
-const LIMITS = { title: 80, text: 200, option: 80, questions: 100, minOptions: 2, maxOptions: 4 };
+const LIMITS = { title: 80, text: 400, option: 80, questions: 100, minOptions: 2, maxOptions: 4 };
 const LETTERS = 'ABCDEFGH';
+const MAX_ACCEPT = 10;                       // accepted answers of a typed-answer question
 
 /* ===================================================================== 1. text helpers */
 
-// Strip control and zero-width characters, collapse whitespace, trim.
+// Strip control characters, zero-width spaces and byte-order marks, collapse whitespace, trim.
+// Zero-width non-joiner and joiner (U+200C, U+200D) are kept: in Devanagari they choose
+// between a conjunct and a half form, so removing them changes how a word is written.
 function clean(s) {
   return String(s == null ? '' : s)
-    .replace(/[\u0000-\u0008\u000e-\u001f\u007f-\u009f​-‍⁠﻿]/g, '')
+    .replace(/[\u0000-\u0008\u000e-\u001f\u007f-\u009f\u200b\u2060\ufeff]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
-// Cut to `max` UTF-16 units (what validateQuiz counts) without splitting a surrogate pair.
+// Cut to `max` UTF-16 units (what validateQuiz counts) between letters (Intl.Segmenter): never inside a
+// surrogate pair, never leaving a vowel sign or virama without its letter, never half a conjunct.
 function cut(s, max) {
   if (s.length <= max) return s;
-  let out = s.slice(0, max);
-  const last = out.charCodeAt(out.length - 1);
-  if (last >= 0xd800 && last <= 0xdbff) out = out.slice(0, -1);
-  return out.trim();
+  let out = '';
+  if (typeof Intl !== 'undefined' && Intl.Segmenter) {
+    for (const { segment } of new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(s)) { if (out.length + segment.length > max) break; out += segment; }
+  } else {
+    out = s.slice(0, max);
+    const last = out.charCodeAt(out.length - 1);
+    if (last >= 0xd800 && last <= 0xdbff) out = out.slice(0, -1);
+    out = out.replace(/\p{M}+$/u, '');
+  }
+  return out.replace(/[\u0915-\u0939\u0958-\u095f\u0978-\u097f]?\u094d[\u200c\u200d]?$/u, '').replace(/[\u200c\u200d]+$/u, '').trim();
 }
 
 function shortQuote(s) { return s.length > 40 ? cut(s, 37) + '…' : s; }
@@ -102,20 +112,24 @@ const TITLE_PREFIX_RE = /^(?:#{1,6}\s+|(?:title|quiz title|quiz|topic)\s*[:\-–
 const QNUM_RE = /^(?:(?:q|question|#)\s*)?(?:\(\s*\d{1,3}\s*\)|\d{1,3}\s*[.):\]．）](?!\d))\s*/i;
 const QWORD_RE = /^(?:q|question)\s*\d{1,3}\b\s*[.):\-–—]?\s*/i;   // "Q1 What…"  "Question 2 What…"
 const QBARE_RE = /^(?:q|question)\s*[.:)\-–—]\s*/i;                 // "Q. What…"  "Question: What…"
-// "A." "A)" "(A)" "[A]" "A:" and lower-case "a." "a)" only when a space follows (so "e.g." is left alone).
-// A–F, so a stray 5th or 6th option is still recognised as one (and dropped with a warning).
-// Also Devanagari "क. ख. ग. घ." and roman "(i) (ii) (iii) (iv)" / "i. ii." (lower-case, space after).
+// "A." "A)" "(A)" "[A]" "A:" "A - text", lower-case "a)text", and "a." "a:" only when a space follows
+// (so "e.g." is left alone). A–F, so a stray 5th or 6th option is still recognised as one (and
+// dropped with a warning). Also Devanagari "क. ख. (ग) (घ)", Hindi "अ. ब. स. द." (the a-b-c-d of Hindi
+// exam papers), and roman "(i) (ii)", "i. ii." (lower-case, space after) or "I. II. III. IV.".
 const DEVA_LETTERS = 'कखगघ';
+const HINDI_ABCD = 'अबसद';
 const ROMAN = { i: 'A', ii: 'B', iii: 'C', iv: 'D' };
-const OPT_LETTER_RE = /^(?:\(([A-Fa-f])\)|\[([A-Fa-f])\]|([A-F])[.):]|([a-f])[.):](?=\s)|([कखगघ])[.):]|\((iv|i{1,3})\)|(iv|i{1,3})[.)](?=\s))\s*/;
+const OPT_LETTER_RE = /^(?:\(([A-Fa-f])\)|\[([A-Fa-f])\]|([A-F])[.):]|([a-f])(?:\)|[.:](?=\s))|([कखगघअबसद])[.):]|\(([कखगघअबसद])\)|\((iv|i{1,3}|IV|I{1,3})\)|(iv|i{1,3})[.)](?=\s)|(IV|I{1,3})[.)](?=\s)|([A-Fa-f])\s+[-–—](?=\s))\s*/;
 // -> { letter: "A".."F", length } or null
 function optionPrefix(s) {
   const m = OPT_LETTER_RE.exec(s);
   if (!m) return null;
   let letter;
-  if (m[5]) letter = LETTERS[DEVA_LETTERS.indexOf(m[5])];
-  else if (m[6] || m[7]) letter = ROMAN[m[6] || m[7]];
-  else letter = (m[1] || m[2] || m[3] || m[4]).toUpperCase();
+  const deva = m[5] || m[6];
+  const roman = m[7] || m[8] || m[9];
+  if (deva) letter = LETTERS[DEVA_LETTERS.includes(deva) ? DEVA_LETTERS.indexOf(deva) : HINDI_ABCD.indexOf(deva)];
+  else if (roman) letter = ROMAN[roman.toLowerCase()];
+  else letter = (m[1] || m[2] || m[3] || m[4] || m[10]).toUpperCase();
   return { letter, length: m[0].length };
 }
 const BULLET_RE = /^(?:[-*–—]\s+|[•○◦▪▫■□●·‣⁃➢➤►▶]\s*)/;
@@ -141,16 +155,18 @@ function metaToken(piece) {
   let m;
   if ((m = TIME_RE.exec(s)) || (m = SECONDS_RE.exec(s))) return { time: parseFloat(m[1]) };
   if ((m = POINTS_RE.exec(s)) || (m = POINTS_N_RE.exec(s))) return { points: parseInt(m[1], 10) };
-  if ((m = POINTS_WORD_RE.exec(s))) return { points: m[1] ? 2000 : 0 };
+  // "poll" or "survey": no points, and a poll (no right answer) unless an answer is marked anyway.
+  if ((m = POINTS_WORD_RE.exec(s))) return m[1] ? { points: 2000 } : { points: 0, poll: /poll|survey/i.test(m[2]) };
   return null;
 }
 
 // Peel "(30s)", "[30 s, double points]", "… Time: 30", "…? 30 seconds" off the end of a question line.
 function extractInlineMeta(text) {
-  const out = { text, time: null, points: null };
+  const out = { text, time: null, points: null, poll: false };
   const apply = (t) => {
     if (t.time != null && out.time == null) out.time = t.time;
     if (t.points != null && out.points == null) out.points = t.points;
+    if (t.poll) out.poll = true;
   };
   for (let guard = 0; guard < 4; guard++) {
     const s = out.text;
@@ -163,7 +179,7 @@ function extractInlineMeta(text) {
       const t = metaToken(m[1]);
       if (t) { apply(t); end = m.index; }
     }
-    if (end < 0 && (m = /([?!.;:,–—-])\s*(\d+\s*(?:s|sec|secs|seconds?)|double(?:\s+points?)?|survey|no\s+points?)\.?\s*$/i.exec(s))) {
+    if (end < 0 && (m = /([?!.;:,–—-])\s*(\d+\s*(?:s|sec|secs|seconds?)|double(?:\s+points?)?|survey|poll|no\s+points?)\.?\s*$/i.exec(s))) {
       const t = metaToken(m[2]);
       if (t) { apply(t); end = m.index + 1; }
     }
@@ -203,7 +219,7 @@ function classifyMeta(line) {
   if ((m = ANSWER_BARE_RE.exec(line))) return { kind: 'answer', value: m[1] };
   const tok = metaToken(line);
   if (tok && tok.time != null) return { kind: 'time', value: tok.time };
-  if (tok && tok.points != null) return { kind: 'points', value: tok.points };
+  if (tok && tok.points != null) return { kind: 'points', value: tok.points, poll: !!tok.poll };
   return null;
 }
 
@@ -292,9 +308,9 @@ function resolveAnswer(value, options) {
   // "Answer: B and D" is ambiguous (one correct answer per question): leave it unmarked.
   if (parts.length > 1) return { index: -1, note: `the answer line names several answers ("${shortQuote(v)}"); only one is supported — tick the right one in the editor` };
   const head = parts[0] || '';
-  let m = /^\(?([A-Ha-h])\)?(?:[.):]|\s|$)/.exec(head) || /^\(?([कखगघ])\)?(?:[.):]|\s|$)/.exec(head);
+  let m = /^\(?([A-Ha-h])\)?(?:[.):]|\s|$)/.exec(head) || /^\(?([कखगघअबसद])\)?(?:[.):]|\s|$)/u.exec(head);
   if (m) {
-    const i = /[A-Ha-h]/.test(m[1]) ? LETTERS.indexOf(m[1].toUpperCase()) : DEVA_LETTERS.indexOf(m[1]);
+    const i = /[A-Ha-h]/.test(m[1]) ? LETTERS.indexOf(m[1].toUpperCase()) : DEVA_LETTERS.includes(m[1]) ? DEVA_LETTERS.indexOf(m[1]) : HINDI_ABCD.indexOf(m[1]);
     if (i < options.length) return { index: i, note: null };
     return { index: -1, note: `the answer line says ${LETTERS[i]} but there are only ${options.length} options` };
   }
@@ -319,7 +335,15 @@ function parseQuizText(text, options) {
   const skippedBlocks = [];
   const warn = (question, message) => { warnings.push({ question, message }); };
 
-  let items = String(text == null ? '' : text).split(/\r\n|\r|\n/).map(classify).filter((it) => it.kind !== 'comment');
+  // Lines marked by docxLines() as having held an equation or a picture: the marker is removed and
+  // the question the line belongs to gets a warning.
+  let items = String(text == null ? '' : text).split(/\r\n|\r|\n/).map((raw) => {
+    const math = raw.includes(DROPPED_MATH), pic = raw.includes(DROPPED_PICTURE);
+    const it = classify(math || pic ? raw.replace(/[\uE000\uE001]/g, '') : raw);
+    if (math) it.math = true;
+    if (pic) it.picture = true;
+    return it;
+  }).filter((it) => it.kind !== 'comment' || it.math || it.picture);
 
   // Title: the first line, when it is plain prose (no number, no "?", not an option) and a question follows it.
   let title = '';
@@ -363,7 +387,7 @@ function parseQuizText(text, options) {
     i = j - 1;
   }
 
-  const newQuestion = (num) => ({ num, lines: [], options: [], answers: [], time: null, points: null, dropped: 0, droppedCorrect: false, closed: false, notes: [] });
+  const newQuestion = (num) => ({ num, lines: [], options: [], answers: [], time: null, points: null, poll: false, dropped: 0, droppedCorrect: false, closed: false, notes: [] });
   let blockNo = 0;
 
   function addOption(q, o) {
@@ -376,6 +400,7 @@ function parseQuizText(text, options) {
     const meta = extractInlineMeta(line);
     if (meta.time != null) q.time = meta.time;
     if (meta.points != null) q.points = meta.points;
+    if (meta.poll) q.poll = true;
     let t = meta.text;
     const m = /\s(?=\(?[Aa][.)]\s)/.exec(t);                         // "What is 2+2? A. 3 B. 4* C. 5"
     if (m && /[?:]$/.test(t.slice(0, m.index).trim())) {
@@ -395,6 +420,7 @@ function parseQuizText(text, options) {
     text = meta.text;
     if (meta.time != null && q.time == null) q.time = meta.time;
     if (meta.points != null && q.points == null) q.points = meta.points;
+    if (meta.poll) q.poll = true;
     blockNo++;
     const num = q.num != null ? q.num : blockNo;                     // the teacher's number, else the block's position
     if (keys.has(num)) {
@@ -403,6 +429,24 @@ function parseQuizText(text, options) {
     }
 
     const label = text ? `"${shortQuote(text)}"` : 'a block with no question text';
+    // No options but an answer line: a typed-answer question ("Answer: Paris / Paree").
+    if (!q.options.length && q.answers.length && text) {
+      if (kept.length >= LIMITS.questions) { overflow++; return; }
+      const notes = q.notes.slice();
+      const value = q.answers[q.answers.length - 1];
+      let accept = value.split(/\s*(?:\/|;|\||\bor\b|\u092f\u093e)\s*/i).map(clean).filter(Boolean);
+      if (accept.length > MAX_ACCEPT) { notes.push(`only ${MAX_ACCEPT} accepted answers are kept`); accept = accept.slice(0, MAX_ACCEPT); }
+      accept = accept.map((a) => { if (a.length <= LIMITS.option) return a; notes.push(`an accepted answer was shortened to ${LIMITS.option} characters`); return cut(a, LIMITS.option); });
+      if (text.length > LIMITS.text) { text = cut(text, LIMITS.text); notes.push(`question text shortened to ${LIMITS.text} characters`); }
+      const timeLimit = q.time != null ? snap(q.time, TIME_LIMITS) : 20;
+      if (q.time != null && timeLimit !== q.time) notes.push(`a time limit of ${q.time} s is not available; using ${timeLimit} s`);
+      const points = q.points != null ? (q.points <= 0 ? 0 : snap(q.points, [1000, 2000])) : 1000;
+      notes.push('no options, so it is a typed-answer question: students type the answer');
+      kept.push({ type: 'typein', text, accept, timeLimit, points });
+      const n = kept.length;
+      for (const note of notes) warn(n, `Question ${n}: ${note}`);
+      return;
+    }
     if (q.options.length < LIMITS.minOptions) {
       skipped++;
       warn(null, `Skipped ${label}: a question needs at least 2 options (found ${q.options.length}).`);
@@ -414,24 +458,35 @@ function parseQuizText(text, options) {
     // "* A. …" on every option is a bullet style, not four correct answers.
     if (q.options.every((o) => o.correct && o.via === 'leadstar')) q.options.forEach((o) => { o.correct = false; });
     const notes = q.notes.slice();
-    const marked = q.options.map((o, i) => (o.correct ? i : -1)).filter((i) => i >= 0);
+    let marked = q.options.map((o, i) => (o.correct ? i : -1)).filter((i) => i >= 0);
     let correct = marked.length ? marked[0] : -1;
-    if (marked.length > 1) notes.push(`more than one option is marked correct (${marked.map((i) => LETTERS[i]).join(', ')}); using ${LETTERS[correct]}`);
     if (q.answers.length) {
       const value = q.answers[q.answers.length - 1];
       if (q.answers.length > 1) notes.push(`several answer lines; using the last one ("${shortQuote(value)}")`);
-      const r = resolveAnswer(value, q.options.map((o) => o.text));
-      if (r.note) notes.push(r.note);
-      if (r.index >= 0) {
-        if (correct >= 0 && correct !== r.index) notes.push(`the answer line says ${LETTERS[r.index]} but option ${LETTERS[correct]} is marked on its own line; using ${LETTERS[correct]}`);
-        else correct = r.index;
+      // "Answer: A, C" / "A and C" / "A & C": several right options.
+      const letters = /^\(?[A-Fa-f]\)?(?:\s*(?:,|&|\+|\band\b)\s*\(?[A-Fa-f]\)?)+$/i.test(value.trim()) ? value.match(/[A-Fa-f](?![a-z])/g).map((l) => LETTERS.indexOf(l.toUpperCase())) : null;
+      if (letters && !marked.length) {
+        marked = [...new Set(letters)].filter((i) => i >= 0 && i < q.options.length).sort((a, b) => a - b);
+        correct = marked.length ? marked[0] : -1;
+      } else {
+        const r = resolveAnswer(value, q.options.map((o) => o.text));
+        if (r.note) notes.push(r.note);
+        if (r.index >= 0) {
+          if (correct >= 0 && !marked.includes(r.index)) notes.push(`the answer line says ${LETTERS[r.index]} but option ${LETTERS[correct]} is marked on its own line; using ${LETTERS[correct]}`);
+          else if (correct < 0) { correct = r.index; marked = [r.index]; }
+        }
       }
     }
+    // Several options marked: a question with several right answers (quiz schema 2).
+    const multi = marked.length > 1;
+    if (multi) notes.push(`${marked.map((i) => LETTERS[i]).join(', ')} are marked right, so it is a question with several right answers`);
+    // "poll" or "survey" with nothing marked: a poll, which has no right answer.
+    const poll = q.poll && correct < 0;
     if (q.dropped) {
       notes.push(`only 4 options are allowed; ${q.dropped} extra option${q.dropped > 1 ? 's were' : ' was'} dropped`
         + (q.droppedCorrect ? ' (one of them was marked correct — tick the right one)' : ''));
     }
-    if (correct < 0) notes.push('no correct answer marked — tick it in the editor');
+    if (correct < 0 && !poll) notes.push('no correct answer marked — tick it in the editor');
     let timeLimit = 20;
     if (q.time != null) {
       timeLimit = snap(q.time, TIME_LIMITS);
@@ -449,16 +504,33 @@ function parseQuizText(text, options) {
       notes.push(`option ${LETTERS[i]} shortened to ${LIMITS.option} characters`);
       return cut(o.text, LIMITS.option);
     });
-    kept.push({ text, options: optionTexts, correct, timeLimit, points });
+    if (poll) kept.push({ type: 'poll', text, options: optionTexts, timeLimit, points: 0 });
+    else if (multi) kept.push({ type: 'multi', text, options: optionTexts, correct: marked, partial: false, timeLimit, points });
+    else kept.push({ text, options: optionTexts, correct, timeLimit, points });
     const n = kept.length;
     for (const note of notes) warn(n, `Question ${n}: ${note}`);
   }
 
   let cur = null, atBlockStart = true;
+  let pendingDrops = [];                 // dropped content seen before the question it belongs to
   const finish = () => { if (cur) finalize(cur); cur = null; };
-  const start = (line, num) => { finish(); cur = newQuestion(num == null ? null : num); if (line) addQuestionLine(cur, line); };
+  const start = (line, num) => {
+    finish(); cur = newQuestion(num == null ? null : num); if (line) addQuestionLine(cur, line);
+    cur.notes.push(...pendingDrops); pendingDrops = [];
+  };
+  const DROP_NOTES = {
+    math: 'an equation was left out: Word equations cannot be imported, so type it as text in the editor',
+    picture: 'a picture, chart or embedded object was left out: add a picture in the editor with “Add a picture”',
+  };
 
   for (const it of items) {
+    // Note dropped content against the question it is in (or the next one, before any question).
+    for (const k of ['math', 'picture']) {
+      if (!it[k]) continue;
+      if (cur && !(it.kind === 'question' || (it.kind === 'text' && atBlockStart))) { if (!cur.notes.includes(DROP_NOTES[k])) cur.notes.push(DROP_NOTES[k]); }
+      else if (!pendingDrops.includes(DROP_NOTES[k])) pendingDrops.push(DROP_NOTES[k]);
+    }
+    if (it.kind === 'comment') continue;
     if (it.kind === 'blank') { atBlockStart = true; continue; }
     switch (it.kind) {
       case 'question':
@@ -471,7 +543,10 @@ function parseQuizText(text, options) {
       case 'option': case 'options': {
         // Options straight after a blank line belong to a question that has none yet
         // ("1. Q?\n\nA. …"); otherwise they are a block with no question line of its own.
-        if (!cur || cur.closed || (atBlockStart && cur.options.length)) start('');
+        // A blank line between "A. …" and "B. …" does not end the question: the letters run on.
+        const firstOpt = it.kind === 'options' ? it.items[0] : it;
+        const runsOn = cur && !cur.closed && firstOpt && firstOpt.letter && firstOpt.letter === LETTERS[cur.options.length];
+        if (!cur || cur.closed || (atBlockStart && cur.options.length && !runsOn)) start('');
         for (const o of (it.kind === 'options' ? it.items : [it])) addOption(cur, o);
         break;
       }
@@ -480,7 +555,7 @@ function parseQuizText(text, options) {
         else warn(null, `An answer line ("${shortQuote(it.value)}") appears before any question and was ignored.`);
         break;
       case 'time': case 'points':
-        if (cur) { cur[it.kind] = it.value; cur.closed = true; }
+        if (cur) { cur[it.kind] = it.value; if (it.poll) cur.poll = true; cur.closed = true; }
         else warn(null, `A ${it.kind} line appears before any question and was ignored.`);
         break;
       default: break;
@@ -488,6 +563,7 @@ function parseQuizText(text, options) {
     atBlockStart = false;
   }
   finish();
+  for (const note of pendingDrops) warn(null, note.charAt(0).toUpperCase() + note.slice(1) + '.');
 
   for (const n of keys.keys()) warn(null, `The answer key names question ${n}, but there is no question ${n}.`);
   if (overflow) {
@@ -638,8 +714,39 @@ function allRunsEmphasised(inner) {
 // lettered lists "A. B. C. …" (letters restart with every run of consecutive items). Table cells
 // and text boxes are paragraphs too. In a run of option lines where only some are bold,
 // underlined or highlighted, those get a trailing " *" (the right-answer marker).
+// Markers for content Word has but this reader cannot import; parseQuizText turns them into warnings.
+const DROPPED_MATH = '\uE000';
+const DROPPED_PICTURE = '\uE001';
+const MATH_RE = /<m:oMath\b/;
+// A picture's image data (a:blip, v:imagedata), a chart, or an embedded object (MathType and others).
+// Not <w:drawing> alone: a text box is a drawing too, and its text is read.
+const PICTURE_RE = /<a:blip\b|<v:imagedata\b|<c:chart\b|<w:object\b/;
+
+// Table rows in a label-and-text layout are one line: "A | Paris | ✓" reads as "A. Paris ✓",
+// "1 | Which organelle…?" as "1. Which organelle…?", "Paris | ✓" as "Paris ✓". Any other row (each
+// cell a whole line, or a whole question in one cell) is read paragraph by paragraph, as before.
+const CELL_LABEL_RE = /^(?:\(?[A-Fa-fकखगघअबसद]\)?[.):]?|\(?(?:i{1,3}|iv|I{1,3}|IV)\)?[.)]?|[Qq]?\d{1,3}[.):]?)$/;
+const CELL_MARK_RE = /^(?:[*★✓✔✅☑xX]|correct|right|answer|सही)$/i;
+function tableRows(xml) {
+  return xml.replace(/<w:tr\b[^>]*>([\s\S]*?)<\/w:tr>/g, (row, inner) => {
+    if (/<w:tbl\b/.test(inner)) return row;                              // a nested table: leave it alone
+    const cells = [...inner.matchAll(/<w:tc\b[^>]*>([\s\S]*?)<\/w:tc>/g)].map((c) => [...c[1].matchAll(/<w:p\b[^>]*>([\s\S]*?)<\/w:p>/g)].map((p) => p[1]));
+    const filled = cells.map((ps) => ps.filter((p) => paragraphText(p) || MATH_RE.test(p) || PICTURE_RE.test(p))).filter((ps) => ps.length);
+    if (filled.length < 2 || filled.some((ps) => ps.length > 1)) return row;
+    const body = (p) => p.replace(/<w:pPr>[\s\S]*?<\/w:pPr>/, '');
+    const run = (t) => `<w:r><w:t xml:space="preserve">${t}</w:t></w:r>`;
+    const first = paragraphText(filled[0][0]);
+    const label = CELL_LABEL_RE.test(first);
+    if (!label && !CELL_MARK_RE.test(paragraphText(filled[filled.length - 1][0]))) return row;
+    let out = body(filled[0][0]) + run(label && !/[.)\]:]$/.test(first) ? '. ' : ' ');
+    out += filled.slice(1).map((ps) => body(ps[0])).join(run(' '));
+    return `<w:p>${out}</w:p>`;
+  });
+}
+
 function docxLines(xml, numbering) {
   xml = xml.replace(/<mc:Fallback>[\s\S]*?<\/mc:Fallback>/g, '');   // text-box fallbacks duplicate their content
+  xml = tableRows(xml);
   const boxes = [];                                                  // text boxes nest <w:p> inside a <w:p>: hoist them
   xml = xml.replace(/<w:txbxContent>([\s\S]*?)<\/w:txbxContent>/g, (all, inner) => { boxes.push(inner); return ''; });
   xml += boxes.join('');
@@ -650,6 +757,8 @@ function docxLines(xml, numbering) {
     const inner = m[1];
     if (inner == null) { lines.push(''); optionLike.push(false); emphasised.push(false); runKey = null; continue; }
     let text = paragraphText(inner);
+    // An equation or a picture cannot be imported: say so where it was (parseQuizText warns).
+    const dropped = (MATH_RE.test(inner) ? DROPPED_MATH : '') + (PICTURE_RE.test(inner) ? DROPPED_PICTURE : '');
     const pPr = /<w:pPr>([\s\S]*?)<\/w:pPr>/.exec(inner);
     const props = pPr ? pPr[1].replace(/<w:pPrChange\b[\s\S]*?<\/w:pPrChange>/g, '') : '';
     const numPr = /<w:numPr>([\s\S]*?)<\/w:numPr>/.exec(props);
@@ -658,7 +767,7 @@ function docxLines(xml, numbering) {
     // paragraphs (grouped by list, so a numbered question list and a numbered option list stay apart).
     let isOption = text && (OPT_LETTER_RE.test(text) || BULLET_RE.test(text) || STAR_LETTER_RE.test(text)) ? 'opt' : null;
     if (!numPr || numId === '0' || !text) {
-      lines.push(text); runKey = null;
+      lines.push(text + dropped); runKey = null;
     } else {
       const ilvl = parseInt((/<w:ilvl\s+w:val="(\d+)"/.exec(numPr[1]) || [, '0'])[1], 10);
       const key = `${numId}/${ilvl}`;
@@ -672,7 +781,7 @@ function docxLines(xml, numbering) {
         else if (ilvl === 0) { const n = (counters.get(numId) || 0) + 1; counters.set(numId, n); text = `${n}. ` + text; }
         else text = '- ' + text;
       }
-      lines.push(text);
+      lines.push(text + dropped);
     }
     optionLike.push(isOption);
     emphasised.push(!!isOption && allRunsEmphasised(inner));
@@ -685,7 +794,10 @@ function docxLines(xml, numbering) {
     while (j < lines.length && optionLike[j] === optionLike[i]) j++;
     const marked = emphasised.slice(i, j).filter(Boolean).length;
     if (j - i >= 2 && marked > 0 && marked < j - i) {
-      for (let k = i; k < j; k++) if (emphasised[k] && !TRAIL_MARK_RE.test(lines[k])) lines[k] += ' *';
+      for (let k = i; k < j; k++) {
+        const bare = lines[k].replace(/[\uE000\uE001]+$/, '');
+        if (emphasised[k] && !TRAIL_MARK_RE.test(bare)) lines[k] = bare + ' *' + lines[k].slice(bare.length);
+      }
     }
     i = j;
   }

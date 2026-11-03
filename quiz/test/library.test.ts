@@ -15,7 +15,7 @@ test('a draft with problems can be stored: blank text, unticked answer, long tex
 });
 
 test('unknown fields are kept, byte for byte', () => {
-  const body = { title: 'T', questions: [q({ explanation: 'kept' })], extra: { a: 1 } };
+  const body = { title: 'T', questions: [q({ note: 'kept' })], extra: { a: 1 } };
   const r = checkLibraryBody(body);
   assert.equal(r.ok, true);
   if (r.ok) assert.deepEqual(JSON.parse(r.value.text), body);
@@ -36,9 +36,30 @@ test('the shape is enforced for schema 1', () => {
 });
 
 test('a newer schema is stored without looking inside', () => {
-  const r = checkLibraryBody({ schema: 2, title: 'Future', questions: [{ type: 'typein', answers: ['x'] }, 'odd'] });
+  const r = checkLibraryBody({ schema: 3, title: 'Future', questions: [{ type: 'drawing', strokes: ['x'] }, 'odd'] });
   assert.equal(r.ok, true);
-  if (r.ok) assert.equal(r.value.schema, 2);
+  if (r.ok) assert.equal(r.value.schema, 3);
+});
+
+test('schema 2: the new question types, as drafts too', () => {
+  const ok = checkLibraryBody({ schema: 2, title: 'T', questions: [
+    q({ type: 'multi', correct: [0, 1], partial: true }),
+    q({ type: 'multi', correct: [] }),
+    { type: 'typein', text: 'Capital?', accept: ['Paris', ''], timeLimit: 20, points: 1000 },
+    q({ type: 'poll', correct: undefined, points: 0, explanation: 'why', image: { key: 'k', alt: '' } }),
+  ] });
+  assert.equal(ok.ok, true, !ok.ok ? ok.error : '');
+  assert.equal(checkLibraryBody({ schema: 2, title: 'T', questions: [q({ type: 'quiz' })] }).ok, false);
+  assert.equal(checkLibraryBody({ schema: 2, title: 'T', questions: [q({ type: 'multi', correct: 1 })] }).ok, false);
+  assert.equal(checkLibraryBody({ schema: 2, title: 'T', questions: [{ type: 'typein', text: 'x', accept: 'Paris', timeLimit: 20, points: 1000 }] }).ok, false);
+});
+
+test('a quiz using new features must say schema 2, so a Phase 2 page keeps it read-only', () => {
+  assert.equal(checkLibraryBody({ title: 'T', questions: [q({ type: 'poll' })] }).ok, false);
+  assert.equal(checkLibraryBody({ title: 'T', questions: [q({ explanation: 'x' })] }).ok, false);
+  assert.equal(checkLibraryBody({ schema: 1, title: 'T', questions: [q({ image: { key: 'k', alt: 'a' } })] }).ok, false);
+  // Long text alone stays allowed in schema 1: Phase 2 pages saved such drafts.
+  assert.equal(checkLibraryBody({ title: 'T', questions: [q({ text: 'x'.repeat(300) })] }).ok, true);
 });
 
 test('the 200 KB limit is in UTF-8 bytes', () => {

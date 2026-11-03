@@ -27,7 +27,7 @@ const KEYS = {
   backup: 'hompub-quiz:backup:',        // + time: copies kept when something could not be used as it was
   old: 'hompub-quiz:quizzes',           // Phase 1: the whole list in one key (left untouched)
 };
-const KNOWN_SCHEMA = 1;
+const KNOWN_SCHEMA = 2;     // quiz schema this page can edit; a newer one is shown read-only and kept as it is
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const BATCH = 50;
 const LOCAL_FIELDS = ['id', 'updatedAt', 'exportedAt', 'version', 'hash'];

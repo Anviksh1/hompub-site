@@ -35,9 +35,10 @@
   --opt-2-edge: #b07f00;     /* the yellow tile's edge, 3.4:1 against the page (P0-31) */
   --opt-border: transparent;
 
-  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
-  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  /* Noto Devanagari first: it covers only Devanagari (fonts.css unicode-range), so other text keeps the system font. */
+  --font-ui: "Noto Sans Devanagari", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-display: "Noto Serif Devanagari", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", "Noto Sans Devanagari", monospace;
   --radius: 16px;
   --gutter-l: max(16px, env(safe-area-inset-left));    /* notched phones in landscape (P0-29) */
   --gutter-r: max(16px, env(safe-area-inset-right));
@@ -651,3 +652,30 @@ body[data-screen="open"] .toast {
 .rename-form h2 { font-size: 1.15rem; margin: 0; }
 .rename-form .row { display: flex; flex-wrap: wrap; gap: 10px; }
 .rename-form input { min-height: 48px; font-size: 1.1rem; }
+
+/* ---------- Phase 3: question types and pictures (PROTOCOL §2, §3, §14) ---------- */
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+.qpic { margin: 0; display: flex; justify-content: center; flex: none; }
+.qpic img { display: block; max-width: 100%; max-height: 22vh; width: auto; height: auto; object-fit: contain; border-radius: 10px; background: #ffffff; }
+.hint { text-align: center; font-weight: 600; color: var(--ink); flex: none; }
+.typein { display: flex; gap: 8px; flex: none; }
+.typein input {
+  flex: 1 1 auto; min-width: 0; min-height: 52px; padding: 10px 14px; font: inherit; font-size: 1.15rem;
+  border: 2px solid var(--ink-soft); border-radius: var(--radius); background: var(--paper); color: var(--ink);
+}
+.typein input:focus { outline: 3px solid var(--ink); outline-offset: 2px; }
+.typein input:disabled { opacity: 0.7; }
+.typein .btn { flex: none; min-height: 52px; }
+.grid.multi .opt[aria-pressed="true"] { box-shadow: 0 0 0 4px var(--paper), 0 0 0 8px var(--ink); }
+.grid.multi .opt[aria-pressed="true"]::after {
+  content: '✓'; position: absolute; top: 6px; right: 10px; font-size: 1.4rem; font-weight: 700; line-height: 1;
+}
+#multi-send { flex: none; min-height: 52px; }
+/* Several right answers add a Send button below the tiles: the tiles give up the room for it. */
+.grid.multi { grid-auto-rows: minmax(48px, 1fr); }
+.verdict[data-verdict="partial"] { color: var(--ink); }
+.explain { color: var(--ink); max-width: 36rem; overflow-wrap: anywhere; }
+@media (orientation: landscape) and (max-height: 500px) {
+  .qpic img { max-height: 34vh; }
+  section[data-screen="open"].with-text .qpic, section[data-screen="open"].with-text .hint { grid-column: 1; }
+}

@@ -19,6 +19,14 @@ import {
   renameCheck,
   sanitizeNick,
   scoreAnswer,
+  scoreMulti,
+  normalizeAnswer,
+  typedRight,
+  cleanTyped,
+  cutText,
+  codePoints,
+  quizSchema,
+  questionType,
   validateQuiz,
 } from '../src/shared.ts';
 
@@ -266,4 +274,144 @@ test('displayRanks: equal scores share a place and are marked tied', () => {
   assert.deepEqual(r.get('d'), { rank: 4, tied: true });
   assert.deepEqual(r.get('e'), { rank: 4, tied: true });
   assert.equal(displayRanks([]).size, 0);
+});
+
+// ------------------------------------------------------------ Phase 3 (schema 2)
+
+const KEY = 'a'.repeat(64) + '.webp';
+
+test('validateQuiz: a schema-1 quiz comes out exactly as before', () => {
+  const r = validateQuiz({ title: 'T', questions: [{ text: 'Q?', options: [' a ', 'b'], correct: 1, timeLimit: 30, points: 2000, extra: 1 }] });
+  assert.ok(r.ok);
+  if (r.ok) assert.deepEqual(r.value.questions[0], { text: 'Q?', options: ['a', 'b'], correct: 1, timeLimit: 30, points: 2000 });
+});
+
+test('validateQuiz: multi-select, typed answer and poll questions', () => {
+  const r = validateQuiz({
+    title: 'T',
+    questions: [
+      { type: 'multi', text: 'Primes?', options: ['2', '4', '5', '9'], correct: [2, 0, 2] },
+      { type: 'multi', text: 'Primes?', options: ['2', '4'], correct: [0], partial: true },
+      { type: 'typein', text: 'Capital of France?', accept: [' Paris ', 'paris', 'Paname'] },
+      { type: 'poll', text: 'Enjoying it?', options: ['Yes', 'No'] },
+    ],
+  });
+  assert.ok(r.ok, !r.ok ? r.error : '');
+  if (!r.ok) return;
+  const [m, m2, t, p] = r.value.questions;
+  assert.deepEqual(m, { type: 'multi', text: 'Primes?', options: ['2', '4', '5', '9'], correct: [0, 2], partial: false, timeLimit: 20, points: 1000 });
+  assert.equal(m2.type === 'multi' && m2.partial, true);
+  assert.deepEqual(t, { type: 'typein', text: 'Capital of France?', accept: ['Paris', 'Paname'], timeLimit: 20, points: 1000 });
+  assert.deepEqual(p, { type: 'poll', text: 'Enjoying it?', options: ['Yes', 'No'], timeLimit: 20, points: 0 });
+  assert.equal(questionType(m), 'multi');
+  assert.equal(questionType({}), 'single');
+});
+
+test('validateQuiz: explanation, picture and the 400-character limit', () => {
+  const long = 'क'.repeat(400);
+  const r = validateQuiz({ title: 'T', questions: [{ text: long, options: ['a', 'b'], correct: 0, explanation: ' Because. ', image: { key: KEY, alt: ' A cell ', w: 800, h: 600 } }] });
+  assert.ok(r.ok, !r.ok ? r.error : '');
+  if (r.ok) {
+    assert.equal(r.value.questions[0].explanation, 'Because.');
+    assert.deepEqual(r.value.questions[0].image, { key: KEY, alt: 'A cell', w: 800, h: 600 });
+  }
+  const bad: unknown[] = [
+    { text: 'x'.repeat(401), options: ['a', 'b'], correct: 0 },
+    { type: 'quiz', text: 'q', options: ['a', 'b'], correct: 0 },
+    { type: 'multi', text: 'q', options: ['a', 'b'], correct: [] },
+    { type: 'multi', text: 'q', options: ['a', 'b'], correct: [2] },
+    { type: 'multi', text: 'q', options: ['a', 'b'], correct: 0 },
+    { type: 'typein', text: 'q', accept: [] },
+    { type: 'typein', text: 'q', accept: ['...'] },
+    { type: 'typein', text: 'q', accept: ['a'], options: ['a', 'b'] },
+    { type: 'typein', text: 'q', accept: Array.from({ length: 11 }, (_, i) => `a${i}`) },
+    { type: 'poll', text: 'q', options: ['a', 'b'], points: 1000 },
+    { type: 'poll', text: 'q', options: ['a'] },
+    { text: 'q', options: ['a', 'b'], correct: 0, image: { key: 'x.webp', alt: 'a' } },
+    { text: 'q', options: ['a', 'b'], correct: 0, image: { key: KEY, alt: '' } },
+    { text: 'q', options: ['a', 'b'], correct: 0, image: { key: KEY, alt: 'a', w: 0 } },
+    { text: 'q', options: ['a', 'b'], correct: 0, explanation: 'x'.repeat(401) },
+  ];
+  for (const q of bad) {
+    const v = validateQuiz({ title: 'T', questions: [q] });
+    assert.equal(v.ok, false, JSON.stringify(q).slice(0, 80));
+  }
+});
+
+test('quizSchema: 2 once a quiz uses anything a schema-1 page cannot keep', () => {
+  assert.equal(quizSchema({ questions: [{ text: 'q', options: ['a', 'b'], correct: 0 }] }), 1);
+  assert.equal(quizSchema({ questions: [{ type: 'single', text: 'q' }] }), 1);
+  assert.equal(quizSchema({ questions: [{ type: 'poll', text: 'q' }] }), 2);
+  assert.equal(quizSchema({ questions: [{ text: 'q', explanation: '' }] }), 2);
+  assert.equal(quizSchema({ questions: [{ text: 'q', image: { key: KEY, alt: 'a' } }] }), 2);
+  assert.equal(quizSchema({ questions: [{ text: 'x'.repeat(201) }] }), 2);
+  assert.equal(quizSchema({ questions: [{ text: 'x'.repeat(200) }] }), 1);
+});
+
+test('scoreMulti: all or nothing, and partial credit beside the unchanged scoreAnswer', () => {
+  const full = scoreAnswer(true, 2000, 30, 1000, 'speed');
+  assert.deepEqual(scoreMulti([0, 2], [0, 2], false, 2000, 30, 1000, 'speed'), { points: full, right: true });
+  assert.deepEqual(scoreMulti([2, 0, 0], [0, 2], false, 2000, 30, 1000, 'speed'), { points: full, right: true });
+  assert.deepEqual(scoreMulti([0], [0, 2], false, 2000, 30, 1000, 'speed'), { points: 0, right: false });
+  assert.deepEqual(scoreMulti([0], [0, 2], true, 2000, 30, 1000, 'speed'), { points: Math.round(full / 2), right: false });
+  assert.deepEqual(scoreMulti([0, 1], [0, 2], true, 2000, 30, 1000, 'speed'), { points: 0, right: false });   // one right, one wrong
+  assert.deepEqual(scoreMulti([0, 2, 3], [0, 2], true, 2000, 30, 1000, 'speed'), { points: Math.round(full / 2), right: false });
+  assert.deepEqual(scoreMulti([1, 3], [0, 2], true, 2000, 30, 1000, 'speed'), { points: 0, right: false });
+  assert.deepEqual(scoreMulti([0], [0, 2], true, 2000, 30, 1000, 'accuracy'), { points: 0, right: false });
+  assert.deepEqual(scoreMulti([0, 2], [0, 2], true, 2000, 30, 1000, 'accuracy'), { points: 1, right: true });
+  assert.deepEqual(scoreMulti([0, 2], [0, 2], true, 2000, 30, 0, 'speed'), { points: 0, right: true });
+});
+
+test('normalizeAnswer: case, Latin accents and IAST ignored; Devanagari signs kept', () => {
+  assert.equal(normalizeAnswer('  New   Delhi. '), 'new delhi');
+  assert.equal(normalizeAnswer('“Paris”'), 'paris');
+  assert.equal(normalizeAnswer('Kṛṣṇa'), 'krsna');
+  assert.equal(normalizeAnswer('Śiva'), normalizeAnswer('siva'));
+  assert.equal(normalizeAnswer('ā ī ū ṛ ṣ ṇ ś ṃ'), 'a i u r s n s m');
+  assert.equal(normalizeAnswer('-5'), '-5');
+  assert.equal(normalizeAnswer('C++'), 'c++');
+  assert.equal(normalizeAnswer('राम।'), 'राम');
+  // Vowel signs and virama change the word: they are never stripped.
+  assert.notEqual(normalizeAnswer('कि'), normalizeAnswer('क'));
+  assert.notEqual(normalizeAnswer('क्'), normalizeAnswer('क'));
+  assert.notEqual(normalizeAnswer('कं'), normalizeAnswer('क'));
+  // Zero-width joiners only change the shape.
+  assert.equal(normalizeAnswer('क्‍ष'), normalizeAnswer('क्ष'));
+  // Composed and decomposed forms are the same answer.
+  assert.equal(normalizeAnswer('é'), normalizeAnswer('é'));
+});
+
+test('typedRight and cleanTyped', () => {
+  assert.equal(typedRight('paris', ['Paris']), true);
+  assert.equal(typedRight('Pariss', ['Paris']), false);
+  assert.equal(typedRight('...', ['...x']), false);
+  assert.equal(typedRight('Krishna', ['Kṛṣṇa', 'Krishna']), true);
+  assert.equal(cleanTyped('  Pa\u0000ris \n'), 'Pa ris');
+  assert.equal(cleanTyped(''), null);
+  assert.equal(cleanTyped('   '), null);
+  assert.equal(cleanTyped(5), null);
+  assert.equal(cleanTyped('x'.repeat(81)), null);
+  assert.equal(cleanTyped('क'.repeat(80)), 'क'.repeat(80));
+});
+
+test('shuffle is off by default and kept through settings', () => {
+  assert.equal(DEFAULT_SETTINGS.shuffle, false);
+  assert.equal(normalizeSettings({ shuffle: true }).shuffle, true);
+  assert.equal(mergeSettings(DEFAULT_SETTINGS, { shuffle: true }, false).shuffle, true);
+});
+
+test('cutText cuts between letters: no lone vowel sign, virama or half conjunct', () => {
+  assert.equal(cutText('Hello', 10), 'Hello');
+  assert.equal(cutText('नमस्ते दुनिया', 4), 'नम');            // never "नमस्" (half of स्त)
+  assert.equal(cutText('कि', 1), '');                        // the vowel sign never stands alone
+  assert.equal(cutText('क्षमा', 2), '');
+  assert.equal(cutText('क्षमा', 3), 'क्ष');
+  assert.equal(cutText('Kṛṣṇa', 3), 'Kṛ');   // IAST written with combining dots
+  assert.equal(cutText('a😀b', 2), 'a');                      // never half a surrogate pair
+  assert.equal(cutText('क्‍ष', 3), '');
+  // Names count code points: 20 at most, cut between letters.
+  const name = 'कृष्णकृष्णकृष्णकृष्ण';                         // 4 × 5 = 20 code points
+  assert.ok(codePoints(cutText(name + 'क', 20, codePoints)) <= 20);
+  assert.equal(sanitizeNick('अर्जुन कृष्ण मुरारी गोपाल'), cutText('अर्जुन कृष्ण मुरारी गोपाल', 20, codePoints).trim());
+  assert.doesNotMatch(sanitizeNick('अर्जुन कृष्ण मुरारी गोपाल'), /[्ा-ौ]$/u.source === '' ? /^$/ : /्$/u);
 });

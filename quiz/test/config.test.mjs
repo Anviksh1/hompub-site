@@ -78,3 +78,14 @@ test('migrations are numbered, additive SQL files', () => {
     assert.doesNotMatch(sql, /\b(DROP|RENAME)\b/i, `${f} only adds`);
   });
 });
+
+test('staging has its own picture bucket, with the same binding', () => {
+  const prod = config.r2_buckets;
+  const stag = config.env.staging.r2_buckets;
+  assert.equal(prod.length, 1);
+  assert.equal(stag.length, 1);
+  assert.equal(prod[0].binding, 'IMAGES');
+  assert.equal(stag[0].binding, prod[0].binding);
+  assert.equal(prod[0].bucket_name, 'hompub-quiz-images');
+  assert.equal(stag[0].bucket_name, 'hompub-quiz-images-staging');
+});

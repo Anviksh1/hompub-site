@@ -166,6 +166,24 @@ jobs:
 
       # The bookmark printed here is the "before" point: restore it with d1-restore to undo
       # what the migrations did. Wrangler skips its confirmation prompt in CI.
+      # Pictures (Phase 3 on): the bucket is created by hand, so check it before anything changes.
+      # Code without an R2 binding (an earlier release) skips this.
+      - name: Check the picture bucket (R2)
+        if: env.ACTION == 'deploy' || env.ACTION == 'redeploy-ref'
+        working-directory: quiz
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -u
+          if ! grep -q '"r2_buckets"' wrangler.jsonc; then echo "This code binds no picture bucket; nothing to check."; exit 0; fi
+          if ! npx wrangler r2 bucket info hompub-quiz-images > ../r2-out.txt 2>&1; then
+            cat ../r2-out.txt
+            echo "::error::The picture bucket hompub-quiz-images cannot be reached. Turn on R2 in the production Cloudflare account, create the bucket (private), and give the production token Account → Workers R2 Storage → Edit (quiz/README.md)."
+            exit 1
+          fi
+          echo "Picture bucket hompub-quiz-images is there."
+
       - name: Apply quiz library migrations (D1)
         if: env.ACTION == 'deploy' || env.ACTION == 'redeploy-ref'
         working-directory: quiz

@@ -19,7 +19,7 @@ teacher who left the quiz page during a question (students are told it is on).
 The referee is open source (MIT) so a school can run its own copy and own the
 data end to end.
 
-## Architecture in six lines
+## Architecture in seven lines
 
 1. The join, player and host pages are plain HTML/CSS/JS served as
    [Workers Static Assets](https://developers.cloudflare.com/workers/static-assets/)
@@ -35,6 +35,9 @@ data end to end.
 6. The teacher's quizzes live in one D1 database (`src/library.ts`, binding
    `DB`, schema in `migrations/`), cached in the host browser by
    `public/library.js` so editing works offline. It holds quizzes only.
+7. Question pictures live in one private R2 bucket (`src/images.ts`, binding
+   `IMAGES`), served only through `/api/images/…`; D1 records which quizzes use
+   which picture, and pictures no quiz has used for 8 days are removed.
 
 Everything the pieces agree on — URLs, frames, phases, scoring, reconnect rules,
 limits — is in [PROTOCOL.md](PROTOCOL.md). If code and that document disagree,
@@ -120,14 +123,19 @@ account is needed.
   rankings and the CSV, and exits non-zero on any violation. Flags:
   `--url --players (up to 400) --questions --time-limit --answer-window --drop
   --join-burst --seed --quiz <file> --passcode --v2 <share of Phase 1 phones>
-  --focus --ip-per-bot --dev-stats --verbose --help` (e.g.
+  --v3 <share of Phase 2 phones> --focus --ip-per-bot --dev-stats --verbose --help` (e.g.
   `node test/load.mjs --players 12 --questions 2` for a 30-second smoke run).
   `--focus` turns Focus check on and checks every report reaches the host.
   Delete `.wrangler/state/` to reset local rooms, counters, lockouts and the
   local quiz library.
 - `node test/library-dev.mjs --base http://localhost:8787 --passcode '…'` checks
   the library API (versions, conflicts, Trash, the 500-quiz cap with `--cap`);
-  `node test/focus-dev.mjs` (same flags) plays a short game with Focus check.
+  `node test/focus-dev.mjs` (same flags) plays a short game with Focus check;
+  `node test/types-dev.mjs` (same flags) plays every question type and checks
+  picture uploads; `node test/images-gc-dev.mjs` (same flags, local server
+  only: it edits the local database to skip ahead 9 days) checks how pictures
+  are tracked and removed. The load harness's `--v3 <share>` runs some phones
+  as Phase 2 pages.
 - `npm run typecheck` runs the TypeScript compiler over `src/`.
   `npm test` runs the unit tests: scoring, validation, the name filter and
   name rules, sessions, the Origin rule, the guess limiters, the idle-wipe
@@ -170,15 +178,25 @@ A browser tab opens asking you to allow Wrangler (Cloudflare's command-line
 tool) to act on your account. Allow it and close the tab. The token is stored
 in your user profile; you do not need to repeat this.
 
-### 3. Create the quiz library, then deploy
+### 3. Create the quiz library and the picture bucket, then deploy
 
 ```
 npx wrangler d1 create hompub-quiz-library
 ```
 
 It prints a `database_id`. Put it in `wrangler.jsonc` under `d1_databases`
-(replacing the id there, which belongs to the HomPub deployment), then create
-the tables and deploy:
+(replacing the id there, which belongs to the HomPub deployment).
+
+Pictures need R2, Cloudflare's file storage. It is free up to 10 GB a month,
+but Cloudflare asks for a payment method before R2 can be used: in the
+dashboard open **Storage & databases → R2** and complete the sign-up. Then
+create a bucket named `hompub-quiz-images` (location Automatic, storage class
+Standard) and leave public access off: no r2.dev link and no custom domain.
+Pictures are served only through the Worker. (`npx wrangler r2 bucket create
+hompub-quiz-images` does the same from the terminal once R2 is turned on.)
+A different name goes in `wrangler.jsonc` under `r2_buckets`.
+
+Then create the tables and deploy:
 
 ```
 npx wrangler d1 migrations apply DB --remote
@@ -321,9 +339,12 @@ account**, or lists only that account under *Account Resources*.
 **Setting up** (once):
 
 1. In each Cloudflare account: **My Profile → API Tokens → Create Token →
-   Edit Cloudflare Workers**, add **Account → D1 → Edit**, restrict *Account
-   Resources* and *Zone Resources* to that account only, and check the summary
-   before creating it.
+   Edit Cloudflare Workers**, add **Account → D1 → Edit** and **Account →
+   Workers R2 Storage → Edit**, restrict *Account Resources* and *Zone
+   Resources* to that account only, and check the summary before creating it.
+   Each account also needs R2 turned on and its picture bucket created by hand
+   (`hompub-quiz-images` in production, `hompub-quiz-images-staging` in
+   staging; private, no public access), before the first deploy that binds it.
 2. A new account needs its `workers.dev` subdomain chosen once in the
    dashboard (**Workers & Pages**); a non-interactive deploy cannot do it.
    Before deploying, the staging workflow reads that subdomain with the
@@ -381,6 +402,16 @@ tags the deployed commit.
   a banner) and reloads instead of sending stale edits. For a copy kept outside
   Cloudflare, run `npx wrangler d1 export DB --remote --output library.sql`
   from a laptop, or use **Export all**.
+- **Rolling back to Phase 2** (`redeploy-ref` with `quiz-phase-2`): roll back
+  outside class, since a game running on the new question types cannot go on
+  under Phase 2 code. Quizzes stay in the library; a Phase 2 page shows the ones
+  that use Phase 3 features (schema 2) read-only and never changes them, and
+  can still host the others. The `images` tables and the bucket stay, unused:
+  pictures are not removed while Phase 2 runs (it has no clean-up), and the
+  links in schema-2 quizzes keep working when Phase 3 is deployed again. To use
+  a schema-2 quiz under Phase 2, first do **Export** on it (the file keeps the
+  pictures), then remove the new features in the Phase 3 editor, or wait for
+  the roll-forward.
 
 ### Deploys interrupt live games
 
@@ -444,6 +475,17 @@ in words instead of freezing. Staging is in its own account, so its tests do
 not count against these. Smaller classes and shorter
 quizzes cost proportionally less. Keepalive `ping`s are answered at the edge
 without waking the room, and the static pages are not metered at all.
+
+**Pictures** are in R2, which is free up to 10 GB-month of storage, 1 million
+Class A operations (uploads) and 10 million Class B operations (reads) a month,
+with no charge for data sent; above those, R2 bills the account (R2 needs a
+payment method on file, unlike Workers Free). The library allows 5,000 pictures
+of at most 1 MB, so at most about half the free storage. Each picture a phone
+shows is one Worker request (and one R2 read) the first time; the browser then
+keeps it. A 300 × 30 game with a picture on every question shown on phones
+adds about 9,000 requests, so about 11 such games a day by requests alone,
+which is still more than rows written allow. The projector loads each picture
+once.
 
 If a cap is hit, that operation fails until 00:00 UTC — a room creation returns
 an error, or an open question's writes fail — and **nothing is billed**; the
@@ -558,6 +600,20 @@ holds it up as follows:
   call, a notification or the screen locking look the same as leaving; some
   Android split-screen modes are not noticed. Treat it as a signal to look
   into, not as proof.
+- **Question types.** Each question in the editor can have one right
+  answer (as before), several right answers (students tick them all and press
+  Send; "Partial credit" gives part of the points for a partly right answer),
+  a typed answer (students type it; list every spelling you accept: capitals,
+  accents such as ā or ṣ, and extra spaces do not matter), or be a poll (no
+  right answer, no points). A question can have an explanation, shown on the
+  projector and the phones after the answer is revealed, and a picture: it is
+  shrunk on the laptop, saved to your library, and shown beside the question
+  (and on phones when questions are shown there). Describe each picture for
+  students who cannot see it. "Shuffle the options on each phone" (with
+  questions shown on phones) gives every student their own order, so
+  neighbours cannot copy by position or colour; the projector keeps A–D.
+  Questions can have up to 400 characters, and Devanagari is shown in Noto
+  fonts served by this site.
 - **If WebSockets are blocked:** connect the **host laptop only** to the guest
   network or to your phone's hotspot. Students do not connect to the laptop,
   they connect to the referee on the internet, so they can stay on the school
@@ -642,14 +698,21 @@ Answer: A
   without a number, and so is the first line of a block. Word's automatic
   numbering is read as well, so a numbered list in Word works without typing
   the numbers.
-- **Option lines.** `A.` `A)` `(A)` `a.` `a)` `[A]`, or a bullet (`-` `•` `–` `*`
-  `○`). Two to four options per question; a fifth is dropped with a warning.
-  Word's bullet lists work too.
+- **Option lines.** `A.` `A)` `(A)` `a.` `a)` (also `a)text` with no space)
+  `[A]` `A - text`, Devanagari `क.` `(क)`, Hindi `अ.` `ब)` `(स)` `द:`, roman
+  `(i)` `i.` `I.`–`IV.`, or a bullet (`-` `•` `–` `*` `○`). Two to four options
+  per question; a fifth is dropped with a warning. Word's bullet lists work too.
+  A blank line between options does not end the question when the letters run
+  on (`A.`, blank, `B.`).
 - **Marking the correct answer** — any one of these:
   - a `*` at the start or end of the option: `B. Mitochondrion *` or `B. *Mitochondrion`;
   - `✓`, `✔`, `(correct)`, `(right)`, `[x]`, `(x)` or `<-- correct` at the end of the option;
   - a line after the options: `Answer: B`, `Ans: b`, `Correct: B`, `Key: B`, or
-    the option's text, `Answer: Mitochondrion` (case and punctuation do not matter).
+    the option's text, `Answer: Mitochondrion` (case and punctuation do not matter),
+    or a Devanagari or Hindi letter (`उत्तर: ख`, `सही उत्तर: ब`).
+  - **Several right answers:** mark two or more options, or `Answer: A, C`
+    (also `A and C`, `A & C`): the question becomes one with several right
+    answers.
 
   - **in a Word file (.docx) only:** the one option that is **bold**,
     underlined or highlighted while the others are not. If every option is
@@ -664,17 +727,28 @@ Answer: A
 - **Time limit.** `(30s)` at the end of the question line, or a line `Time: 30`,
   `Timer: 30 s` or `30 seconds` after the options. Snapped to the nearest
   allowed value: 5, 10, 15, 20, 30, 60, 90, 120 or 240 seconds. Default 20.
-- **Points.** A line `Points: 2000` or `double points` for 2000; `Points: 0`,
-  `no points` or `survey` for a survey question nobody scores on. Default 1000.
+- **Points.** A line `Points: 2000` or `double points` for 2000; `Points: 0` or
+  `no points` for a practice question nobody scores on. Default 1000.
+- **Polls and typed answers.** `(poll)` or `(survey)` on the question, or a
+  line `poll`, with no answer marked: a poll (no right answer, no points). A
+  question with no options and only an answer line, `Answer: Paris / Paree`,
+  is a typed-answer question; `/`, `;`, `|` or `or` separate the spellings
+  accepted.
 - **Limits**, the same as the editor's: title up to 80 characters, question text
-  200, each option 80 (longer text is cut, with a warning); up to 100 questions
+  400, each option 80 (longer text is cut between letters, never inside a
+  Devanagari conjunct, with a warning); up to 100 questions
   (extra ones are skipped, with a warning); a question with fewer than two
   options is skipped and named in the warnings. Files larger than 5 MB are
   refused — a quiz is text, so remove the pictures or paste the text instead.
 - **Files.** `.docx` (Word 2007 or later, and Google Docs → Download → Word) and
   plain text (`.txt`, `.md`). Old `.doc` files, PDFs and `.pages` are not read:
-  save as `.docx` first, or copy the text and use **Paste questions**. Tables are
-  read cell by cell, one cell per line.
+  save as `.docx` first, or copy the text and use **Paste questions**. In tables,
+  a row whose first cell is only a label (`A`, `(b)`, `1`, `Q2`) or whose last
+  cell is only a mark (`✓`, `*`) reads as one line (`A | Paris | ✓` → `A. Paris ✓`);
+  other cells are read one per line. Word equations, pictures, charts and
+  embedded objects cannot be imported: the preview says which question had
+  one, so you can type the equation or add the picture in the editor. Zero-width
+  joiners in Devanagari text are kept.
 
 After importing, the quiz is in your library like any other. The Word file is
 not a backup of the quiz as the editor sees it (it may lack the ticked

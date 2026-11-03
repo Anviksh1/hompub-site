@@ -1,4 +1,4 @@
-# HomPub Quiz — protocol and contract (v3, pilot)
+# HomPub Quiz — protocol and contract (v4, pilot)
 
 This document is the single source of truth for every component in `quiz/`:
 the Cloudflare Worker (`src/worker.ts`), the `Room` Durable Object
@@ -8,9 +8,11 @@ page (`public/index.html`) and the load harness (`test/load.mjs`). If code and
 this document disagree, fix one of them in the same commit.
 
 Protocol 2 added host sign-in, roster deltas, renames and the other Phase 1
-changes. Protocol 3 (this version) adds Focus check (§13); the synced quiz
-library (§12) arrived with it. What changed, and how pages from before it keep
-working, is in §11.
+changes. Protocol 3 added Focus check (§13); the synced quiz library (§12)
+arrived with it. Protocol 4 (this version) adds question types (several right
+answers, a typed answer, a poll), explanations, pictures (§14), per-phone
+option order, and 400-character questions: quiz schema 2. What changed, and how
+pages from before it keep working, is in §11.
 
 ## 1. Roles, pages, URLs
 
@@ -26,17 +28,18 @@ budget). Only `/api/*` invokes the Worker.
 | `GET /` | Join page: enter a 6-digit PIN → navigates to `/play?pin=XXXXXX` |
 | `GET /play?pin=XXXXXX` | Player page (phone). Also the target of the QR code. |
 | `GET /host` | Host page (laptop): quiz editor, lobby, game control, results |
-| `GET /api/health` | `200 {"ok":true,"now":<ms>,"version":"0.3.0","proto":3}` |
+| `GET /api/health` | `200 {"ok":true,"now":<ms>,"version":"0.4.0","proto":4}` |
 | `POST /api/session` | Sign in. Body `{"passcode": "...", "shared"?: true}`. `200 {"signedIn":true,"shared","expiresAt","library"}` and `Set-Cookie: __Host-hq_session=…; Path=/; Secure; HttpOnly; SameSite=Strict` (with `Max-Age`, except for a shared computer). `401 {"error":"wrong_passcode","remaining","message"}`. `429 {"error":"locked","retryAfter","message"}` + `Retry-After` after 5 wrong passcodes from one network in 15 minutes. `503 {"error":"not_configured"\|"passcode_too_short"\|"try_again","message"}`. |
 | `GET /api/session` | `200 {"signedIn":true,…}` (renews the cookie when due) or `200 {"signedIn":false[,"problem","message"]}`. `?passive=1`: the host page's timer, not the teacher, is asking; a shared-computer session is then not renewed, so its 4-hour idle limit holds while the tab stays open (it is never renewed past 12 hours in any case). |
 | `DELETE /api/session` | Sign out on this device: clears the cookie. `200 {"signedIn":false}`. |
 | `GET /api/rooms` | Signed in: `200 {"rooms":[{"pin","title","phase","playerCount","createdAt"}]}`, this library's live games (at most 10, newest first). Never contains host tokens. `401` signed out. |
 | `/api/library…` | Signed in only: the synced quiz library (§12). |
+| `POST /api/images`, `GET /api/images/:key` | Question pictures (§14): upload signed in only; reading needs no sign-in. |
 | `GET /api/echo` | WebSocket echo (handled in the Worker, no Durable Object). Used by the network preflight. Any text frame is echoed back verbatim. Closes after 60 s. |
 | `POST /api/room` | Signed in only (`401 {"error":"sign_in"}` otherwise). Create a room. Body: `{"quiz": Quiz, "settings"?: Settings}`. Response `200 {"pin":"123456","hostToken":"<32 hex>","roomKey":"<16 hex>","joinUrl":"https://<host>/play?pin=123456&k=<roomKey>"}`. Errors: `400 {"error":"..."}` (invalid quiz), `413` (body > 200 KB), `429 {"error":"too_many_rooms"}` (whole-deployment daily cap; signed-in hosts skip the per-network cap), `503 {"error":"no_pin_available"\|"not_configured"\|…}`. |
 | `GET /api/room/:pin[?k=<roomKey>]` | Room summary for the join page: `200 {"pin","phase","playerCount","locked","lateJoin","nicknameMode","nameMode","allowRename"}` or `404 {"error":"not_found"}`, or `429 {"error":"rate_limited","retryAfter","message"}` (§9). No quiz title: anyone who guesses a PIN could read it. |
-| `GET /api/room/:pin/ws?role=host&v=3` | Host WebSocket. Needs the session cookie (checked by the Worker, which then vouches for the socket); otherwise the host token goes in a first `auth` frame (§4.2). A token in the URL is ignored. A version-1 page (no `v`) is refused with `4010` "This page is out of date…" because it cannot sign in. |
-| `GET /api/room/:pin/ws?role=player&v=3[&k=<roomKey>][&token=<playerToken>]` | Player WebSocket. `token` present = reconnect attempt. `k` = the room key from the QR code / join link. `v=2` pages still play (§11); a page without `v` (version 1) is refused with `4010` "This page is out of date. Reload it to join the game." |
+| `GET /api/room/:pin/ws?role=host&v=4` | Host WebSocket. Needs the session cookie (checked by the Worker, which then vouches for the socket); otherwise the host token goes in a first `auth` frame (§4.2). A token in the URL is ignored. A version-1 page (no `v`) is refused with `4010` "This page is out of date…" because it cannot sign in; so is a version-3 page in a room whose quiz uses the protocol-4 types (§11). |
+| `GET /api/room/:pin/ws?role=player&v=4[&k=<roomKey>][&token=<playerToken>]` | Player WebSocket. `token` present = reconnect attempt. `k` = the room key from the QR code / join link. `v=2` and `v=3` pages still play a quiz of one-right-answer questions (§11); a page without `v` (version 1) is refused with `4010` "This page is out of date. Reload it to join the game." |
 
 `:pin` must match `^[1-9][0-9]{5}$`. Any other `/api/*` path → `404 {"error":"not_found"}`.
 The join page treats a summary whose `phase` is `podium` or `ended` as too late to join, matching the Room, which refuses new players in both phases with `4004`.
@@ -48,7 +51,7 @@ the `ALLOWED_ORIGINS` var (comma-separated). Otherwise `403`. Requests without
 an `Origin` header (curl, the load harness) are allowed.
 
 **Requests that use the session cookie** (`/api/session`, `/api/rooms`,
-`/api/library…`, `POST /api/room`, the host socket) follow a stricter rule: POST, PUT, DELETE
+`/api/library…`, `/api/images…`, `POST /api/room`, the host socket) follow a stricter rule: POST, PUT, DELETE
 and WebSocket upgrades need `Origin` equal to the page's origin, and a missing
 Origin is refused; GET and HEAD refuse a foreign Origin and a `Sec-Fetch-Site`
 that is present and not `same-origin`, but accept a missing Origin (browsers
@@ -68,28 +71,44 @@ and `wss://` in production; clients derive the scheme from `location.protocol`.
 
 ```jsonc
 {
+  "schema": 2,                             // 2 once the quiz uses anything below marked "schema 2"; missing = 1
   "title": "Cell biology — week 6",       // 1..80 chars
   "questions": [                           // 1..100 questions
     {
-      "text": "Which organelle makes ATP?",  // 1..200 chars
+      "text": "Which organelle makes ATP?",  // 1..400 chars (a schema-1 quiz keeps to 200)
       "options": ["Ribosome", "Mitochondrion", "Golgi body", "Nucleus"], // 2..4 strings, each 1..80 chars
       "correct": 1,                          // index into options
       "timeLimit": 20,                       // seconds, one of 5,10,15,20,30,60,90,120,240
-      "points": 1000                         // 0 | 1000 | 2000  (0 = survey question, nobody scores)
-    }
+      "points": 1000,                        // 0 | 1000 | 2000  (0 = practice: nobody scores, the right answer is still shown)
+      "explanation": "Mitochondria make ATP.",   // schema 2, optional, 1..400 chars: shown after the reveal
+      "image": { "key": "<sha256>.webp", "alt": "A mitochondrion", "w": 1600, "h": 1067 }  // schema 2, optional (§14); alt 1..150 chars
+    },
+    // schema 2: other types. A question without "type" is the one-right-answer question above.
+    { "type": "multi",  "text": "…", "options": ["…"], "correct": [0, 2], "partial": false, "timeLimit": 20, "points": 1000 },
+    { "type": "typein", "text": "…", "accept": ["Kṛṣṇa", "Krishna"], "timeLimit": 20, "points": 1000 },
+    { "type": "poll",   "text": "…", "options": ["…"], "timeLimit": 20, "points": 0 }
   ]
 }
 ```
 
-A stored quiz may also carry `"schema": 1` (missing means 1) and fields this
-version does not know; the library keeps both. A page that meets a quiz with a
-newer `schema` opens it read-only and never saves, hosts or changes it (§12).
+- `multi`: `correct` lists every right option (1 or more, sorted, no repeats);
+  `partial` (default false) gives part of the points for a partly right
+  answer (§3).
+- `typein`: no options; `accept` lists 1..10 answers (each 1..80 chars) that
+  count as right, compared as in §3.
+- `poll`: no right answer and no points (`points` must be 0).
+
+A stored quiz may also carry fields this version does not know; the library
+keeps them. `schema` is 2 when a quiz uses a `type`, an `explanation`, an
+`image` or text over 200 characters; a page never lowers it. A page that meets a
+quiz with a newer `schema` opens it read-only and never saves, hosts or changes
+it (§12): a Phase 2 page (schema 1) keeps schema-2 quizzes intact that way.
 
 Option slots are fixed to Kahoot's shape/colour pairs so colour-blind players
 can play by shape: index 0 = red triangle, 1 = blue diamond, 2 = yellow
 circle, 3 = green square. Letters A–D are used in CSV and text.
 
-### Settings (host may change until `start`; `showOnDevices`, `lateJoin` and `allowRename` may change any time; `focusCheck` any time except during `intro` and `open`)
+### Settings (host may change until `start`; `showOnDevices`, `lateJoin` and `allowRename` may change any time; `focusCheck` and `shuffle` any time except during `intro` and `open`)
 
 ```jsonc
 {
@@ -100,6 +119,7 @@ circle, 3 = green square. Letters A–D are used in CSV and text.
   "nameMode": "typed",      // "typed" (default) = typed names only, no random-name button | "either" = typed or random | "random" = random two-word names only
   "allowRename": true,      // students may change their own name (rename frame). Switched off by the server at start; the host may switch it on again.
   "focusCheck": false,      // phones report leaving the page during a question (§13). Off by default.
+  "shuffle": false,         // protocol 4: each phone shows the options in its own order (§3), only while showOnDevices is on
   "nicknameMode": "free"    // legacy, always derived: "spin" when nameMode is "random", else "free". Still written, so a server rolled back to protocol 2 reads stored rooms unchanged.
 }
 ```
@@ -141,11 +161,37 @@ mode "speed" (Kahoot's published formula):
 
 Worked check: 2 s on a 30 s, 1000-point question → 1000 × (1 − (2/30)/2) = 966.7 → **967**.
 
+**Question types (protocol 4).** The formula above is unchanged; the types
+decide whether an answer is right:
+
+- `multi`: right only when the chosen options are exactly `correct`; it then
+  scores as above. With `partial`, a partly right answer gets
+  `round(that score × (rightPicks − wrongPicks) / rightOptions)`, never below 0;
+  in mode `accuracy` only a fully right answer scores (1 point).
+- `typein`: right when the typed text matches one of `accept` after
+  normalising both: Unicode NFD, the Combining Diacritical Marks block
+  (U+0300–U+036F) removed (so IAST "Kṛṣṇa" matches "Krsna"; Devanagari vowel
+  signs, virama and anusvara are kept), zero-width joiners removed, NFC,
+  lower case, runs of spaces made one, surrounding quotes and closing
+  punctuation (`. ! ? , ; : । ॥`) removed. A leading sign stays ("-5" is not "5").
+- `poll`: no right answer, 0 points; a poll neither extends nor breaks a streak.
+
+"Fastest correct" (`reveal.fastest`) is given only for a question worth points
+that has a right answer: null for a poll and for a 0-point question.
+
+**Shuffle.** With `settings.shuffle` and `showOnDevices`, the question view
+carries `"shuffle": true`. Each phone shows option `order[k]` in tile `k`,
+where `order` is a Fisher–Yates shuffle driven by mulberry32 seeded with the
+32-bit FNV-1a hash of `"<pid>:<q>"`, so the order is the same after a reload.
+Tiles keep their position's shape and colour; the phone sends the option's own
+index, so the server needs nothing to undo it.
+
 Order: by `score` descending, then lower `elapsedTotal` (sum of `elapsed` over
-*correct* answers), then earlier `joinedAt`. This strict order decides the top
+*right* answers), then earlier `joinedAt`. This strict order decides the top
 three and the CSV. The rank shown (`rank`, with `tied`) is by score alone:
 equal scores share a place (1, 2, 2, 4) and are marked tied. `streak` counts
-consecutive correct answers and is display-only (no bonus points).
+consecutive right answers (a partly right one breaks it) and is display-only
+(no bonus points).
 
 One answer per player per question: enforced in the Room by an in-memory set
 for the open question and by the persisted `answers` JSON. A second tab or a
@@ -173,6 +219,8 @@ reason="duplicate"`).
 | `{"t":"join","spin":true,"joinId":"…"}` | first connection | a random two-word name (adjective + animal, e.g. `Brave Otter`). Refused with `join_rejected` (`random_off`) when `nameMode` is `"typed"`. A `join` after joining gets `error` `already_joined`; a new name goes through `rename`. |
 | `{"t":"rename","nick":"Priya S"}` / `{"t":"rename","random":true}` | any phase while `settings.allowRename` | Same checks as joining (sanitising, deny-list, 20 characters, duplicate numbering). At most 3 renames per player, counted apart from spins. Typed names refused when `nameMode` is `"random"`, random ones when it is `"typed"`. Reply `renamed` or `rename_rejected` (old name kept); the host gets `player_updated`. |
 | `{"t":"answer","q":3,"choice":1}` | phase `open` | `q` must equal the current question index; `choice` an integer in `[0, optionCount)`. Refusal reasons are checked in this order: wrong `q` or not open/closed → `closed`; phase `closed` → `late`; bad `choice` → `invalid`; already answered → `duplicate`. |
+| `{"t":"answer","q":3,"choice":[0,2]}` | phase `open`, a `multi` question | 1..optionCount distinct option indices (any order); anything else → `invalid`. |
+| `{"t":"answer","q":3,"text":"Krishna"}` | phase `open`, a `typein` question | 1..80 characters (code points) after control and bidi-control characters become spaces and spaces are collapsed; empty or longer → `invalid`. |
 | `{"t":"away","q":3,"n":2,"ms":14000,"copies":1}` | version 3, a question checked by Focus check (§13) | running totals for question `q` from this page: times the student left the page, ms away, blocked copies. No reply. |
 
 A reconnecting player (`?token=`) sends nothing; the server replies with `sync`.
@@ -222,28 +270,32 @@ Every frame has `t`. Frames with times carry `serverNow` (ms since epoch, server
 
 ```jsonc
 {
-  "t": "sync", "proto": 3, "serverNow": 1760000000000,
+  "t": "sync", "proto": 4, "serverNow": 1760000000000,
   "role": "player" | "host",
   "pin": "123456", "title": "Cell biology — week 6",
   "phase": "open", "q": 3, "total": 20,
   "focusQs": [0, 1, 2, 3],                   // questions opened while Focus check was on (§13)
   "locked": false, "settings": { ...Settings... }, "playerCount": 97,
   "question": null | {                       // present in intro / open / closed
-    "q": 3, "total": 20, "optionCount": 4, "timeLimit": 20, "points": 1000,
+    "q": 3, "total": 20, "type": "single" | "multi" | "typein" | "poll", "optionCount": 4, "timeLimit": 20, "points": 1000,
     "opensAt": 1760000003000, "deadline": 1760000023000,
-    "text": "...", "options": ["..."]        // host always; players only when settings.showOnDevices
-  },
+    "text": "...", "options": ["..."],       // host always; players only when settings.showOnDevices (a typein has options [], optionCount 0)
+    "image": { "url": "/api/images/<key>", "alt": "...", "w": 1600, "h": 1067 },  // with the text, if the question has a picture
+    "shuffle": true                          // with the text, when settings.shuffle (§3)
+  },                                         // never the answer key, accepted answers or the explanation
   // ---- player only ----
   // During intro and open, score and rank are as before the current question, and streak is null once
   // the player has answered it: nothing a player gets may tell whether this answer was right before `closed`.
   "me": { "pid": "p_ab12", "nick": "Priya", "score": 2310, "rank": 12, "tied": false, "streak": 2,
-          "answered": true, "choice": 1,       // answered/choice refer to the current question
+          "answered": true, "choice": 1,       // answered/choice refer to the current question; choice is [..] for multi, null for typein
+          "typed": "Krishna",                  // typein only, once answered
           "spins": 1,                          // name spins used so far (max 3)
           "renamesLeft": 3 },                  // student renames still allowed (max 3)
   "result": { ...same fields as the result frame, without t... },   // only in phase closed
-  "recap": { "q": 2, "right": true, "choice": 1, "points": 912, "survey": false, "closedAt": 1760000041000, "score": 2310, "rank": 12, "tied": false, "playerCount": 97 },
+  "recap": { "q": 2, "type": "single", "right": true, "choice": 1, "typed": "…", "points": 912, "survey": false, "closedAt": 1760000041000, "score": 2310, "rank": 12, "tied": false, "playerCount": 97 },
                                              // intro / open of question 2 onwards: the result of question q-1, for a phone away at its reveal.
-                                             // `right`: true / false / null (no answer). No `correct` index: players never get one before `closed`.
+                                             // `right`: true / false / null (no answer, or a poll). `survey`: a poll or a 0-point question.
+                                             // No `correct`: players never get the answer key before `closed`.
   "podium": { "top": [{"nick":"...","score":1234,"rank":1,"tied":false}, ...], "you": {"score": 2310, "rank": 12, "tied": false} }, // podium / ended
   "played": true,                                                    // ended only: whether any question was answered
   // ---- host only ----
@@ -271,11 +323,11 @@ Every frame has `t`. Frames with times carry `serverNow` (ms since epoch, server
 | `intro` | `question` (same object as in `sync`), `serverNow` |
 | `open` | `q, deadline, serverNow` |
 | `ack` | `q, accepted:boolean, reason?: "late" \| "duplicate" \| "closed" \| "invalid" \| "unavailable"` (`unavailable`: the answer could not be saved, see `storage_full`) |
-| `result` | `q, correct:int, choice:int\|null, points:int, score:int, rank:int, tied:boolean, streak:int, playerCount:int, closedAt` (sent to every player at close, including those who did not answer; `closedAt` is when the question closed, server time) |
+| `result` | `q, type, correct, right:boolean\|null, choice, typed?, points:int, explanation?, score:int, rank:int, tied:boolean, streak:int, playerCount:int, closedAt` (sent to every player at close, including those who did not answer; `closedAt` is when the question closed, server time). `correct`: the right option's index; for `multi` the indices; for `typein` the accepted answers; null for a poll. `right`: whether this player's answer was right (null: no answer, or a poll); a partly right `multi` answer is `false` with points above 0. `choice`: as sent (an index, the sorted indices, or null for typein, whose text is `typed`). |
 | `podium` | `top:[{nick,score,rank,tied}] (≤3), you:{score,rank,tied}, playerCount` |
 | `ended` | `played:boolean` — clear the localStorage entry. `played: false`: the host ended the game before any answer. |
 | `kicked` | — (then close 4003) |
-| `settings` | `settings`, plus `question` (the same object as in `sync`, present in intro/open/closed, only when `showOnDevices` changed) — sent when the host changes `showOnDevices`, `nameMode`, `allowRename` or `focusCheck`; clients update settings and question and keep any in-progress answer UI |
+| `settings` | `settings`, plus `question` (the same object as in `sync`, present in intro/open/closed, only when `showOnDevices` changed) — sent when the host changes `showOnDevices`, `nameMode`, `allowRename`, `focusCheck` or `shuffle`; clients update settings and question and keep any in-progress answer UI |
 | `error` | `code, message` (also `join_timeout`: no successful join within 60 s) |
 
 **Host frames**
@@ -290,19 +342,19 @@ Every frame has `t`. Frames with times carry `serverNow` (ms since epoch, server
 | `notice` | `code: "pin_limited", retryAfterMs, serverNow` — lookups for this PIN from some network are being refused because of the PIN-guess limit (§9), so typing the PIN does not work there for about `retryAfterMs`; scanning the QR code still does. At most once a minute. |
 | `intro` | `question` (with text and options), `serverNow` |
 | `open` | `q, deadline, serverNow` |
-| `tally` | `q, counts:int[], answered, expected` (coalesced, ≤ 4/s while open) |
-| `reveal` | `q, correct, counts:int[], answered, expected, fastest:{nick, ms}\|null, leaderboard:[{pid,nick,score,delta,rank,tied}] (top 10), playerCount` |
+| `tally` | `q, counts:int[], answered, expected` (coalesced, ≤ 4/s while open; `counts` as in `reveal`) |
+| `reveal` | `q, type, correct, counts:int[], answered, right, explanation?, expected, fastest:{nick, ms}\|null, leaderboard:[{pid,nick,score,delta,rank,tied}] (top 10), playerCount` — `correct` as in `result`; `counts`: answers per option (a `multi` answer counts once for each option chosen; `[]` for typein); `right`: how many answers were right. Typed answers are never sent to hosts in frames (only in the CSV), so nothing a student typed is put on the projector. |
 | `podium` | `top:[{pid,nick,score,rank,tied}] (≤3), leaderboard (top 10), playerCount` |
 | `results_csv` | `csv:string, filename:string, update?:true` (`update`: a player was renamed after `end`; replace the held file without downloading it again) |
 | `wiped` | — (then close 4004) |
 | `settings` | `settings, locked` |
-| `error` | `code, message`. `storage_full`: the Room could not save (most likely Cloudflare's free daily write allowance is used up; it resets at 00:00 UTC, 05:30 IST); `auth_timeout`: no `auth` frame within 10 s; `focus_mid_question`: Focus check cannot change during a question. |
+| `error` | `code, message`. `storage_full`: the Room could not save (most likely Cloudflare's free daily write allowance is used up; it resets at 00:00 UTC, 05:30 IST); `auth_timeout`: no `auth` frame within 10 s; `focus_mid_question` / `shuffle_mid_question`: Focus check or shuffle cannot change during a question. |
 
-Players never receive `correct` before `closed`. The Room never sends the quiz's answer key to a player-tagged socket.
+Players never receive `correct` (or the accepted answers, or the explanation) before `closed`. The Room never sends the quiz's answer key to a player-tagged socket.
 
 ## 5. Reconnect and resume
 
-- **Player:** keeps `{pin, token, pid, nick, title}` in localStorage. On socket close (except the no-retry codes), on `visibilitychange` → visible, and on `online`, reconnect to `/api/room/<pin>/ws?role=player&v=3&token=<token>` with backoff 500 ms → 8 s (×2, ±30 % jitter). The server replies `sync`. One page per player plays at a time (§4.1, `4012`); answers are de-duplicated per player in any case, so two tabs cannot answer twice. A student offline for a whole question scores 0 for it. Players also request a Screen Wake Lock after joining (ignored where unsupported).
+- **Player:** keeps `{pin, token, pid, nick, title}` in localStorage. On socket close (except the no-retry codes), on `visibilitychange` → visible, and on `online`, reconnect to `/api/room/<pin>/ws?role=player&v=4&token=<token>` with backoff 500 ms → 8 s (×2, ±30 % jitter). The server replies `sync`. One page per player plays at a time (§4.1, `4012`); answers are de-duplicated per player in any case, so two tabs cannot answer twice. A student offline for a whole question scores 0 for it. Players also request a Screen Wake Lock after joining (ignored where unsupported).
 - **Unknown or stale player token** (the room was wiped and the PIN reused, or storage is from another deployment): the server accepts the socket and closes it with `4004` and reason `Unknown player token; join again`. The player page clears its stored entry for that PIN and shows the join screen.
 - **Host:** keeps `{pin, hostToken, title}` in localStorage key `hompub-quiz:host`. After a reload the page goes straight back to the stage (with "Not now"). Another signed-in browser or device lists the library's live games (`GET /api/rooms`) and can take over without the host token: the Worker vouches for its session. While the host is disconnected the server timers still close questions; phones show "Waiting for the host" only in `closed`. A host that connects while the phase is `ended` receives `sync` and then `results_csv` again, so the results file is never lost to a reload. A host socket closed with `4011` keeps its key: if the page's session is still valid (it was renewed since the socket opened) it reconnects at once, otherwise it asks for the passcode over the stage, still offering a results file it holds, and reconnects after sign-in. On a shared-computer session that has lapsed, and on "Sign out on this device", the page forgets the game screen and any results file it holds (asking first if the file was not downloaded); the game keeps running and can be resumed after signing in.
 - **Deploys** restart every Durable Object and drop every socket; clients reconnect and resync within seconds. Deploy outside school hours.
@@ -335,7 +387,11 @@ may run the previous version for a few seconds during a deploy.
 rank,nickname,score,correct,answered,q1,q2,...,qN
 1,Priya,18345,19,20,B 967,A 1000,,C 812,...
 ```
-`qN` = `<letter> <points>` for an answered question (letter A–D of the choice), empty if unanswered.
+`qN` = `<letter> <points>` for an answered question (letter A–D of the choice), empty if unanswered;
+`A+C <points>` for several right answers; the typed text and the points, quoted
+like any cell (a leading `= + - @` gets a `'`), for a typed answer; just the
+letter for a poll. `correct` counts right answers (a poll is never right, a
+partly right answer is not right).
 When Focus check was on for at least one question (§13), the columns
 `q1 left page … qN left page, times left page, seconds away, copies blocked`
 follow: `2x 14 s` (left twice, 14 s away in all), `0`, `not checked` (the
@@ -353,7 +409,9 @@ Filename: `hompub-quiz-<pin>-<YYYYMMDD>.csv`.
 | Not-yet-joined sockets | at most `MAX_PLAYERS` at once (→ 4009); each is closed 60 s after its last `join` attempt and 3 minutes after it connected (→ `join_timeout`, 4000) |
 | Wrong host passcodes | 5 per network (IPv4 address, or IPv6 /64) per 15 minutes, then 15 minutes locked (→ 429). Checked in the Directory, reserved before the check, so parallel guesses cannot exceed it. The count is saved at the 4th wrong passcode and the lockout at the 5th, so a restart of the Directory does not reset them (up to 500 such rows a day; beyond that, memory only). There is no limit across all networks: one person could then block sign-in for everyone. |
 | PIN guesses | per network per 10 minutes: `PIN_MISS_LIMIT` (100) lookups or joins of PINs that do not exist, unknown player tokens, or ended games; and 2 × `MAX_PLAYERS` + 100 new joins. Over either limit, every lookup and new join from that network is refused (→ 429 / 4014, or 4010 for version-1 pages) unless it carries the room key (`k`) or a valid player token for that PIN; such callers are not counted either (a phone reconnecting with its token after the game was wiped is not guessing). The host of a PIN whose lookups were refused gets `notice` `pin_limited`. |
-| Quiz body | 200 KB, 100 questions, text 200 chars, option 80 chars, title 80 chars (to host; the library also stores drafts, §12) |
+| Quiz body | 200 KB, 100 questions, text 400 chars (200 in a schema-1 quiz), option 80 chars, title 80 chars, explanation 400 chars, 10 accepted answers of 80 chars, picture description 150 chars (to host; the library also stores drafts, §12) |
+| Typed answer | 80 characters |
+| Pictures | 1 MB each as uploaded (the host page shrinks pictures to 1,600 px and under 1 MB first); JPEG, PNG, WebP or GIF by their first bytes; 5,000 per library, used or not; removed 8 days after no quiz uses them (§14) |
 | Quiz library | 500 quizzes, 1,000 counting the Trash; 50 quizzes per batch read; Trash kept 30 days |
 | Focus check | a leave under 1 s is not counted; ms away clamped to the question's time limit + 1 s; 100 leaves and 1,000 blocked copies per report at most; 3 saved rows per player per question while it is open, the rest saved when it closes |
 | Nickname | 20 characters after trim; a leading `= + - @` is removed |
@@ -409,11 +467,24 @@ the Trash after that. It holds no student data: games, names and answers stay
 in the Room and are deleted with it. The host page caches the library in its
 localStorage (§12).
 
-## 11. Protocol 3 and compatibility
+Question pictures (§14) are in an R2 bucket in the same Cloudflare account,
+named by the SHA-256 of the file, with a D1 record of their size and type and
+of which quizzes use them. A picture is deleted 8 days after the last quiz
+(live or in the Trash) stopped using it. Students' phones load pictures from
+`/api/images/…` on this site only; nothing about who loaded them is kept.
+A typed answer is stored like any answer, in the Room, and deleted with it.
 
-Pages say which protocol they speak: `v=3` in the WebSocket URL; the server
-puts `proto: 3` in every `sync`.
+## 11. Protocol 4 and compatibility
 
+Pages say which protocol they speak: `v=4` in the WebSocket URL; the server
+puts `proto: 4` in every `sync`.
+
+- **Version-3 pages** (cached from Phase 2, for the hour or so after a deploy)
+  play a quiz of one-right-answer questions as before (they ignore `type`,
+  `right`, `image`, `explanation`, `shuffle`). A room whose quiz uses another
+  type refuses them, players and hosts, with `4010` "This page is out of
+  date. Reload it …", since they could neither show nor answer those
+  questions. They report for Focus check like version-4 pages.
 - **Version-2 pages** (cached from Phase 1, for the hour or so after a deploy)
   work as before: they ignore `focus`, `focusQs`, `recap`, `played` and `tied`.
   They cannot send `away`, so while Focus check is on, a player on such a page
@@ -427,6 +498,12 @@ puts `proto: 3` in every `sync`.
   for every player.
 - **The host token is no longer accepted in the URL.** A host socket is ready
   when the Worker vouches for its session, or after an `auth` frame.
+- **A version-4 page meeting an older server** (a rolled-back deployment):
+  the host page sees `proto` below 4, says the server is older and hides
+  shuffle; hosting a quiz with the new types fails with the server's readable
+  `400` (an older server does not know them), and its pictures do not load.
+  A phone never sends a `text` or list `choice` unless the question's `type`
+  asks for one, which an older server never sends.
 - **A version-3 page meeting an older server** (a rolled-back deployment):
   pages send `away` only for a question the room checked (listed in
   `focusQs`, or opened while `settings.focusCheck` was true), which a
@@ -472,11 +549,16 @@ restore from backup can never land on the restored library.
 `Meta = {id, title, schema, questions, version, hash, updatedAt, deletedAt}`.
 `id` matches `^[A-Za-z0-9_-]{1,64}$` (the page makes UUIDs; the sample quiz
 has a fixed id). `body` is the quiz exactly as saved: the shape is checked
-(title text, at most 100 question objects with text, up to 4 option texts,
-numeric `correct`, `timeLimit`, `points`), the content is not, so drafts with
-problems can be saved; `POST /api/room` still checks everything before a game.
-Fields this version does not know are kept, and a body with a newer `schema`
-is stored without looking inside. `hash` is the SHA-256 (hex) of the stored
+(title text, at most 100 question objects with text, a known `type`, up to 4
+option texts or, for `typein`, up to 10 accepted answers, numeric `correct`
+(a list for `multi`; none for `typein` and `poll`), `timeLimit`, `points`),
+the content is not, so drafts with problems can be saved; `POST /api/room`
+still checks everything before a game. A body using a schema-2 field must say
+`schema: 2` (`400 invalid_quiz` otherwise), so a Phase 2 page can never edit it;
+long text alone is allowed in schema 1, as Phase 2 pages saved such drafts.
+Fields this version does not know are kept, and a body with a schema newer
+than 2 is stored without looking inside. Each save also records which pictures
+the quiz uses (§14), in the same transaction. `hash` is the SHA-256 (hex) of the stored
 body text, `JSON.stringify(body)`; the page computes the same to match quizzes.
 
 **Generation.** One number per library, in table `library`. It changes only
@@ -534,3 +616,36 @@ not proof: nothing is automatic and scores never change.
   detected; a page the browser closes entirely reports nothing; screenshots
   cannot be blocked.
 
+## 14. Pictures
+
+A question may show one picture (`image` in the quiz, §2): on the projector,
+and on phones when the question is shown there. Files live in the R2 bucket
+bound as `IMAGES` (one private bucket per Cloudflare account; no public URL),
+recorded in D1 tables `images` and `quiz_images` (`migrations/0002_images.sql`).
+
+| Request | Reply |
+|---|---|
+| `POST /api/images`, the body is the file | Signed in, page Origin (as §12). The format comes from the file's first bytes (JPEG, PNG, WebP, GIF; SVG and anything else → `415 not_an_image`); over 1 MB → `413 image_too_large`; a library that has 5,000 pictures → `422 images_full`. `200 {key, url, bytes, type}`. `key` is `<sha256 hex>.<webp\|jpg\|png\|gif>`, so the same file always gets the same key and is stored once. |
+| `GET` / `HEAD /api/images/:key` | No sign-in (phones). `200` with the type from the key, `Cache-Control: public, max-age=31536000, immutable` (a key never changes), an `ETag`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'` and `Cross-Origin-Resource-Policy: same-origin`; `304` for a matching `If-None-Match`; `404` for an unknown or malformed key. |
+
+A phone learns a picture's URL only from the question view, so not before the
+question starts; the key says nothing about the picture to someone who does not
+have the file.
+
+**The host page** shrinks a chosen picture to at most 1,600 px on its longer
+side and 1 MB (WebP, or JPEG on white where the browser cannot write WebP),
+uploads it, and asks for a description (`alt`, read out to students who cannot
+see it). Uploading needs sign-in. "Export" and "Export all" put each picture in
+the file as a data URL beside its key; opening such a file uploads the
+pictures again (signed in), or keeps the key when this server already has it.
+
+**Which quizzes use a picture.** Every library save rewrites the quiz's
+`quiz_images` rows in the same D1 transaction as the quiz (only if the stored
+body is the one just written). At most once an hour, reading the list
+(`GET /api/library`) removes the rows of quizzes deleted for good, marks
+pictures no quiz uses (`images.unused_since`), clears the mark of pictures used
+again, and deletes up to 90 pictures unused for more than 8 days: their rows
+first, then the files. Eight days is longer than the 7 days a D1 Time Travel
+restore can go back, so a restored quiz never lacks its picture. A new upload
+counts as unused from then on, and an upload of a picture already stored starts
+its 8 days again.

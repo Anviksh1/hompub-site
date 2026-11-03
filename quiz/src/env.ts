@@ -7,6 +7,8 @@ export interface Env {
   ASSETS: Fetcher;
   /** The synced quiz library (PROTOCOL.md §12). Missing only if the binding is removed. */
   DB?: D1Database;
+  /** Question pictures (PROTOCOL.md §14). Missing only if the binding is removed. */
+  IMAGES?: R2Bucket;
   ALLOWED_ORIGINS: string;
   MAX_PLAYERS: string;
   ROOM_CREATE_PER_IP_PER_DAY: string;

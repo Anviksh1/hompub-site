@@ -89,6 +89,20 @@ jobs:
 
       # The bookmark printed here is the "before" point for undoing a migration with
       # `wrangler d1 time-travel restore DB --env staging --bookmark=…`.
+      # Pictures: the bucket is created by hand, so check it before anything changes.
+      - name: Check the picture bucket (R2, staging)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -u
+          if ! npx wrangler r2 bucket info hompub-quiz-images-staging > ../r2-out.txt 2>&1; then
+            cat ../r2-out.txt
+            echo "::error::The picture bucket hompub-quiz-images-staging cannot be reached. Turn on R2 in the staging Cloudflare account, create the bucket (private), and give the staging token Account → Workers R2 Storage → Edit (quiz/README.md)."
+            exit 1
+          fi
+          echo "Picture bucket hompub-quiz-images-staging is there."
+
       - name: Apply quiz library migrations (D1, staging)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

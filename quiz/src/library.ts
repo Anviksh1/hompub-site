@@ -7,11 +7,12 @@
 // on. A write based on an older version is refused with 409 and the server's
 // copy, so a page never overwrites another device's edit without asking.
 
-import { LIMITS, sha256Hex } from './shared.ts';
+import { LIMITS, QUESTION_TYPES, sha256Hex, usesSchema2Fields, type QuestionType } from './shared.ts';
+import { imageKeysOf, refStatements, removeUnusedImages } from './images.ts';
 
 export const LIBRARY = {
   /** Quiz schema this server understands. Newer bodies are stored untouched, unchecked. */
-  knownSchema: 1,
+  knownSchema: 2,
   maxLive: 500,            // quizzes not in the Trash
   maxRows: 1000,           // all rows, Trash included (bounds storage at ~200 MB)
   trashMs: 30 * 24 * 60 * 60 * 1000,
@@ -59,13 +60,26 @@ export function checkLibraryBody(raw: unknown): Ok<CheckedBody> | Err {
       const where = `Question ${i + 1}`;
       if (!isObject(q)) return { ok: false, error: `${where} must be an object.` };
       if (typeof q.text !== 'string') return { ok: false, error: `${where}: text must be text.` };
-      if (!Array.isArray(q.options) || q.options.length > LIMITS.maxOptions || !q.options.every((o) => typeof o === 'string')) {
+      if (q.type !== undefined && !QUESTION_TYPES.includes(q.type as QuestionType)) return { ok: false, error: `${where}: type must be one of ${QUESTION_TYPES.join(', ')}.` };
+      const type = (q.type ?? 'single') as QuestionType;
+      const texts = (v: unknown, max: number) => Array.isArray(v) && v.length <= max && v.every((o) => typeof o === 'string');
+      if (type === 'typein') {
+        if (!texts(q.accept, LIMITS.acceptAnswers)) return { ok: false, error: `${where}: accept must be a list of up to ${LIMITS.acceptAnswers} texts.` };
+      } else if (!texts(q.options, LIMITS.maxOptions)) {
         return { ok: false, error: `${where}: options must be a list of up to ${LIMITS.maxOptions} texts.` };
       }
-      for (const k of ['correct', 'timeLimit', 'points'] as const) {
+      if (type === 'multi') {
+        if (!Array.isArray(q.correct) || !q.correct.every((c) => typeof c === 'number' && Number.isFinite(c))) return { ok: false, error: `${where}: correct must be a list of numbers.` };
+      } else if (type === 'single' && (typeof q.correct !== 'number' || !Number.isFinite(q.correct))) {
+        return { ok: false, error: `${where}: correct must be a number.` };
+      }
+      for (const k of ['timeLimit', 'points'] as const) {
         if (typeof q[k] !== 'number' || !Number.isFinite(q[k])) return { ok: false, error: `${where}: ${k} must be a number.` };
       }
     }
+    // A schema-1 page (Phase 2) would edit a quiz it cannot fully show and lose the new parts.
+    // (Long text alone is allowed in schema 1: Phase 2 pages saved such drafts, and keep them.)
+    if (schema < 2 && usesSchema2Fields(raw)) return { ok: false, error: 'This quiz uses new question features, so its schema must be 2.' };
   }
   const text = JSON.stringify(raw);
   if (new TextEncoder().encode(text).byteLength > LIMITS.quizBytes) return { ok: false, error: 'The quiz is larger than 200 KB. Shorten some text.' };
@@ -166,7 +180,7 @@ function isErr(v: unknown): v is Err {
  * checked the session and the Origin. Every reply carries the library's
  * generation, so a page notices a restore from backup (PROTOCOL.md §12).
  */
-export async function handleLibrary(request: Request, url: URL, db: D1Database, lib: string, now: number): Promise<LibraryReply> {
+export async function handleLibrary(request: Request, url: URL, db: D1Database, lib: string, now: number, bucket?: R2Bucket): Promise<LibraryReply> {
   const path = url.pathname;
   const gen = () => generation(db, lib);
 
@@ -180,6 +194,8 @@ export async function handleLibrary(request: Request, url: URL, db: D1Database, 
       db.prepare(`SELECT ${COLS} FROM quizzes WHERE library_id = ?1 ORDER BY updated_at DESC`).bind(lib),
     ]);
     const rows = list.results.map(meta);
+    // Pictures no quiz has used for 8 days (PROTOCOL.md §14). A failure here never fails the list.
+    if (bucket) { try { await removeUnusedImages(db, bucket, lib, now); } catch { /* tried again next hour */ } }
     return {
       status: 200,
       body: {
@@ -243,27 +259,29 @@ export async function handleLibrary(request: Request, url: URL, db: D1Database, 
     if (old) return old;
     const b = checked.value;
     const hash = await contentHash(b.text);
+    // Which pictures the quiz uses is rewritten in the same transaction as the quiz itself.
+    const refs = refStatements(db, id, hash, imageKeysOf(parsed.quiz));
 
     let changes = 0;
     if (base === 0) {
-      const res = await db.prepare(
+      const [res] = await db.batch([db.prepare(
         `INSERT INTO quizzes (id, library_id, title, body, schema, question_count, version, content_hash, updated_at, deleted_at)
            SELECT ?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, NULL
            WHERE (SELECT COUNT(*) FROM quizzes WHERE library_id = ?2 AND deleted_at IS NULL) < ?9
              AND (SELECT COUNT(*) FROM quizzes WHERE library_id = ?2) < ?10
          ON CONFLICT(id) DO NOTHING`,
-      ).bind(id, lib, b.title, b.text, b.schema, b.questionCount, hash, now, LIBRARY.maxLive, LIBRARY.maxRows).run();
+      ).bind(id, lib, b.title, b.text, b.schema, b.questionCount, hash, now, LIBRARY.maxLive, LIBRARY.maxRows), ...refs]);
       changes = res.meta.changes;
     } else {
       // Unchanged content on a live quiz is not a write; a lower schema never replaces a higher one.
       // Taking a quiz out of the Trash this way counts against the live limit, as a restore does.
-      const res = await db.prepare(
+      const [res] = await db.batch([db.prepare(
         `UPDATE quizzes SET title = ?3, body = ?4, schema = ?5, question_count = ?6, version = version + 1,
                 content_hash = ?7, updated_at = ?8, deleted_at = NULL
            WHERE library_id = ?1 AND id = ?2 AND version = ?9 AND schema <= ?5
              AND (content_hash <> ?7 OR deleted_at IS NOT NULL)
              AND (deleted_at IS NULL OR (SELECT COUNT(*) FROM quizzes WHERE library_id = ?1 AND deleted_at IS NULL) < ?10)`,
-      ).bind(lib, id, b.title, b.text, b.schema, b.questionCount, hash, now, base, LIBRARY.maxLive).run();
+      ).bind(lib, id, b.title, b.text, b.schema, b.questionCount, hash, now, base, LIBRARY.maxLive), ...refs]);
       changes = res.meta.changes;
     }
     const r = await row(db, lib, id, true);

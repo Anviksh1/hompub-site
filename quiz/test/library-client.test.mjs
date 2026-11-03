@@ -331,9 +331,12 @@ test('deleting for good straight after moving to the Trash removes it from the s
 test('a quiz with a newer schema is read-only and never sent', async () => {
   const srv = fakeServer();
   const a = browser(srv, new FakeStorage());
-  const e = a.create(quiz('Future', { schema: 2 }));
+  const e = a.create(quiz('Future', { schema: 3 }));
   assert.equal(a.readOnly(a.get(e.id)), true);
   assert.equal(a.touch(e.id), false);
+  // Schema 2 (Phase 3 question types) is this page's own.
+  const two = a.create(quiz('Now', { schema: 2 }));
+  assert.equal(a.readOnly(a.get(two.id)), false);
 });
 
 test('a quiz moved to the Trash is done once the server has it (nothing left pending)', async () => {

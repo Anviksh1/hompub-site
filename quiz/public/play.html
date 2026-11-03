@@ -11,8 +11,10 @@
   HomPub Quiz player page (phones). MIT licence.
   Every screen below is a <section data-screen="…">; play.js shows exactly one of
   them, filled from a single state object (PROTOCOL.md §2 phases, §4.3 frames).
-  System fonts only, no external requests: play.css + play.js + one WebSocket.
+  System fonts only, no external requests: play.css + play.js + one WebSocket. The one
+  web font, Noto Devanagari, is served from this site and loads only for Devanagari text.
 -->
+<link rel="stylesheet" href="/fonts/fonts.css">
 <link rel="stylesheet" href="/play.css">
 <script src="/play.js" defer></script>
 </head>
@@ -121,8 +123,16 @@
     </div>
     <!-- Clamped on short screens; the projector shows the question in full (P0-24) -->
     <p id="open-text" class="qtext" hidden></p>
+    <figure id="open-pic" class="qpic" hidden><img id="open-pic-img" alt=""></figure>
+    <p id="open-hint" class="hint" hidden></p>
     <!-- Above the tiles, so it is never below the fold (P0-24) -->
     <p id="open-status" class="status" role="status" aria-live="polite"></p>
+    <!-- A typed-answer question (PROTOCOL §3) -->
+    <form id="typein-form" class="typein" hidden>
+      <label for="typein" class="sr-only">Your answer</label>
+      <input id="typein" type="text" maxlength="80" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="send" placeholder="Type your answer">
+      <button id="typein-send" class="btn primary" type="submit">Send</button>
+    </form>
     <div id="grid" class="grid" data-count="4">
       <button class="opt" type="button" data-choice="0" aria-label="Red triangle">
         <svg class="shape" viewBox="0 0 100 100" aria-hidden="true"><polygon points="50,12 92,84 8,84"/></svg>
@@ -141,6 +151,8 @@
         <span class="opt-text"></span>
       </button>
     </div>
+    <!-- Several right answers: the tiles toggle, then this sends them together -->
+    <button id="multi-send" class="btn primary" type="button" hidden>Send my answer</button>
   </section>
 
   <section data-screen="closed" class="center" hidden>
@@ -157,6 +169,9 @@
         <span id="res-correct-text"></span>
       </span>
     </p>
+    <p id="res-answers" class="meta" hidden></p>
+    <p id="res-typed" class="meta" hidden></p>
+    <p id="res-explain" class="explain" hidden></p>
     <dl class="scoreboard">
       <div><dt>Score</dt><dd id="res-score"></dd></div>
       <div><dt>Rank</dt><dd id="res-rank"></dd></div>

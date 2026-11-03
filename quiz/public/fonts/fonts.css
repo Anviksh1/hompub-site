@@ -1,0 +1,7 @@
+/* Noto Sans and Noto Serif Devanagari (SIL Open Font License 1.1, OFL.txt), served from this site:
+   student pages make no third-party requests. The unicode-range means a browser downloads a file only
+   when the page shows Devanagari; other text keeps its usual font. */
+@font-face { font-family: 'Noto Sans Devanagari'; font-style: normal; font-weight: 400; font-display: swap; src: url(/fonts/noto-sans-devanagari-400.woff2) format('woff2'); unicode-range: U+0900-097F, U+1CD0-1CF9, U+200C-200D, U+20A8, U+20B9, U+20F0, U+25CC, U+A830-A839, U+A8E0-A8FF; }
+@font-face { font-family: 'Noto Sans Devanagari'; font-style: normal; font-weight: 700; font-display: swap; src: url(/fonts/noto-sans-devanagari-700.woff2) format('woff2'); unicode-range: U+0900-097F, U+1CD0-1CF9, U+200C-200D, U+20A8, U+20B9, U+20F0, U+25CC, U+A830-A839, U+A8E0-A8FF; }
+@font-face { font-family: 'Noto Serif Devanagari'; font-style: normal; font-weight: 400; font-display: swap; src: url(/fonts/noto-serif-devanagari-400.woff2) format('woff2'); unicode-range: U+0900-097F, U+1CD0-1CF9, U+200C-200D, U+20A8, U+20B9, U+20F0, U+25CC, U+A830-A839, U+A8E0-A8FF; }
+@font-face { font-family: 'Noto Serif Devanagari'; font-style: normal; font-weight: 700; font-display: swap; src: url(/fonts/noto-serif-devanagari-700.woff2) format('woff2'); unicode-range: U+0900-097F, U+1CD0-1CF9, U+200C-200D, U+20A8, U+20B9, U+20F0, U+25CC, U+A830-A839, U+A8E0-A8FF; }
