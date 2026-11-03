@@ -20,7 +20,7 @@
 // §4: after these close codes the server has said a definite "no"; never retry.
 // 4012: this player is now playing in another tab or on another device. 4014: too many wrong PINs.
 const NO_RETRY_CODES = new Set([4001, 4003, 4004, 4009, 4010, 4012, 4014]);
-const PROTO = 3;                 // protocol version this page speaks (PROTOCOL §11)
+const PROTO = 4;                 // protocol version this page speaks (PROTOCOL §11)
 const PING_EVERY_MS = 10000;     // keepalive; answered at the edge, not billed
 const PONG_TIMEOUT_MS = 10000;   // no pong or frame this long after a ping → the socket is dead (P0-11)
 const WAKE_FRESH_MS = 3000;      // hidden longer than this → open a fresh socket at once on return (P0-12)
@@ -280,7 +280,9 @@ const ui = {
   spins: 0,             // name spins used
   conn: 'idle',         // status pill
   fatal: null,          // {title, text, action, code, newPin} → fatal screen (refusal())
-  pendingChoice: null,  // tapped, waiting for ack
+  pendingChoice: null,  // tapped, waiting for ack: an option, the options of a multi-select answer, or {text}
+  multiPick: [],        // options ticked on a multi-select question, not sent yet
+  typedDraft: '',       // what is in the typed-answer box, not sent yet
   ack: null,            // {accepted, reason} for the current question
   timeUp: false,        // our clock passed the deadline while the question was open
   summary: null,        // GET /api/room/<pin> (join screen only)
@@ -741,6 +743,7 @@ function handleFrame(f) {
       state.result = null;
       if (state.me) { state.me.answered = false; state.me.choice = null; }
       ui.pendingChoice = null; ui.ack = null; ui.timeUp = false;
+      ui.multiPick = []; ui.typedDraft = ''; ui.focusedTypein = false;
       ui.recap = '';
       ui.qPoints[state.q] = f.question.points;
       // §13: checked when Focus check is on as the question starts (the host cannot change it until it closes).
@@ -761,7 +764,11 @@ function handleFrame(f) {
       ui.ack = { accepted: !!f.accepted, reason: f.reason || '' };
       ui.stuck = false;
       ui.sentAt = 0;
-      if (f.accepted && state.me) { state.me.answered = true; state.me.choice = ui.pendingChoice; }
+      if (f.accepted && state.me) {
+        state.me.answered = true;
+        const p = ui.pendingChoice;
+        if (p && typeof p === 'object' && !Array.isArray(p)) { state.me.choice = null; state.me.typed = p.text; } else state.me.choice = p;
+      }
       if (!f.accepted && f.reason === 'invalid') ui.pendingChoice = null;   // let them tap again
       if (!f.accepted && f.reason === 'closed' && state.phase === 'open' && !ui.timeUp
           && state.question && serverNow() < state.question.deadline) {
@@ -962,6 +969,46 @@ function respin() {
   render();
 }
 
+/* ---------- question types (PROTOCOL §2, §3) ---------- */
+
+function qType(q) { return q && (q.type === 'multi' || q.type === 'typein' || q.type === 'poll') ? q.type : 'single'; }
+// Shuffled options (settings.shuffle, only while the question is on the phones): each phone shows its
+// own order, the same after a reload, seeded by its player id and the question. Tiles keep their
+// position's shape and colour, so neighbours cannot copy by colour; the answer sent is the option's
+// own index, so the server needs nothing to undo.
+function seedFrom(text) {
+  let h = 2166136261;
+  for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+function shuffledOrder(n, seed) {
+  let a = seed || 1;
+  const rand = () => { a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const order = Array.from({ length: n }, (_, i) => i);
+  for (let i = n - 1; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); const tmp = order[i]; order[i] = order[j]; order[j] = tmp; }
+  return order;
+}
+function optionOrder(q, n) {
+  const pid = (state.me && state.me.pid) || (ui.saved && ui.saved.pid) || '';
+  if (!q || q.shuffle !== true || !pid) return Array.from({ length: n }, (_, i) => i);
+  return shuffledOrder(n, seedFrom(`${pid}:${q.q}`));
+}
+function toggleMulti(choice) {
+  if (state.phase !== 'open' || ui.pendingChoice != null || (state.me && state.me.answered) || ui.timeUp) return;
+  const at = ui.multiPick.indexOf(choice);
+  if (at >= 0) ui.multiPick.splice(at, 1); else ui.multiPick.push(choice);
+  render();
+}
+function sendMulti() {
+  if (!ui.multiPick.length) return;
+  onChoice([...ui.multiPick].sort((a, b) => a - b));
+}
+function sendTyped() {
+  const text = String($('typein').value || '').replace(/\s+/g, ' ').trim();
+  if (!text) { toast('Type your answer first'); $('typein').focus(); return; }
+  onChoice({ text: Array.from(text).slice(0, 80).join('') });
+}
+
 // "Answer sent" only once the server says so (P0-17). Until then: "Sending…". No ack within 2 s:
 // "Not getting through — reconnecting…", a fresh socket, and the answer is sent again after its sync.
 // A tap while reconnecting is held and sent when the connection is back (P0-20).
@@ -979,7 +1026,9 @@ function onChoice(choice) {
 }
 // Every send of the pending answer (the tap, and each resend after a reconnect) gets the 2 s check.
 function sendAnswer(choice) {
-  if (!sock || !sock.send({ t: 'answer', q: state.q, choice })) { ui.sentAt = 0; return false; }
+  // A typed answer is {text}; an option or a list of options goes as `choice` (PROTOCOL §3).
+  const frame = choice && typeof choice === 'object' && !Array.isArray(choice) ? { t: 'answer', q: state.q, text: choice.text } : { t: 'answer', q: state.q, choice };
+  if (!sock || !sock.send(frame)) { ui.sentAt = 0; return false; }
   ui.sentAt = Date.now();
   ui.stuck = false;
   setTimeout(checkAck, ACK_WAIT_MS + 50);
@@ -1219,9 +1268,10 @@ function questionLabel() {
 // option was correct.
 function recapText(r) {
   const label = `Question ${r.q + 1}`;
-  if (r.right === null || (r.right === undefined && r.choice == null)) return `${label}: Not answered`;
-  if (r.survey === true || ui.qPoints[r.q] === 0 || typeof r.right !== 'boolean') return `${label}: Answer recorded`;   // survey question
-  if (!r.right) return `${label}: Not correct`;
+  const answered = r.choice != null || typeof r.typed === 'string';
+  if (!answered) return `${label}: Not answered`;
+  if (r.survey === true || ui.qPoints[r.q] === 0 || typeof r.right !== 'boolean') return `${label}: Answer recorded`;   // a poll or survey question
+  if (!r.right) return r.points > 0 ? `${label}: Partly right, +${fmt(r.points)}` : `${label}: Not correct`;
   return `${label}: Correct, ` + (r.points > 0 ? `+${fmt(r.points)}` : 'no points');
 }
 // The final rank and score, kept for the ended screen (P0-10).
@@ -1327,37 +1377,74 @@ const RENDER = {
   open() {
     const q = state.question || {};
     const me = state.me || {};
-    const count = Math.min(4, Math.max(2, q.optionCount || (Array.isArray(q.options) ? q.options.length : 4)));
+    const type = qType(q);
+    const count = type === 'typein' ? 0 : Math.min(4, Math.max(2, q.optionCount || (Array.isArray(q.options) ? q.options.length : 4)));
     const hasText = Array.isArray(q.options) && q.options.length > 0;   // only when showOnDevices
     setText('open-q', questionLabel());
     $('open-text').hidden = !q.text;
     setText('open-text', q.text || '');
-
-    const grid = $('grid');
-    grid.dataset.count = String(count);
-    grid.classList.toggle('with-text', hasText);
-    grid.parentElement.classList.toggle('with-text', hasText);   // landscape: question beside the tiles
+    const pic = q.image && typeof q.image.url === 'string' && /^\/api\/images\/[0-9a-f]{64}\.(webp|jpg|png|gif)$/.test(q.image.url) ? q.image : null;
+    $('open-pic').hidden = !pic;
+    if (pic) {
+      const img = $('open-pic-img');
+      if (img.getAttribute('src') !== pic.url) { img.setAttribute('src', pic.url); }
+      img.alt = pic.alt || '';
+      if (pic.w && pic.h) { img.width = pic.w; img.height = pic.h; } else { img.removeAttribute('width'); img.removeAttribute('height'); }
+    }
+    const hint = type === 'poll' ? 'A poll: there is no right answer.' : '';
+    $('open-hint').hidden = !hint;
+    setText('open-hint', hint);
 
     const answered = me.answered || ui.pendingChoice != null;
     const locked = answered || ui.timeUp;
-    const chosen = me.answered ? me.choice : ui.pendingChoice;
+    const sent = me.answered ? (type === 'typein' ? { text: me.typed || '' } : me.choice) : ui.pendingChoice;
+
+    const grid = $('grid');
+    grid.hidden = type === 'typein';
+    grid.dataset.count = String(count || 2);
+    grid.classList.toggle('with-text', hasText);
+    grid.parentElement.classList.toggle('with-text', hasText);   // landscape: question beside the tiles
+    grid.classList.toggle('multi', type === 'multi');
+    const order = optionOrder(q, count);
+    // data-choice is the tile's position (its shape and colour); data-option the option it shows.
     grid.querySelectorAll('.opt').forEach((btn) => {
-      const i = Number(btn.dataset.choice);
-      btn.hidden = i >= count;
+      const pos = Number(btn.dataset.choice);
+      const i = pos < count ? order[pos] : pos;
+      btn.dataset.option = String(i);
+      btn.hidden = pos >= count;
       const label = hasText && typeof q.options[i] === 'string' ? q.options[i] : '';
       btn.querySelector('.opt-text').textContent = label;
-      btn.setAttribute('aria-label', SHAPE_NAMES[i] + (label ? ': ' + label : ''));
+      btn.setAttribute('aria-label', SHAPE_NAMES[pos] + (label ? ': ' + label : ''));
       btn.disabled = locked;
-      btn.classList.toggle('picked', chosen === i);
-      btn.classList.toggle('dim', locked && chosen !== i);
+      const picked = type === 'multi'
+        ? (Array.isArray(sent) ? sent.includes(i) : ui.multiPick.includes(i))
+        : sent === i;
+      if (type === 'multi') btn.setAttribute('aria-pressed', picked ? 'true' : 'false'); else btn.removeAttribute('aria-pressed');
+      btn.classList.toggle('picked', picked);
+      btn.classList.toggle('dim', locked && !picked);
     });
+    const multiBtn = $('multi-send');
+    multiBtn.hidden = type !== 'multi' || locked;
+    multiBtn.disabled = !ui.multiPick.length;
+    setText('multi-send', ui.multiPick.length ? `Send my answer (${ui.multiPick.length} chosen)` : 'Choose at least one');
 
-    let text = 'Tap your answer';
+    const form = $('typein-form');
+    form.hidden = type !== 'typein';
+    if (type === 'typein') {
+      const input = $('typein');
+      input.disabled = locked;
+      $('typein-send').disabled = locked;
+      if (locked && sent && typeof sent === 'object' && typeof sent.text === 'string') input.value = sent.text;
+      else if (!locked && input.value !== ui.typedDraft && document.activeElement !== input) input.value = ui.typedDraft;
+      if (!locked && !ui.focusedTypein) { ui.focusedTypein = true; input.focus(); }
+    }
+
+    let text = type === 'typein' ? 'Type your answer, then Send' : type === 'multi' ? 'Tap every right answer, then Send' : 'Tap your answer';
     let kind = 'muted';
     if (ui.ack && !ui.ack.accepted) {
       kind = 'bad';
       if (ui.ack.reason === 'duplicate') text = 'Already answered';
-      else if (ui.ack.reason === 'invalid') text = 'That answer wasn’t valid — try again';
+      else if (ui.ack.reason === 'invalid') text = type === 'typein' ? 'That answer was too long or empty — try again' : 'That answer wasn’t valid — try again';
       else if (ui.ack.reason === 'unavailable') text = 'The game server could not save answers right now';
       else text = 'Too late — not counted';                 // late / closed
     } else if (me.answered || (ui.ack && ui.ack.accepted)) {
@@ -1378,14 +1465,21 @@ const RENDER = {
     const r = state.result;
     const me = state.me || {};
     const q = state.question || {};
+    const type = qType(r && r.type ? r : q);
     setText('closed-q', questionLabel());
 
-    const survey = q.points === 0;               // §2: nobody scores, so there is no right or wrong
+    // A poll, or a question worth 0 points: nobody scores, so there is no right or wrong to show.
+    const survey = type === 'poll' || q.points === 0;
+    const answered = !!r && (r.choice != null || typeof r.typed === 'string');
+    // Protocol 4 says whether the answer was right; an older server only sends the right option.
+    const right = !r ? null : typeof r.right === 'boolean' ? r.right : (type === 'single' && r.choice != null ? r.choice === r.correct : null);
     let verdict = 'No answer', cls = 'none';
-    if (r && r.choice != null) {
-      if (survey) verdict = 'Answer recorded';
-      else if (r.choice === r.correct) { verdict = 'Correct ✓'; cls = 'correct'; }
-      else { verdict = 'Wrong ✗'; cls = 'wrong'; }
+    if (answered) {
+      if (type === 'poll') verdict = 'Answer recorded';
+      else if (right === true) { verdict = 'Correct ✓'; cls = 'correct'; }
+      else if (type === 'multi' && r.points > 0) { verdict = 'Partly right'; cls = 'partial'; }
+      else if (right === false) { verdict = survey ? 'Not quite' : 'Wrong ✗'; cls = 'wrong'; }
+      else verdict = 'Answer recorded';
     }
     const v = $('verdict');
     v.textContent = verdict;
@@ -1393,10 +1487,10 @@ const RENDER = {
 
     const points = r ? r.points : 0;
     // "+0 points" reads like a gain (P0-21).
-    setText('res-points', q.points === 0 ? 'Survey question — no points' : points > 0 ? `+${plural(points, 'point')}` : 'No points');
+    setText('res-points', type === 'poll' ? 'Poll — no points' : q.points === 0 ? 'Practice question — no points' : points > 0 ? `+${plural(points, 'point')}` : 'No points');
     if (r && Number.isInteger(r.q)) ui.seenResult = r.q;   // P0-18: no recap of a result shown here
 
-    const hasCorrect = !survey && !!r && Number.isInteger(r.correct) && r.correct >= 0 && r.correct <= 3;
+    const hasCorrect = type === 'single' && !!r && Number.isInteger(r.correct) && r.correct >= 0 && r.correct <= 3;
     $('res-correct-row').hidden = !hasCorrect;
     if (hasCorrect) {
       $('res-correct').dataset.shape = String(r.correct);
@@ -1404,6 +1498,21 @@ const RENDER = {
       setText('res-correct-text', optText || SHAPE_NAMES[r.correct]);
       $('res-correct').setAttribute('aria-label', SHAPE_NAMES[r.correct] + (optText ? ': ' + optText : ''));
     }
+    // Several right options, or the accepted typed answers, in words.
+    let answers = '';
+    if (r && type === 'multi' && Array.isArray(r.correct)) {
+      answers = 'Right answers: ' + r.correct.map((i) => (Array.isArray(q.options) && typeof q.options[i] === 'string' ? q.options[i] : SHAPE_NAMES[i])).join(' · ');
+    } else if (r && type === 'typein' && Array.isArray(r.correct)) {
+      answers = (r.correct.length > 1 ? 'Accepted answers: ' : 'The answer: ') + r.correct.join(' · ');
+    }
+    $('res-answers').hidden = !answers;
+    setText('res-answers', answers);
+    const typed = r && typeof r.typed === 'string' ? `You typed: ${r.typed}` : '';
+    $('res-typed').hidden = !typed;
+    setText('res-typed', typed);
+    const ex = r && typeof r.explanation === 'string' ? r.explanation : '';
+    $('res-explain').hidden = !ex;
+    setText('res-explain', ex ? `Why: ${ex}` : '');
 
     const score = r ? r.score : me.score;
     const rank = r ? r.rank : me.rank;
@@ -1587,8 +1696,25 @@ function boot() {
   $('nick').addEventListener('input', () => { if (ui.nickMsg) { ui.nickMsg = ''; render(); } });
   $('grid').addEventListener('click', (ev) => {
     const btn = ev.target.closest('.opt');
-    if (btn && !btn.disabled) onChoice(Number(btn.dataset.choice));
+    if (!btn || btn.disabled) return;
+    const option = Number(btn.dataset.option !== undefined ? btn.dataset.option : btn.dataset.choice);
+    if (qType(state.question) === 'multi') toggleMulti(option);
+    else onChoice(option);
   });
+  $('multi-send').addEventListener('click', sendMulti);
+  $('typein-form').addEventListener('submit', (ev) => { ev.preventDefault(); sendTyped(); });
+  $('typein').addEventListener('input', () => { ui.typedDraft = $('typein').value; });
+  // Focus check (§13): during a checked question, the answer box takes no pasted or dropped text.
+  ['paste', 'drop'].forEach((type) => $('typein').addEventListener(type, (ev) => {
+    if (!checkedOpen()) return;
+    ev.preventDefault();
+    const q = state.q;
+    totalsFor(q).copies += 1;
+    saveAway();
+    clearTimeout(focus.copyTimer);
+    focus.copyTimer = setTimeout(() => sendAway(q), COPY_REPORT_MS);
+    toast('Pasting is off during this question');
+  }));
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
       requestWakeLock();
