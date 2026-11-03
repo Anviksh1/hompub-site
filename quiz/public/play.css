@@ -1,6 +1,7 @@
 /* HomPub Quiz — player page styles. MIT licence.
    Phone-first (360 px wide), 16 px gutters, no horizontal scroll, tap targets ≥ 44 px.
-   Tokens mirror the site's style.css; fonts are system stacks only (no web fonts on phones). */
+   Tokens mirror the site's style.css; fonts are system stacks only (no web fonts on phones).
+   No informational text is smaller than 13 px (0.8125rem) (P0-27). */
 
 :root {
   color-scheme: light dark;
@@ -22,20 +23,24 @@
   --bad: #b3261e;
   --warn: #9a6700;
   --shadow: 0 1px 2px rgba(36,30,51,0.06), 0 8px 24px rgba(36,30,51,0.06);
+  --small: 0.8125rem;        /* 13 px: the smallest text on the page */
 
   /* The four answer slots (PROTOCOL §2): 0 red ▲ · 1 blue ◆ · 2 yellow ● · 3 green ■ */
   --opt-0: #d7263d;
   --opt-1: #1368ce;
   --opt-2: #e3a600;
-  --opt-3: #26890c;
+  --opt-3: #1f7a0a;          /* white text 5.5:1 (P0-31) */
   --opt-ink: #ffffff;
   --opt-2-ink: #1c1730;      /* white on yellow fails contrast; the circle uses dark ink */
+  --opt-2-edge: #b07f00;     /* the yellow tile's edge, 3.4:1 against the page (P0-31) */
   --opt-border: transparent;
 
   --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --radius: 16px;
+  --gutter-l: max(16px, env(safe-area-inset-left));    /* notched phones in landscape (P0-29) */
+  --gutter-r: max(16px, env(safe-area-inset-right));
 }
 
 @media (prefers-color-scheme: dark) {
@@ -67,6 +72,7 @@
   --opt-2: #ffd500;
   --opt-3: #006b1e;
   --opt-border: var(--ink);
+  --opt-2-edge: var(--ink);
 }
 @media (prefers-contrast: more) {
   :root:not([data-contrast="normal"]) {
@@ -75,12 +81,13 @@
     --opt-2: #ffd500;
     --opt-3: #006b1e;
     --opt-border: var(--ink);
+    --opt-2-edge: var(--ink);
   }
 }
 
 /* ---------- base ---------- */
 * { box-sizing: border-box; }
-html { -webkit-text-size-adjust: 100%; }
+html { -webkit-text-size-adjust: 100%; scroll-padding-top: 88px; }   /* a focused field never hides under the header */
 body {
   margin: 0;
   min-height: 100vh;
@@ -124,11 +131,12 @@ h1 {
   text-wrap: balance;
   overflow-wrap: anywhere;
 }
-h1.huge { font-size: clamp(2rem, 9vw, 3rem); }
+/* Grows with the screen, but very large text or zoom does not turn it into a column of words (P0-28). */
+h1.huge { font-size: clamp(1.5rem, 1rem + 5vw, 3rem); }
 p { margin: 0; }
 .eyebrow {
   font-family: var(--font-mono);
-  font-size: 0.74rem;
+  font-size: var(--small);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--ink-soft);
@@ -151,24 +159,36 @@ p { margin: 0; }
 }
 
 /* ---------- header bar ---------- */
+/* Header and countdown bar stay reachable when large text makes the page scroll (P0-28). */
+.top { position: sticky; top: 0; z-index: 10; }
 .bar {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 8px 16px;
+  padding: 8px var(--gutter-r) 8px var(--gutter-l);
   padding-top: calc(8px + env(safe-area-inset-top));
   background: var(--hero-bg-1);
   background-image: linear-gradient(155deg, var(--hero-bg-1) 20%, var(--hero-bg-2) 100%);
   color: var(--hero-ink);
+  container-type: inline-size;
 }
-.mark { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
+/* Nothing in the header can overlap: the wordmark and the pill shrink (P0-25). */
+.mark { display: flex; align-items: center; gap: 8px; flex: 1 1 auto; min-width: 0; }
 .badge { width: 28px; height: 28px; border-radius: 8px; flex: none; }
 .badge svg { display: block; width: 100%; height: 100%; }
-.mark-text { font-family: var(--font-display); font-weight: 600; font-size: 1.05rem; white-space: nowrap; }
+.mark-text {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 1.05rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
 .mark-sub {
   font-family: var(--font-mono);
   font-weight: 400;
-  font-size: 0.7rem;
+  font-size: var(--small);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--hero-ink-soft);
@@ -178,8 +198,10 @@ p { margin: 0; }
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  flex: 0 1 auto;
+  min-width: 0;
   font-family: var(--font-mono);
-  font-size: 0.72rem;
+  font-size: var(--small);
   letter-spacing: 0.02em;
   padding: 6px 10px;
   border-radius: 999px;
@@ -189,18 +211,35 @@ p { margin: 0; }
 }
 .pill::before {
   content: "";
+  flex: none;
   width: 8px;
   height: 8px;
   border-radius: 50%;
   background: #ffd166;                        /* connecting / reconnecting: amber */
   box-shadow: 0 0 6px rgba(255,209,102,0.7);
 }
+.pill-long { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.pill-short { display: none; }
 .pill[data-conn="open"]::before { background: #8adde1; box-shadow: 0 0 6px rgba(138,221,225,0.8); }
 .pill[data-conn="closed"]::before { background: #ff8a80; box-shadow: none; }
 .pill[data-conn="offline"]::before { background: #ff8a80; box-shadow: none; }
+/* Before Join is tapped nothing connects, so there is nothing to show (P0-15). */
+.pill[data-conn="idle"],
 body[data-screen="ended"] .pill,
 body[data-screen="fatal"] .pill,
 body[data-screen="nopin"] .pill { visibility: hidden; }
+/* Narrow header (small phone, large text, zoom): first "QUIZ" goes, then the pill keeps its
+   dot and a short label (the long one stays for screen readers), then the wordmark goes. */
+@container (max-width: 21.5rem) {
+  .mark-sub { display: none; }
+}
+@container (max-width: 19rem) {
+  .pill-long { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .pill-short { display: inline; }
+}
+@container (max-width: 14rem) {
+  .mark-text { display: none; }
+}
 .icon-btn {
   width: 44px;
   height: 44px;
@@ -220,13 +259,19 @@ body[data-screen="nopin"] .pill { visibility: hidden; }
 .icon-btn:focus-visible { outline-color: var(--hero-ink); }
 
 /* ---------- countdown bar ---------- */
-.timebar { height: 6px; background: var(--rule); overflow: hidden; visibility: hidden; }
+.timebar { height: 10px; background: var(--rule); overflow: hidden; visibility: hidden; }
 body[data-screen="open"] .timebar { visibility: visible; }
 .timefill {
   height: 100%;
   background: var(--accent);
   transform-origin: left center;
   transform: scaleX(1);
+}
+body.hurry .timefill { background: var(--bad); }
+/* Windows high contrast drops backgrounds: keep the bar with system colours (P0-30). */
+@media (forced-colors: active) {
+  .timebar { background: Canvas; border-bottom: 1px solid CanvasText; }
+  .timefill, body.hurry .timefill { forced-color-adjust: none; background: Highlight; }
 }
 
 /* ---------- screens ---------- */
@@ -237,19 +282,48 @@ main {
   width: 100%;
   max-width: 640px;
   margin: 0 auto;
-  padding: 16px 16px calc(16px + env(safe-area-inset-bottom));
+  padding: 16px var(--gutter-r) calc(16px + env(safe-area-inset-bottom)) var(--gutter-l);
 }
 section[data-screen] { flex: 1; display: flex; flex-direction: column; gap: 12px; }
 section.center { justify-content: center; align-items: center; text-align: center; }
 section.center > * { width: 100%; }
 .waiting { margin-top: auto; padding-top: 16px; font-size: 0.9rem; }
 
+/* Focus check notice (PROTOCOL §13): small, readable, always there while it is on. */
+.focus-note {
+  flex: none;
+  margin: 0 0 10px;
+  padding: 4px 10px;
+  border-radius: 10px;
+  background: var(--paper-raised);
+  border: 1px solid var(--rule);
+  color: var(--ink-soft);
+  font-size: var(--small);
+  line-height: 1.35;
+  text-align: center;
+}
+/* In-app browser suggestion (P0-16), dismissed with OK. */
+.inapp {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 12px;
+  padding: 8px 8px 8px 14px;
+  border-radius: 12px;
+  background: var(--chip-bg);
+  color: var(--chip-ink);
+  font-size: 0.95rem;
+}
+.inapp p { flex: 1; }
+.inapp .btn.slim { min-width: 0; min-height: 44px; margin: 0; padding: 8px 16px; flex: none; }
+
 /* ---------- forms & buttons ---------- */
 #join-form, #nick-row, .row { display: flex; flex-direction: column; gap: 10px; }
 .label {
   display: block;
   font-family: var(--font-mono);
-  font-size: 0.74rem;
+  font-size: var(--small);
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--ink-soft);
@@ -303,19 +377,49 @@ input[type="text"]:focus-visible { outline: 3px solid var(--accent); outline-off
   color: var(--accent-strong);
   margin-top: 8px;
 }
+/* The result a phone missed while away (P0-18). */
+.recap {
+  font-weight: 600;
+  background: var(--paper-raised);
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  padding: 8px 12px;
+}
 
 /* ---------- open question ---------- */
-.open-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+/* Everything here fits one screen: status above the tiles, the question clamped (the projector
+   shows it in full), and tiles that share the space left with no fixed minimum (P0-23, P0-24). */
+section[data-screen="open"] { gap: 10px; }
+.open-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .open-head h1 { font-weight: 400; line-height: 1.45; }   /* the "Question N of M" label is an h1 for screen readers only */
-.secs { font-size: 1rem; color: var(--ink-soft); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.qtext { font-family: var(--font-display); font-size: 1.25rem; line-height: 1.3; overflow-wrap: anywhere; }
+/* P0-27: large bold seconds in ink, red in the last three. */
+.secs {
+  font-size: 1.5rem;
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+body.hurry .secs { color: var(--bad); }
+.qtext {
+  font-family: var(--font-display);
+  font-size: 1.25rem;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: var(--q-lines, 4);
+  line-clamp: var(--q-lines, 4);
+  overflow: hidden;
+  flex: none;
+}
 .grid {
-  flex: 1;
+  flex: 1 1 auto;
   display: grid;
   grid-template-columns: 1fr 1fr;
-  grid-auto-rows: minmax(120px, 1fr);
+  grid-auto-rows: minmax(max(48px, 11vh), 1fr);
   gap: 10px;
-  min-height: 300px;
 }
 .grid[data-count="2"] .opt { grid-column: 1 / -1; }
 .grid[data-count="3"] .opt:nth-child(3) { grid-column: 1 / -1; }
@@ -326,13 +430,15 @@ input[type="text"]:focus-visible { outline: 3px solid var(--accent); outline-off
   align-items: center;
   justify-content: center;
   gap: 10px;
-  min-height: 44px;
+  min-height: 48px;
+  min-width: 0;
   padding: 12px;
   border-radius: var(--radius);
   border: 3px solid var(--opt-border);
   background: var(--opt-bg);
   color: var(--opt-ink);
   cursor: pointer;
+  overflow: hidden;
   user-select: none;
   -webkit-user-select: none;
   -webkit-tap-highlight-color: transparent;
@@ -340,27 +446,97 @@ input[type="text"]:focus-visible { outline: 3px solid var(--accent); outline-off
 }
 .opt[data-choice="0"] { --opt-bg: var(--opt-0); }
 .opt[data-choice="1"] { --opt-bg: var(--opt-1); }
-.opt[data-choice="2"] { --opt-bg: var(--opt-2); color: var(--opt-2-ink); }
+.opt[data-choice="2"] { --opt-bg: var(--opt-2); color: var(--opt-2-ink); border-color: var(--opt-2-edge); }
 .opt[data-choice="3"] { --opt-bg: var(--opt-3); }
-.opt .shape { width: clamp(56px, 22vw, 96px); height: auto; fill: currentColor; flex: none; }
-.opt-text { font-weight: 600; font-size: 1.05rem; line-height: 1.3; overflow-wrap: anywhere; }
+.opt .shape { width: clamp(40px, min(22vw, 13vh), 96px); height: auto; fill: currentColor; flex: none; }
+.opt-text {
+  font-weight: 600;
+  font-size: 1rem;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+  hyphens: auto;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: var(--opt-lines, 6);
+  line-clamp: var(--opt-lines, 6);
+  overflow: hidden;
+}
 .opt-text:empty { display: none; }
-.grid.with-text .opt { justify-content: flex-start; align-items: flex-start; text-align: left; }
-.grid.with-text .opt .shape { width: 36px; }
+.grid.with-text .opt { justify-content: flex-start; align-items: flex-start; text-align: left; gap: 6px; padding: 10px; }
+.grid.with-text .opt .shape { width: 26px; }
 .opt:not(:disabled):active { transform: scale(0.97); }
 .opt:disabled { cursor: default; }
 .opt.dim { opacity: 0.35; }
 .opt.picked { box-shadow: 0 0 0 4px var(--paper), 0 0 0 8px var(--ink); }
 .opt:focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; }
-.status { text-align: center; min-height: 1.5em; font-weight: 600; }
+.status { text-align: center; min-height: 1.45em; font-weight: 600; flex: none; }
+.status[data-kind="ok"] { color: var(--ok); }      /* "Answer sent", green as on the result screen (P0-22) */
 .status[data-kind="bad"] { color: var(--bad); }
 .status[data-kind="muted"] { color: var(--ink-soft); font-weight: 400; }
+/* Focus check with questions on phones: no selecting or long-press menu on the text (§13). */
+body.nocopy .qtext,
+body.nocopy .opt-text {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* Shorter screens: fewer lines of question and option text, so the tiles and status still fit. */
+@media (max-height: 760px) { :root { --q-lines: 3; --opt-lines: 5; } }
+@media (max-height: 600px) {
+  :root { --q-lines: 2; --opt-lines: 4; }
+  main { padding-top: 12px; }
+  .qtext { font-size: 1.1rem; }
+  .grid.with-text .opt-text { font-size: 0.9rem; }
+  .bar { padding-top: calc(6px + env(safe-area-inset-top)); padding-bottom: 6px; }
+}
+@media (max-height: 480px) {
+  :root { --opt-lines: 2; }
+  .grid.with-text .opt { flex-direction: row; align-items: flex-start; }
+}
+/* Narrow for the text size (150 % zoom, very large text): options with text one under another,
+   at full width, instead of words broken across lines in half-width tiles. */
+section[data-screen="open"] { container-type: inline-size; }
+@container (max-width: 17.5rem) {
+  .grid.with-text { grid-template-columns: minmax(0, 1fr); }
+  .grid.with-text .opt { flex-direction: row; align-items: flex-start; }
+  .grid.with-text[data-count="3"] .opt:nth-child(3) { grid-column: auto; }
+}
+
+/* Landscape phones: one row of tiles; with text, the question beside the tiles (P0-23). */
+@media (orientation: landscape) and (max-height: 500px) {
+  :root { --q-lines: 6; --opt-lines: 4; }
+  .bar { padding-top: calc(4px + env(safe-area-inset-top)); padding-bottom: 4px; }
+  main { padding-top: 10px; padding-bottom: calc(10px + env(safe-area-inset-bottom)); max-width: 880px; }
+  .focus-note { margin-bottom: 8px; }
+  .grid { grid-template-columns: repeat(var(--cols, 4), minmax(0, 1fr)); grid-auto-rows: minmax(64px, 1fr); }
+  .grid[data-count="2"] { --cols: 2; }
+  .grid[data-count="3"] { --cols: 3; }
+  .grid[data-count="2"] .opt, .grid[data-count="3"] .opt:nth-child(3) { grid-column: auto; }
+  .opt .shape { width: clamp(36px, 16vh, 72px); }
+  section[data-screen="open"].with-text {
+    display: grid;
+    grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
+    grid-template-rows: auto auto 1fr;
+    grid-template-areas: "head head" "text grid" "status grid";
+    column-gap: 14px;
+    row-gap: 8px;
+  }
+  .with-text .open-head { grid-area: head; }
+  .with-text .qtext { grid-area: text; font-size: 1.05rem; }
+  .with-text .status { grid-area: status; align-self: start; text-align: left; }
+  .grid.with-text { grid-area: grid; --cols: 2; }
+  .grid.with-text[data-count="3"] .opt:nth-child(3) { grid-column: 1 / -1; }
+  .grid.with-text[data-count="2"] { --cols: 1; }
+  .grid.with-text .opt-text { font-size: 0.9rem; }
+}
 
 /* ---------- result ---------- */
 .verdict[data-verdict="correct"] { color: var(--ok); }
 .verdict[data-verdict="wrong"] { color: var(--bad); }
 .verdict[data-verdict="none"] { color: var(--ink-soft); }
 .points { font-family: var(--font-mono); font-size: 1.4rem; font-variant-numeric: tabular-nums; }
+.final { font-size: 1.2rem; font-weight: 600; text-wrap: balance; }   /* the final rank on the ended screen (P0-10) */
 .chip-shape {
   display: inline-flex;
   align-items: center;
@@ -376,7 +552,7 @@ input[type="text"]:focus-visible { outline: 3px solid var(--accent); outline-off
 }
 .chip-shape[data-shape="0"] { --opt-bg: var(--opt-0); }
 .chip-shape[data-shape="1"] { --opt-bg: var(--opt-1); }
-.chip-shape[data-shape="2"] { --opt-bg: var(--opt-2); color: var(--opt-2-ink); }
+.chip-shape[data-shape="2"] { --opt-bg: var(--opt-2); color: var(--opt-2-ink); border-color: var(--opt-2-edge); }
 .chip-shape[data-shape="3"] { --opt-bg: var(--opt-3); }
 .chip-shape svg { width: 20px; height: 20px; fill: currentColor; flex: none; display: none; }
 .chip-shape[data-shape="0"] .shape-0,
@@ -384,16 +560,28 @@ input[type="text"]:focus-visible { outline: 3px solid var(--accent); outline-off
 .chip-shape[data-shape="2"] .shape-2,
 .chip-shape[data-shape="3"] .shape-3 { display: block; }
 .chip-shape span { overflow-wrap: anywhere; }
-.scoreboard { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; width: 100%; margin: 8px 0 0; }
-.scoreboard > div { background: var(--paper-raised); border: 1px solid var(--rule); border-radius: 12px; padding: 12px; }
+/* One row per figure, so "You are 2nd of 9" keeps the width of the screen (P0-28). */
+.scoreboard { display: flex; flex-direction: column; gap: 8px; width: 100%; margin: 8px 0 0; }
+.scoreboard > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 12px;
+  background: var(--paper-raised);
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  padding: 10px 14px;
+  text-align: left;
+}
 .scoreboard dt {
   font-family: var(--font-mono);
-  font-size: 0.72rem;
+  font-size: var(--small);
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--ink-soft);
 }
-.scoreboard dd { margin: 4px 0 0; font-size: 1.25rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.scoreboard dd { margin: 0; font-size: 1.25rem; font-weight: 600; font-variant-numeric: tabular-nums; text-align: right; }
 .streak { display: inline-flex; align-items: center; justify-content: center; gap: 6px; color: var(--warn); font-weight: 600; }
 .streak svg { width: 22px; height: 22px; fill: currentColor; }
 
@@ -409,8 +597,8 @@ input[type="text"]:focus-visible { outline: 3px solid var(--accent); outline-off
   padding: 12px 14px;
   text-align: left;
 }
-.top3 .place { font-family: var(--font-mono); font-size: 0.8rem; min-width: 2.6em; color: var(--ink-soft); }
-.top3 .name { flex: 1; font-weight: 600; overflow-wrap: anywhere; }
+.top3 .place { font-family: var(--font-mono); font-size: var(--small); min-width: 2.6em; color: var(--ink-soft); white-space: nowrap; }
+.top3 .name { flex: 1; font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
 .top3 .score { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .top3 li.you { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
 
@@ -426,9 +614,21 @@ input[type="text"]:focus-visible { outline: 3px solid var(--accent); outline-off
   border-radius: 999px;
   font-size: 0.95rem;
   box-shadow: var(--shadow);
+  width: max-content;                     /* left: 50% would otherwise wrap it at half the screen */
   max-width: calc(100vw - 32px);
   z-index: 20;
   animation: toast-in 0.2s ease-out;
+}
+/* During a question the toast goes over the header, never over the status or the tiles (P0-26). */
+body[data-screen="intro"] .toast,
+body[data-screen="open"] .toast {
+  top: calc(8px + env(safe-area-inset-top));
+  bottom: auto;
+  border-radius: 14px;
+  text-align: center;
+  background: var(--paper);               /* light on the dark header */
+  color: var(--ink);
+  border: 1px solid var(--rule);
 }
 @keyframes toast-in {
   from { opacity: 0; transform: translate(-50%, 8px); }

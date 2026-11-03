@@ -20,7 +20,7 @@
 // §4: after these close codes the server has said a definite "no"; never retry.
 // 4012: this player is now playing in another tab or on another device. 4014: too many wrong PINs.
 const NO_RETRY_CODES = new Set([4001, 4003, 4004, 4009, 4010, 4012, 4014]);
-const PROTO = 2;                 // protocol version this page speaks (PROTOCOL §11)
+const PROTO = 3;                 // protocol version this page speaks (PROTOCOL §11)
 const PING_EVERY_MS = 10000;     // keepalive; answered at the edge, not billed
 const PONG_TIMEOUT_MS = 10000;   // no pong or frame this long after a ping → the socket is dead (P0-11)
 const WAKE_FRESH_MS = 3000;      // hidden longer than this → open a fresh socket at once on return (P0-12)
@@ -234,22 +234,37 @@ const SAVED_MAX_AGE_MS = 6 * 60 * 60 * 1000;        // entries older than this a
 const CONTRAST_KEY = 'hompub-quiz:contrast';        // per-phone convenience only
 const SHAPE_NAMES = ['Red triangle', 'Blue diamond', 'Yellow circle', 'Green square'];
 const MAX_SPINS = 3;                                // §4.1
-const PLACES = ['1st', '2nd', '3rd'];
 const TAB_KEY = 'hompub-quiz:tab';                  // sessionStorage: one id per tab (PROTOCOL §11)
+const INAPP_KEY = 'hompub-quiz:inapp-ok';           // the in-app browser suggestion was dismissed
+const NBSP = '\u00a0';
 
-// Title + fallback body for the no-retry close codes (§4). The server's own
-// close reason, when it sends one, replaces the body.
+// The no-retry close codes (§4) as screens: [title, what to do next, button] (P0-08). The title
+// names the situation once; the body never repeats it. Buttons: 'retry' asks the server again,
+// 'here' takes the game back to this tab, 'reload' reloads the page.
 const CLOSE_TEXT = {
-  4001: ['Not allowed', 'This link is not valid for this game.'],
-  4003: ['You were removed by the host', ''],
-  4004: ['This game has ended', 'The game is over or the PIN is no longer in use.'],
-  4009: ['This game is full', 'The host has reached the player limit.'],
-  4010: ['This game is locked', 'The host is not letting new players in right now.'],
-  4012: ['This game is open somewhere else', 'You are playing in another tab or on another device. Tap “Use it here” to play on this one instead.'],
-  4014: ['Too many wrong PINs', 'Too many wrong PINs came from this network. Wait a few minutes, or scan the QR code on the big screen.'],
+  4001: ['This link doesn’t work', 'Scan the QR code on the big screen, or type the PIN on the PIN page.', null],
+  4003: ['You were removed from the game', 'If you think this is a mistake, talk to your teacher.', null],
+  4004: ['This game has ended', 'It’s too late to join. Ask your teacher for the new PIN.', null],
+  4009: ['This game is full', 'Ask your teacher to make room, then tap Try again.', 'retry'],
+  4012: ['This game is open somewhere else', 'You are playing in another tab or on another device. Tap “Use it here” to play on this one instead.', 'here'],
+  4014: ['Too many wrong PINs', 'Wait a few minutes, then tap Try again, or scan the QR code on the big screen.', 'retry'],
 };
+// 4010 means one of three things; the close reason (or, failing that, the room summary) says which.
+const REFUSED_4010 = {
+  locked: ['This game is locked', 'Ask your teacher to unlock the game, then tap Try again.', 'retry'],
+  late: ['The game has already started', 'The host isn’t letting new players in. Ask your teacher to let you in, then tap Try again.', 'retry'],
+  outdated: ['This page is out of date', 'Reload the page to join the game.', 'reload'],
+  other: ['You can’t join right now', 'Ask your teacher, then tap Try again.', 'retry'],
+};
+const GAME_OVER = ['This game is over', 'Ask your teacher for the new PIN.', null];
+const NO_GAME = ['No game with this PIN', 'The game may have finished. Check the PIN on the big screen, or ask your teacher for the new PIN.', null];
 
-const PILL_TEXT = { connecting: 'Connecting…', open: 'Connected', reconnecting: 'Reconnecting…', offline: 'No connection', closed: 'Disconnected' };
+// 'idle': before Join is tapped nothing is connecting, so the pill is hidden (P0-15).
+const PILL_TEXT = { idle: '', connecting: 'Connecting…', open: 'Connected', reconnecting: 'Reconnecting…', offline: 'No connection', closed: 'Disconnected' };
+// What a narrow header shows next to the dot (P0-25); the long text stays for screen readers.
+const PILL_SHORT = { idle: '', connecting: 'Wait…', open: 'Live', reconnecting: 'Retry…', offline: 'Offline', closed: 'Off' };
+// In-app browsers of messaging and social apps; only read here, never changed (P0-16).
+const IN_APP = /\b(FBAN|FBAV|Instagram|WhatsApp|Snapchat)\b|\bLine\/|; wv\)/.test(navigator.userAgent || '');
 
 // Mirrors the server's `sync` frame (§4.3). Replaced wholesale on every sync.
 let state = {
@@ -259,12 +274,12 @@ let state = {
 
 // Client-only bits. Everything else comes from the server.
 const ui = {
-  saved: null,          // {pin, token, pid, nick} from welcome / localStorage; non-null = we are a player
+  saved: null,          // {pin, token, pid, nick, title} from welcome / localStorage; non-null = we are a player
   joining: false,       // join sent, waiting for welcome
   joinFrame: null,      // the join frame to (re)send when the socket opens
   spins: 0,             // name spins used
-  conn: 'connecting',   // status pill
-  fatal: null,          // {title, text, retry} → fatal screen
+  conn: 'idle',         // status pill
+  fatal: null,          // {title, text, action, code, newPin} → fatal screen (refusal())
   pendingChoice: null,  // tapped, waiting for ack
   ack: null,            // {accepted, reason} for the current question
   timeUp: false,        // our clock passed the deadline while the question was open
@@ -284,6 +299,16 @@ const ui = {
   refocusRenameField: false, // after this render, focus the rename form's field (the rename was refused)
   renameTimer: 0,       // gives up on a rename answer that never came
   legacyServer: false,  // the server speaks protocol 1 (rolled back): no renames
+  checking: false,      // the join form's "Try again" is asking the server again
+  staleNote: false,     // our stored token was refused: the game we were in on this PIN is over (P0-02)
+  prevTitle: '',        // the quiz title stored with that earlier entry, to spot a reused PIN (P0-02)
+  justJoined: false,    // the next sync follows our own welcome: no recap of a question we were not in
+  seenResult: -1,       // the last question whose result this page showed (P0-18)
+  recap: '',            // "Question 1: Correct, +912" for the intro screen (P0-18)
+  qPoints: {},          // points of the questions this page saw, so a recap knows a survey question
+  sawQuestion: false,   // this page showed a question or the podium (the game did start)
+  wakeFailed: false,    // the wake lock request was refused
+  inappOk: false,       // the in-app browser suggestion was dismissed
 };
 const ACK_WAIT_MS = 2000;
 
@@ -311,6 +336,40 @@ const serverNow = () => Date.now() + clockOffset;
 function syncClock(frame) {
   if (typeof frame.serverNow === 'number') clockOffset = frame.serverNow - Date.now();
 }
+// "2nd of 9" / "tied 2nd of 9" with no line break inside (P0-19, P0-21).
+function place(rank, tied, total) {
+  const p = `${ordinal(rank)}${NBSP}of${NBSP}${fmt(total)}`;
+  return tied ? `tied${NBSP}${p}` : p;
+}
+
+// A screen for a refusal: CLOSE_TEXT's shape, with the server's reason where it adds something.
+function refusal(code, reason) {
+  reason = typeof reason === 'string' ? reason : '';
+  let entry = CLOSE_TEXT[code];
+  if (code === 4010) entry = REFUSED_4010[kind4010(reason) || 'other'];
+  else if (code === 4004 && !/ended/i.test(reason)) entry = GAME_OVER;   // wiped: "Room not found", "Game over"
+  if (!entry) entry = ['Disconnected', `The connection was closed (code ${code}). Tap Try again.`, 'reload'];
+  let text = entry[1];
+  // §9: the server's message says how long to wait; keep that part, the title already names the problem.
+  if (code === 4014) { const wait = reason.replace(/^Too many wrong PINs[^.]*\.\s*/i, ''); if (wait && wait !== reason) text = wait; }
+  return { title: entry[0], text, action: entry[2], code, newPin: code === 4004 };
+}
+// 4010 is shared by "locked", "late joining is off" and "out of date" (§4); the reason tells them apart.
+function kind4010(reason) {
+  if (/out of date|reload/i.test(reason)) return 'outdated';
+  if (/lock/i.test(reason)) return 'locked';
+  if (/late/i.test(reason)) return 'late';
+  return '';
+}
+// A 4010 without a reason we know: the summary says whether the room is locked or late joining is off.
+async function explain4010() {
+  const s = await getSummary();
+  if (s && ui.fatal && ui.fatal.code === 4010) {
+    const kind = s.locked ? 'locked' : (s.phase && s.phase !== 'lobby' && s.lateJoin === false) ? 'late' : 'other';
+    ui.fatal = Object.assign(refusal(4010, ''), { title: REFUSED_4010[kind][0], text: REFUSED_4010[kind][1] });
+  }
+  render();
+}
 
 /* ---------- localStorage (may be unavailable in private mode: every call is guarded) ---------- */
 function loadSaved() {
@@ -327,6 +386,7 @@ function saveSaved(v) {
 function clearSaved() {
   ui.saved = null;
   try { localStorage.removeItem(STORE_KEY); } catch (err) { /* ignore */ }
+  clearAway();                     // Focus check totals belong to that player only
 }
 // "Cleared when the game ends" must also hold for a phone that was asleep when the game
 // ended and never came back to this PIN: on every load, drop every player entry that is
@@ -359,9 +419,162 @@ function toast(text, ms = 2500) {
 function requestWakeLock() {
   if (!ui.saved || !('wakeLock' in navigator) || document.visibilityState !== 'visible') return;
   if (wakeLock && !wakeLock.released) return;
+  // Refused (battery saver, an embedded browser): the lobby asks the student to keep the screen on (P0-16).
+  const refused = () => { if (!ui.wakeFailed) { ui.wakeFailed = true; render(); } };
   try {
-    navigator.wakeLock.request('screen').then((lock) => { wakeLock = lock; }, () => {});
-  } catch (err) { /* unsupported or denied: fine */ }
+    navigator.wakeLock.request('screen').then((lock) => { wakeLock = lock; ui.wakeFailed = false; }, refused);
+  } catch (err) { refused(); }
+}
+const canKeepAwake = () => 'wakeLock' in navigator && !ui.wakeFailed;
+
+/* ---------- Focus check (PROTOCOL §13) ----------
+ * While the host has it on, every game screen says so, and for each question opened while it
+ * was on (a "checked" question) the page counts the times it was hidden or lost focus for 1 s or
+ * more during the question's open window, the time away, and, when questions are shown on
+ * phones, the copies it blocked. It sends running totals for one question at a time; the server
+ * keeps the largest of each, so sending again is harmless. Nothing here delays or blocks a tap.
+ *
+ * Times are Date.now(), not performance.now(): a locked phone freezes the page, and on some phones
+ * the monotonic clock stops while the device sleeps, so a long absence would be measured short.
+ * Wall-clock time keeps counting through sleep; a clock change while away is rare, and the
+ * server clamps the time to the question's limit. */
+const AWAY_KEY = 'hompub-quiz:away:' + PIN;     // sessionStorage: {"<q>": {n, ms, copies}}, the last two questions
+const AWAY_MIN_MS = 1000;                       // a shorter absence is not counted (§9)
+const COPY_REPORT_MS = 1500;                    // blocked copies are reported after a quiet moment
+const FOCUS_NOTE = 'Your teacher can see if you leave this page during a question.';
+const focus = {
+  checked: new Set(),   // questions opened while Focus check was on (sync.focusQs, intro / open frames)
+  wins: [],             // the last two checked questions: {q, from, to, shut, seen} in this phone's time
+  absences: [],         // recent times away from the page: {id, from, to}
+  awayAt: 0,            // when the page was left; 0 while it is here
+  nextId: 1,
+  totals: {},           // q → {n, ms, copies}: what has been counted for that question
+  copyTimer: 0,
+  noteSaid: false,      // the notice has been read out since it last appeared
+  holdUntil: 0,         // after a long absence: wait for the frames that say when questions closed
+};
+const INTRO_GAP_MS = 3000;   // a question's intro: the previous question had closed before it began (§2)
+const focusOn = () => !!(state.settings && state.settings.focusCheck === true);
+const checkedOpen = () => state.phase === 'open' && focusOn() && focus.checked.has(state.q);
+const blockCopies = () => checkedOpen() && !!state.settings.showOnDevices;
+
+// A checked question's open window, from the server's times (§2: local = server time - offset).
+function noteQuestion(q, opensAt, deadline) {
+  if (!Number.isInteger(q) || typeof opensAt !== 'number' || typeof deadline !== 'number') return;
+  let w = focus.wins.find((x) => x.q === q);
+  if (!w) {
+    w = { q, shut: 0, seen: new Set() };
+    focus.wins.push(w);
+    focus.wins.sort((a, b) => a.q - b.q);
+    if (focus.wins.length > 2) focus.wins.shift();
+  }
+  w.from = opensAt - clockOffset;
+  w.to = deadline - clockOffset;
+  // An earlier question had closed before this one's intro began: the same seconds never count twice.
+  focus.wins.forEach((x) => { if (x.q < q) x.to = Math.min(x.to, w.from - INTRO_GAP_MS); });
+  countAbsences();
+}
+// The question closed: later absences do not count for it. `serverAt` is the server's close time
+// (result.closedAt, recap.closedAt); without it, the moment this page saw the close.
+function shutQuestion(q, serverAt) {
+  const w = focus.wins.find((x) => x.q === q);
+  if (!w) return;
+  if (typeof serverAt === 'number') w.shut = w.shut ? Math.min(w.shut, serverAt - clockOffset) : serverAt - clockOffset;
+  else if (!w.shut) w.shut = Date.now();
+}
+function leavePage() {
+  if (focus.awayAt || !ui.saved) return;
+  focus.awayAt = Date.now();
+}
+// Back means visible and focused (or touched). An absence also counts for a question this page
+// learns about only afterwards (a sync after waking), so absences are kept for a while.
+// After a long absence a frozen page has not yet seen when questions closed; it waits up to 2 s for
+// the frames (result, sync) that say so before counting, so time after an early close is not counted.
+function backOnPage() {
+  if (!focus.awayAt) return;
+  const now = Date.now();
+  const long = now - focus.awayAt > WAKE_FRESH_MS;
+  focus.absences.push({ id: focus.nextId, from: focus.awayAt, to: now });
+  focus.nextId += 1;
+  focus.awayAt = 0;
+  focus.absences = focus.absences.filter((a) => now - a.to < 10 * 60 * 1000).slice(-6);
+  if (long) { focus.holdUntil = now + 2000; setTimeout(countAbsences, 2050); return; }
+  countAbsences();
+}
+// Each absence is matched once against each window: its overlap with the open question, if 1 s or more.
+function countAbsences() {
+  if (Date.now() < focus.holdUntil) return;
+  const changed = [];
+  focus.wins.forEach((w) => {
+    const end = w.shut ? Math.min(w.to, w.shut) : w.to;
+    focus.absences.forEach((a) => {
+      if (w.seen.has(a.id)) return;
+      w.seen.add(a.id);
+      const overlap = Math.min(a.to, end) - Math.max(a.from, w.from);
+      if (!(overlap >= AWAY_MIN_MS)) return;
+      const t = totalsFor(w.q);
+      t.n += 1;
+      t.ms += Math.round(overlap);
+      if (!changed.includes(w.q)) changed.push(w.q);
+    });
+  });
+  if (!changed.length) return;
+  saveAway();
+  changed.forEach(sendAway);
+}
+// During an open checked question with the text on the phone: no copying, cutting or long-press
+// menu, outside the name fields. Each blocked copy is counted.
+function onCopy(ev) {
+  if (!blockCopies()) return;
+  const el = ev.target;
+  if (el && el.closest && el.closest('input, textarea')) return;
+  ev.preventDefault();
+  if (ev.type === 'contextmenu') return;
+  const q = state.q;
+  totalsFor(q).copies += 1;
+  saveAway();
+  clearTimeout(focus.copyTimer);
+  focus.copyTimer = setTimeout(() => sendAway(q), COPY_REPORT_MS);
+}
+function totalsFor(q) {
+  if (!focus.totals[q]) focus.totals[q] = { n: 0, ms: 0, copies: 0 };
+  return focus.totals[q];
+}
+// Only the two latest questions: the server takes reports for the current and the previous one.
+function saveAway() {
+  const keep = {};
+  Object.keys(focus.totals).map(Number).sort((a, b) => b - a).slice(0, 2).forEach((q) => { keep[q] = focus.totals[q]; });
+  focus.totals = keep;
+  try { sessionStorage.setItem(AWAY_KEY, JSON.stringify(keep)); } catch (err) { /* the in-memory copy is enough */ }
+}
+function loadAway() {
+  let v = null;
+  try { v = JSON.parse(sessionStorage.getItem(AWAY_KEY) || 'null'); } catch (err) { v = null; }
+  if (!v || typeof v !== 'object') return;
+  const n = (x) => (typeof x === 'number' && Number.isFinite(x) && x >= 0 ? Math.floor(x) : 0);
+  Object.keys(v).forEach((k) => {
+    if (/^\d+$/.test(k) && v[k]) focus.totals[Number(k)] = { n: n(v[k].n), ms: n(v[k].ms), copies: n(v[k].copies) };
+  });
+}
+function clearAway() {
+  focus.totals = {};
+  focus.wins = [];
+  focus.absences = [];
+  focus.awayAt = 0;
+  clearTimeout(focus.copyTimer);
+  try { sessionStorage.removeItem(AWAY_KEY); } catch (err) { /* ignore */ }
+}
+// §11: only for a question the room checked (from sync.focusQs, or Focus check on as it started),
+// even if the host has switched Focus check off since. A server without Focus check (protocol 2)
+// gives neither, so it never gets this frame. A report that cannot go now stays in sessionStorage
+// and goes after the next sync.
+function sendAway(q) {
+  const t = focus.totals[q];
+  if (!t || (!t.n && !t.copies) || !focus.checked.has(q)) return;
+  if (sock) sock.send({ t: 'away', q, n: t.n, ms: t.ms, copies: t.copies });
+}
+function resendAway() {
+  Object.keys(focus.totals).forEach((q) => sendAway(Number(q)));
 }
 
 /* =====================================================================
@@ -424,11 +637,19 @@ function openSocket() {
       if ((code === 4004 || code === 4000) && ui.saved && state.phase === null) {
         // The room did not accept our stored token (PROTOCOL §5: 4004 "Unknown player
         // token; join again", e.g. the PIN was reused for a new game). Retrying the same
-        // handshake cannot help: forget it and join afresh (a wiped room then shows 404).
+        // handshake cannot help: forget it and join afresh.
         sock.close();
         sock = null;
+        ui.conn = 'idle';
+        if (ui.saved.title) ui.prevTitle = ui.saved.title;
         clearSaved();
-        toast('Your earlier session was not recognised — join again.');
+        if (code === 4004 && /not found|game over/i.test(reason)) {
+          // The game was wiped: it is over, which is not the same as a mistyped PIN (P0-02).
+          ui.fatal = Object.assign(refusal(4004, reason), { title: GAME_OVER[0], text: GAME_OVER[1] });
+          render();
+          return;
+        }
+        ui.staleNote = code === 4004;   // the join form says the earlier game on this PIN is over
         fetchSummary();
         return;
       }
@@ -447,11 +668,10 @@ function openSocket() {
       }
       if (code === 4003 || code === 4004) clearSaved();   // token is dead either way, even after `ended`
       if (ui.fatal || state.phase === 'ended') return;
-      const [title, fallback] = CLOSE_TEXT[code] || ['Disconnected', `The connection was closed (code ${code}).`];
-      // 4012 has its own text and a "Use it here" button; other refusals use the server's reason when it has one.
-      ui.fatal = { title, text: code === 4012 ? fallback : (reason || fallback), retry: code === 4009 || code === 4010, here: code === 4012 };
+      ui.fatal = refusal(code, reason);
       ui.joining = false;
       render();
+      if (code === 4010 && !kind4010(reason)) explain4010();
     },
   });
   sock.connect();
@@ -462,10 +682,13 @@ function handleFrame(f) {
   switch (f.t) {
     case 'welcome':
       // §4.3: persist so a reload (or a new tab) resumes instead of re-joining.
+      if (!ui.saved || ui.saved.pid !== f.pid) clearAway();   // a new player starts with no Focus check totals
       saveSaved({ pin: f.pin || PIN, token: f.token, pid: f.pid, nick: f.nick });
       ui.joining = false;
       ui.joinFrame = null;
       ui.nickMsg = '';
+      ui.justJoined = true;
+      ui.staleNote = false;
       ui.nameNote = f.note && typeof f.note.message === 'string' ? f.note.message : '';
       state.me = Object.assign({}, state.me, { pid: f.pid, nick: f.nick });
       requestWakeLock();
@@ -510,6 +733,7 @@ function handleFrame(f) {
 
     case 'intro':
       if (!f.question) break;                      // malformed; wait for the next sync
+      if (typeof state.q === 'number') shutQuestion(state.q);
       state.phase = 'intro';
       state.question = f.question;
       state.q = f.question.q;
@@ -517,12 +741,19 @@ function handleFrame(f) {
       state.result = null;
       if (state.me) { state.me.answered = false; state.me.choice = null; }
       ui.pendingChoice = null; ui.ack = null; ui.timeUp = false;
+      ui.recap = '';
+      ui.qPoints[state.q] = f.question.points;
+      // §13: checked when Focus check is on as the question starts (the host cannot change it until it closes).
+      if (focusOn()) focus.checked.add(state.q);
+      if (focus.checked.has(state.q)) noteQuestion(state.q, f.question.opensAt, f.question.deadline);
       break;
 
     case 'open':
       if (state.question && state.question.q === f.q) state.question.deadline = f.deadline;
       state.phase = 'open';
       state.q = f.q;
+      if (focusOn()) focus.checked.add(f.q);
+      if (focus.checked.has(f.q) && state.question && state.question.q === f.q) noteQuestion(f.q, state.question.opensAt, f.deadline);
       break;
 
     case 'ack':
@@ -543,17 +774,20 @@ function handleFrame(f) {
       break;
 
     case 'result':
+      shutQuestion(f.q, f.closedAt);
+      countAbsences();
       state.phase = 'closed';
       state.q = f.q;
       state.result = f;
       if (state.me) {
-        state.me.score = f.score; state.me.rank = f.rank; state.me.streak = f.streak;
+        state.me.score = f.score; state.me.rank = f.rank; state.me.tied = !!f.tied; state.me.streak = f.streak;
         state.me.answered = f.choice != null; state.me.choice = f.choice;
       }
       if (typeof f.playerCount === 'number') state.playerCount = f.playerCount;
       break;
 
     case 'podium':
+      if (typeof state.q === 'number') shutQuestion(state.q);
       state.phase = 'podium';
       state.podium = { top: Array.isArray(f.top) ? f.top : [], you: f.you || null };
       state.result = null;
@@ -561,14 +795,17 @@ function handleFrame(f) {
       break;
 
     case 'ended':
-      // §4.3: "Game over. Nothing about this game is kept." — and we keep nothing either.
+      // §4.3: nothing about this game is kept, and we keep nothing either, except the final
+      // rank and score on this screen, in memory (P0-10). `played: false`: ended before any answer.
+      if (typeof state.q === 'number') shutQuestion(state.q);
       state.phase = 'ended';
+      state.played = f.played;
       clearSaved();
       if (sock) sock.close();
       break;
 
     case 'kicked':
-      ui.fatal = { title: 'You were removed by the host', text: '', retry: false };
+      ui.fatal = refusal(4003, '');
       clearSaved();
       if (sock) sock.close();
       break;
@@ -592,7 +829,7 @@ function handleFrame(f) {
       if (f.code === 'already_joined' && ui.saved) {
         // Only respin() sends `join` after we are in: the server has run out of spins.
         ui.spins = MAX_SPINS;
-        toast('No spins left');
+        toast('No more random names');
       } else {
         toast(f.message || `Error: ${f.code}`);
       }
@@ -619,9 +856,11 @@ function applySync(f) {
   ui.legacyServer = typeof f.proto !== 'number';
   if (state.me && state.me.pid) {
     ui.joining = false;
-    // A spun or de-duplicated nickname may differ from what we stored.
-    if (ui.saved && state.me.nick && state.me.nick !== ui.saved.nick) {
-      saveSaved(Object.assign({}, ui.saved, { nick: state.me.nick }));
+    // A spun or de-duplicated nickname may differ from what we stored. The title is kept with the
+    // entry, so a later visit can tell when this PIN has been given to another game (P0-02).
+    const title = typeof state.title === 'string' ? state.title : '';
+    if (ui.saved && ((state.me.nick && state.me.nick !== ui.saved.nick) || (title && title !== ui.saved.title))) {
+      saveSaved(Object.assign({}, ui.saved, { nick: state.me.nick || ui.saved.nick }, title ? { title } : {}));
     }
     // §4.3: me.spins = spins already used, so a reload does not offer a spin that cannot work.
     if (typeof state.me.spins === 'number') ui.spins = Math.min(MAX_SPINS, Math.max(0, state.me.spins));
@@ -636,6 +875,28 @@ function applySync(f) {
     ui.pendingChoice = held;
     sendAnswer(held);
   }
+  const q = state.question;
+  if (q && Number.isInteger(q.q)) ui.qPoints[q.q] = q.points;
+  // Focus check (§13): the server's list of checked questions is the truth. Reports that could not
+  // be sent before (offline, a reload) go now; the server keeps the largest totals, so repeats are harmless.
+  focus.checked = new Set(Array.isArray(f.focusQs) ? f.focusQs.filter(Number.isInteger) : []);
+  const inQuestion = state.phase === 'intro' || state.phase === 'open' || state.phase === 'closed';
+  if (q && inQuestion && focus.checked.has(q.q)) noteQuestion(q.q, q.opensAt, q.deadline);
+  if (q && state.phase === 'closed') shutQuestion(q.q, f.result && f.result.closedAt);
+  if (f.recap && Number.isInteger(f.recap.q)) shutQuestion(f.recap.q, f.recap.closedAt);
+  if (state.phase === 'podium' || state.phase === 'ended') shutQuestion(state.q);
+  countAbsences();
+  resendAway();
+  // P0-18: back for the next question after missing a reveal: say how the last one went. Not for a
+  // question this page already showed the result of, nor for one the student joined after.
+  ui.recap = '';
+  const r = f.recap;
+  if (r && Number.isInteger(r.q) && r.q !== ui.seenResult && !ui.justJoined && (state.phase === 'intro' || state.phase === 'open')) {
+    ui.seenResult = r.q;
+    if (state.phase === 'intro') ui.recap = recapText(r);
+    else toast(recapText(r), 4000);
+  }
+  ui.justJoined = false;
   if (state.phase === 'ended') {
     // Reconnected after the host pressed End: same promise as the `ended` frame —
     // nothing about this game is kept, here or on the server.
@@ -667,8 +928,29 @@ function cancelJoin() {
   ui.joinFrame = null;
   ui.nickMsg = '';
   ui.failures = 0;
-  ui.conn = 'connecting';          // the pill's pre-join look
+  ui.conn = 'idle';                // the pill's pre-join look: nothing is connecting (P0-15)
   render();
+}
+
+// "Try again" on a refusal (full, locked, late joining off): ask the server again instead of
+// reloading into the same screen (P0-09). The join form then shows what the summary says.
+function tryAgain() {
+  const f = ui.fatal;
+  if (!f) return;
+  if (f.action === 'here') { useHere(); return; }
+  if (f.action === 'reload') { location.reload(); return; }
+  ui.fatal = null;
+  if (sock) { sock.close(); sock = null; }
+  ui.conn = 'idle';
+  if (ui.saved) { render(); openSocket(); return; }   // a player refused on reconnect (4009): connect again
+  recheck();
+}
+// The join form's own "Try again" (locked, late joining off) and the same after a refusal screen.
+function recheck() {
+  if (ui.checking) return;
+  ui.checking = true;
+  render();
+  fetchSummary();
 }
 
 // §4.1: up to 3 spins, before the first answer. The server enforces the limit;
@@ -787,29 +1069,36 @@ function say(text) {
   announceTimer = setTimeout(() => { el.textContent = text; }, 50);
 }
 
-async function fetchSummary() {
+// GET /api/room/<pin> (§1). Returns the summary, or null; a 404 or 429 becomes the fatal screen.
+async function getSummary() {
   try {
     const res = await fetch(`/api/room/${PIN}` + (ROOM_KEY ? `?k=${ROOM_KEY}` : ''), { cache: 'no-store', headers: { accept: 'application/json' } });
     if (res.status === 429) {
       let body = null;
       try { body = await res.json(); } catch (err) { body = null; }
-      ui.fatal = { title: 'Too many wrong PINs', text: (body && body.message) || CLOSE_TEXT[4014][1], retry: true };
+      ui.fatal = refusal(4014, body && body.message);
     } else if (res.status === 404) {
-      ui.fatal = { title: 'No game with that PIN', text: 'Check the PIN on the big screen and try again.', retry: false };
+      // After our stored token was refused, the game we were in is over; otherwise it may be a typo (P0-02).
+      const [title, text] = ui.staleNote ? GAME_OVER : NO_GAME;
+      ui.fatal = Object.assign(refusal(4004, 'Room not found'), { title, text });
     } else if (res.ok) {
-      const s = await res.json();
-      ui.summary = s;
-      if (s && typeof s.playerCount === 'number') state.playerCount = s.playerCount;
-      if (s && typeof s.title === 'string') state.title = s.title;
-      if (s && s.phase === 'ended') {
-        ui.fatal = { title: 'This game has ended', text: 'Nothing about it is kept.', retry: false };
-      } else if (s && s.phase === 'podium') {
-        // The server refuses every join in podium (4004 "This game has ended"): say so here.
-        ui.fatal = { title: 'This game has ended', text: 'The final results are on the big screen — it’s too late to join.', retry: false };
-      }
+      return await res.json();
     }
     // Other statuses: let the WebSocket report the real problem when they tap Join.
   } catch (err) { /* offline: the socket wrapper will retry when they tap Join */ }
+  return null;
+}
+async function fetchSummary() {
+  const s = await getSummary();
+  ui.checking = false;
+  if (s) {
+    ui.summary = s;
+    if (typeof s.playerCount === 'number') state.playerCount = s.playerCount;
+    if (s.phase === 'ended' || s.phase === 'podium') {
+      // The server refuses every join from the podium on (4004 "This game has ended"): say so here.
+      ui.fatal = refusal(4004, 'This game has ended');
+    }
+  }
   render();
 }
 
@@ -830,10 +1119,14 @@ function pickScreen() {
   }
 }
 
+// Screens that show the Focus check notice while it is on (§13): every screen of a game in progress.
+const NOTE_SCREENS = new Set(['lobby', 'intro', 'open', 'closed', 'podium']);
+
 function render() {
   const screen = pickScreen();
   const changed = screen !== shownScreen;
   shownScreen = screen;
+  if (screen === 'intro' || screen === 'open' || screen === 'closed' || screen === 'podium') ui.sawQuestion = true;
   document.body.dataset.screen = screen;
   document.querySelectorAll('[data-screen]').forEach((el) => { el.hidden = el.dataset.screen !== screen; });
   renderPill();
@@ -841,7 +1134,17 @@ function render() {
   const draw = RENDER[screen];
   if (draw) draw();
   renderRenameForm(screen);
-  if (changed) announceScreen(screen);         // after draw(): the headline is read back from the DOM
+  // Focus check: a notice that cannot be dismissed, read out once when it appears; no selecting
+  // or long-press menu on the question and options while questions are shown on phones.
+  const noteOn = focusOn() && NOTE_SCREENS.has(screen);
+  $('focus-note').hidden = !noteOn;
+  if (!focusOn()) focus.noteSaid = false;
+  const sayNote = noteOn && !focus.noteSaid;
+  if (sayNote) focus.noteSaid = true;
+  document.body.classList.toggle('nocopy', focusOn() && !!(state.settings && state.settings.showOnDevices));
+  $('inapp').hidden = !IN_APP || ui.inappOk || (screen !== 'join' && screen !== 'lobby');
+  if (changed) announceScreen(screen, sayNote ? FOCUS_NOTE : '');   // after draw(): the headline is read back from the DOM
+  else if (sayNote) say(FOCUS_NOTE);
   if (screen === 'intro' || screen === 'open') {
     // paintClock() may move intro → open or flag time-up; each change is one-way,
     // so this recursion is bounded (at most two extra passes).
@@ -855,9 +1158,10 @@ function render() {
 function renderPill() {
   const pill = $('pill');
   // While the phone reports no network, say so, rather than "Reconnecting…" over and over.
-  const conn = navigator.onLine === false && ui.conn !== 'closed' && ui.conn !== 'open' ? 'offline' : ui.conn;
+  const conn = navigator.onLine === false && ui.conn !== 'closed' && ui.conn !== 'open' && ui.conn !== 'idle' ? 'offline' : ui.conn;
   pill.dataset.conn = conn;
-  pill.textContent = PILL_TEXT[conn] || conn;
+  setText('pill-long', PILL_TEXT[conn] == null ? conn : PILL_TEXT[conn]);
+  setText('pill-short', PILL_SHORT[conn] == null ? conn : PILL_SHORT[conn]);
 }
 
 /* ---------- screen changes for screen-reader users ----------
@@ -878,7 +1182,7 @@ const SCREEN_TEXT = {
   open: ['open-q', 'open-text'],
   closed: ['verdict', 'res-points', 'res-rank'],
   podium: ['pod-you', 'pod-score'],
-  ended: ['ended-heading', 'ended-text'],
+  ended: ['ended-heading', 'ended-rank', 'ended-text'],
   fatal: ['fatal-title', 'fatal-text'],
 };
 
@@ -888,7 +1192,7 @@ function focusScreenHeading(screen) {
   if (heading) heading.focus({ preventScroll: true });
 }
 
-function announceScreen(screen) {
+function announceScreen(screen, extra) {
   const parts = [];
   (SCREEN_TEXT[screen] || []).forEach((id) => {
     const el = $(id);
@@ -896,6 +1200,7 @@ function announceScreen(screen) {
     const text = el.textContent.trim();
     if (text) parts.push(text);
   });
+  if (extra) parts.push(extra);
   const el = $('announcer');
   clearTimeout(announceTimer);
   el.textContent = '';                         // empty first so an identical headline is still spoken
@@ -909,8 +1214,33 @@ function questionLabel() {
   const total = (q && q.total) || state.total;
   return (typeof idx === 'number' && total) ? `Question ${idx + 1} of ${total}` : '';
 }
+// A result this page missed, in one line (P0-18): "Question 1: Correct, +912". The recap says only
+// whether this student's answer was right (`right`: true, false, or null for no answer), never which
+// option was correct.
+function recapText(r) {
+  const label = `Question ${r.q + 1}`;
+  if (r.right === null || (r.right === undefined && r.choice == null)) return `${label}: Not answered`;
+  if (r.survey === true || ui.qPoints[r.q] === 0 || typeof r.right !== 'boolean') return `${label}: Answer recorded`;   // survey question
+  if (!r.right) return `${label}: Not correct`;
+  return `${label}: Correct, ` + (r.points > 0 ? `+${fmt(r.points)}` : 'no points');
+}
+// The final rank and score, kept for the ended screen (P0-10).
+function finalPlace() {
+  const p = state.podium || {};
+  const me = state.me || {};
+  const you = p.you || { score: me.score, rank: me.rank, tied: me.tied };
+  if (!you.rank) return '';
+  return `You finished ${place(you.rank, you.tied, state.playerCount || you.rank)} · ${plural(you.score, 'point')}`;
+}
 
 const RENDER = {
+  // /play?pin=12 or ?pin=abc is a bad link, not a missing PIN (P0-03).
+  nopin() {
+    const bad = PARAMS.has('pin') && PIN !== '';
+    setText('nopin-heading', bad ? 'This link’s PIN isn’t valid' : 'No game PIN');
+    setText('nopin-text', bad ? 'A game PIN has 6 digits. Type the PIN from the big screen instead.' : 'This link is missing its 6-digit game PIN.');
+  },
+
   join() {
     const s = ui.summary;
     setText('join-heading', state.title || 'Join the game');
@@ -930,24 +1260,35 @@ const RENDER = {
     // podium counts as ended: the server refuses every join from the podium on (4004).
     const tooLate = !!(s && (s.phase === 'podium' || s.phase === 'ended'));
     const unreachable = ui.joining && ui.failures >= 3;   // handshakes keep failing (proxy, Worker down)
+    const started = !!(s && s.phase && s.phase !== 'lobby');
+    // Locked, or started with late joining off: nothing on the form can work, so it is switched off
+    // with one instruction and a "Try again" that asks the server again (P0-09).
+    const blocked = !tooLate && !!s && (!!s.locked || (started && s.lateJoin === false));
 
     let notice = '';
     if (unreachable) notice = 'Can’t reach the game yet — check your Wi-Fi. Still trying…';
     else if (tooLate) notice = 'This game has finished — it’s too late to join.';
-    else if (s && s.locked) notice = 'The host has locked this game — new players can’t join right now.';
-    else if (s && s.phase && s.phase !== 'lobby' && s.lateJoin === false) notice = 'This game has already started and the host isn’t letting new players in.';
-    else if (s && s.phase && s.phase !== 'lobby') notice = 'This game has already started. You can still join; earlier questions won’t count for you.';
+    else if (blocked && s.locked) notice = 'The host has locked this game. Ask your teacher to unlock the game, then tap Try again.';
+    else if (blocked) notice = 'This game has already started and the host isn’t letting new players in. Ask your teacher to let you in, then tap Try again.';
+    else if (started) notice = 'This game has already started. You can still join; earlier questions won’t count for you.';
+    // Our stored token was refused: the game we were in is over, and this PIN may now be another game's (P0-02).
+    if (ui.staleNote && !unreachable && !blocked) notice = 'Your earlier game with this PIN is over. Join only if your teacher has just given you this PIN.' + (notice ? ' ' + notice : '');
     $('join-notice').hidden = !notice;
     setText('join-notice', notice);
     $('join-cancel').hidden = !unreachable;
+    $('join-retry').hidden = !blocked;
+    $('join-retry').disabled = ui.checking;
+    setText('join-retry', ui.checking ? 'Checking…' : 'Try again');
 
     const busy = ui.joining;
-    $('nick').disabled = busy || tooLate;
-    $('join-btn').disabled = busy || tooLate;
-    $('spin-btn').disabled = busy || tooLate;
+    const off = busy || tooLate || blocked;
+    $('nick').disabled = off;
+    $('join-btn').disabled = off;
+    $('spin-btn').disabled = off;
     setText('join-btn', busy ? 'Joining…' : 'Join');
     setText('spin-btn', busy ? 'Joining…' : 'Random name');
-    if (!spinOnly && !busy && !tooLate && !ui.focusedNick) { ui.focusedNick = true; $('nick').focus(); }
+    if (blocked) ui.focusedNick = false;           // once unblocked, the name box gets focus again
+    if (!spinOnly && !off && !ui.focusedNick) { ui.focusedNick = true; $('nick').focus(); }
   },
 
   connecting() {
@@ -955,6 +1296,7 @@ const RENDER = {
     setText('connecting-title', ui.saved ? 'Rejoining…' : 'Connecting…');
     setText('connecting-text', nick ? `Welcome back, ${nick}.` : '');
     $('connecting-hint').hidden = ui.failures < 3;
+    $('connecting-back').hidden = ui.failures < 3;
   },
 
   lobby() {
@@ -963,16 +1305,23 @@ const RENDER = {
     setText('lobby-count', plural(state.playerCount, 'player') + ' in');
     $('name-note').hidden = !ui.nameNote;
     setText('name-note', ui.nameNote);
+    // P0-02: this phone was in another game with this PIN, and the PIN now belongs to a new one.
+    const other = ui.prevTitle && state.title && ui.prevTitle !== state.title ? `This PIN now belongs to a different game: ${state.title}` : '';
+    $('game-warn').hidden = !other;
+    setText('game-warn', other);
+    $('wake-hint').hidden = canKeepAwake();        // P0-16: no Wake Lock here (in-app browsers)
     // Protocol 2: the name is changed with "Change my name". An older server only knows re-spins.
     const canSpin = ui.legacyServer && ui.spins < MAX_SPINS && !me.answered;
     $('respin-btn').hidden = !canSpin;
-    setText('respin-btn', ui.spins ? `Spin again (${MAX_SPINS - ui.spins} left)` : 'Spin a new name');
+    setText('respin-btn', ui.spins ? `Another random name (${MAX_SPINS - ui.spins} left)` : 'Another random name');
     $('edit-name-btn').hidden = !canRename() || ui.renaming;
   },
 
   intro() {
     setText('intro-title', state.title || '');
     setText('intro-q', questionLabel());
+    $('intro-recap').hidden = !ui.recap;
+    setText('intro-recap', ui.recap);
   },
 
   open() {
@@ -987,6 +1336,7 @@ const RENDER = {
     const grid = $('grid');
     grid.dataset.count = String(count);
     grid.classList.toggle('with-text', hasText);
+    grid.parentElement.classList.toggle('with-text', hasText);   // landscape: question beside the tiles
 
     const answered = me.answered || ui.pendingChoice != null;
     const locked = answered || ui.timeUp;
@@ -1042,7 +1392,9 @@ const RENDER = {
     v.dataset.verdict = cls;
 
     const points = r ? r.points : 0;
-    setText('res-points', q.points === 0 ? 'Survey question — no points' : `+${fmt(points)} points`);
+    // "+0 points" reads like a gain (P0-21).
+    setText('res-points', q.points === 0 ? 'Survey question — no points' : points > 0 ? `+${plural(points, 'point')}` : 'No points');
+    if (r && Number.isInteger(r.q)) ui.seenResult = r.q;   // P0-18: no recap of a result shown here
 
     const hasCorrect = !survey && !!r && Number.isInteger(r.correct) && r.correct >= 0 && r.correct <= 3;
     $('res-correct-row').hidden = !hasCorrect;
@@ -1055,9 +1407,11 @@ const RENDER = {
 
     const score = r ? r.score : me.score;
     const rank = r ? r.rank : me.rank;
+    const tied = r ? r.tied : me.tied;
     const total = (r && r.playerCount) || state.playerCount;
     setText('res-score', fmt(score));
-    setText('res-rank', rank ? `You are ${ordinal(rank)} of ${fmt(total)}` : '—');
+    // P0-19: equal scores share a place ("Tied 2nd of 3"); P0-21: "2nd of 2" never breaks.
+    setText('res-rank', !rank ? '—' : tied ? `Tied${NBSP}${place(rank, false, total)}` : `You are ${place(rank, false, total)}`);
 
     const streak = (r ? r.streak : me.streak) || 0;
     $('res-streak').hidden = streak < 2;
@@ -1069,28 +1423,49 @@ const RENDER = {
   podium() {
     const p = state.podium || {};
     const me = state.me || {};
-    const you = p.you || { score: me.score, rank: me.rank };
-    setText('pod-you', you.rank ? `You finished ${ordinal(you.rank)} of ${fmt(state.playerCount)}` : 'Final results');
-    setText('pod-score', `${fmt(you.score)} points`);
+    const you = p.you || { score: me.score, rank: me.rank, tied: me.tied };
+    setText('pod-you', you.rank ? `You finished ${place(you.rank, you.tied, state.playerCount || you.rank)}` : 'Final results');
+    setText('pod-score', plural(you.score, 'point'));
 
     const list = $('pod-top');
     list.textContent = '';                       // rebuild; names are server text → textContent only
     (p.top || []).slice(0, 3).forEach((entry, i) => {
       const li = document.createElement('li');
       if (entry.nick && entry.nick === me.nick) li.className = 'you';
-      const place = document.createElement('span'); place.className = 'place'; place.textContent = PLACES[i];
+      // §4.3: display ranks share a place on equal scores (protocol 2 servers send none: 1st, 2nd, 3rd).
+      const rank = Number.isInteger(entry.rank) && entry.rank > 0 ? entry.rank : i + 1;
+      const where = document.createElement('span'); where.className = 'place'; where.textContent = (entry.tied ? 'Tied' + NBSP : '') + ordinal(rank);
       const name = document.createElement('span'); name.className = 'name'; name.textContent = entry.nick || '';
       const score = document.createElement('span'); score.className = 'score'; score.textContent = fmt(entry.score);
-      li.append(place, name, score);
+      li.append(where, name, score);
       list.appendChild(li);
     });
   },
 
+  // P0-10: the final rank stays; a game ended before anyone answered says so instead of "Game over".
+  ended() {
+    // `played: false` also when questions ran but nobody answered; this phone knows it saw one then.
+    const cancelled = state.played === false && !ui.sawQuestion && !state.podium;
+    const heading = $('ended-heading');
+    heading.textContent = cancelled ? 'The host ended the game before it started.' : 'Game over.';
+    heading.classList.toggle('huge', !cancelled);
+    const fin = state.played === false ? '' : finalPlace();     // nobody answered: no ranking to keep
+    $('ended-rank').hidden = !fin;
+    setText('ended-rank', fin);
+    setText('ended-text', cancelled ? 'Wait for a new PIN from your teacher.' : 'Nothing about this game is kept.');
+  },
+
   fatal() {
-    setText('fatal-title', ui.fatal.title);
-    setText('fatal-text', ui.fatal.text || '');
-    $('fatal-retry').hidden = !ui.fatal.retry && !ui.fatal.here;
-    setText('fatal-retry', ui.fatal.here ? 'Use it here' : 'Try again');
+    const f = ui.fatal;
+    setText('fatal-title', f.title);
+    setText('fatal-text', f.text || '');
+    const btn = $('fatal-retry');
+    btn.hidden = !f.action;
+    setText('fatal-retry', f.action === 'here' ? 'Use it here' : f.action === 'reload' ? 'Reload' : 'Try again');
+    // With nothing to retry, the way back to the PIN page is the main button.
+    const link = $('fatal-link');
+    link.className = 'btn ' + (f.action ? 'secondary' : 'primary');
+    setText('fatal-link', f.newPin ? 'Enter a new PIN' : 'Back to the PIN page');
   },
 };
 
@@ -1131,6 +1506,7 @@ function startTicking() { if (!rafId) rafId = requestAnimationFrame(tick); }
 function stopTicking() {
   if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
   $('timefill').style.transform = 'scaleX(1)';
+  document.body.classList.remove('hurry');
 }
 function tick() {
   rafId = 0;
@@ -1159,6 +1535,8 @@ function paintClock() {
     const left = Math.max(0, q.deadline - now);
     $('timefill').style.transform = `scaleX(${(left / total).toFixed(4)})`;
     setText('open-secs', `${Math.ceil(left / 1000)} s`);
+    // P0-27: the last three seconds are red, in the number and the bar.
+    document.body.classList.toggle('hurry', left > 0 && left <= 3000);
     if (left <= 0 && !ui.timeUp) { ui.timeUp = true; return true; }
   }
   return false;
@@ -1193,7 +1571,14 @@ function boot() {
   $('spin-btn').addEventListener('click', () => startJoin(true));
   $('join-cancel').addEventListener('click', cancelJoin);
   $('respin-btn').addEventListener('click', respin);
-  $('fatal-retry').addEventListener('click', () => { if (ui.fatal && ui.fatal.here) useHere(); else location.reload(); });
+  $('fatal-retry').addEventListener('click', tryAgain);
+  $('join-retry').addEventListener('click', recheck);
+  $('inapp-ok').addEventListener('click', () => {
+    ui.inappOk = true;
+    try { localStorage.setItem(INAPP_KEY, '1'); } catch (err) { /* shown again next time: fine */ }
+    render();
+  });
+  try { ui.inappOk = localStorage.getItem(INAPP_KEY) === '1'; } catch (err) { /* ignore */ }
   document.querySelectorAll('[data-rename-open]').forEach((b) => b.addEventListener('click', openRename));
   $('rename-form').addEventListener('submit', (ev) => { ev.preventDefault(); sendRename(false); });
   $('rename-random').addEventListener('click', () => sendRename(true));
@@ -1205,12 +1590,27 @@ function boot() {
     if (btn && !btn.disabled) onChoice(Number(btn.dataset.choice));
   });
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') requestWakeLock();
+    if (document.visibilityState === 'visible') {
+      requestWakeLock();
+      // Back on the join form: the host may have locked or unlocked the game meanwhile (P0-09).
+      if (shownScreen === 'join' && !ui.joining && !sock) fetchSummary();
+    }
   });
+  // Focus check (§13): left = hidden or not focused; back = visible and focused, or touched.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') leavePage();
+    else if (document.hasFocus()) backOnPage();
+  });
+  // Only the window's own blur and focus: a heading or field losing focus inside the page is not leaving it.
+  window.addEventListener('blur', (ev) => { if (ev.target === window) leavePage(); });
+  window.addEventListener('focus', (ev) => { if (ev.target === window && document.visibilityState === 'visible') backOnPage(); });
+  window.addEventListener('pointerdown', () => { if (document.visibilityState === 'visible') backOnPage(); }, true);
+  ['copy', 'cut', 'contextmenu'].forEach((type) => document.addEventListener(type, onCopy));
 
   sweepSaved();                    // forget entries from games that are long over
   if (!PIN_RE.test(PIN)) { render(); return; }
   ui.saved = loadSaved();
+  if (ui.saved) loadAway();        // Focus check totals not yet confirmed sent before a reload
   render();
   if (ui.saved) openSocket();      // §5: resume with the token; the server replies with sync
   else fetchSummary();             // first visit: show title / player count on the join screen

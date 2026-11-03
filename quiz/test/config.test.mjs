@@ -3,7 +3,7 @@
 // Run with: node --test test/config.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 
 /** Parse JSONC: drop // and /* *\/ comments that are outside strings. */
 function parseJsonc(text) {
@@ -51,4 +51,30 @@ test('no dev-only switch or secret is configured as a var', () => {
 test('the room cap is at least 400 and observability stays off', () => {
   assert.ok(Number(config.vars.MAX_PLAYERS) >= 400);
   assert.equal(config.observability.enabled, false);
+});
+
+test('staging has its own quiz library database, with the same binding and migrations', () => {
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  const prod = config.d1_databases;
+  const stag = config.env.staging.d1_databases;
+  assert.equal(prod.length, 1);
+  assert.equal(stag.length, 1);
+  assert.equal(prod[0].binding, 'DB');
+  assert.equal(stag[0].binding, prod[0].binding);
+  assert.equal(stag[0].migrations_dir, prod[0].migrations_dir);
+  assert.match(prod[0].database_id, uuid);
+  assert.match(stag[0].database_id, uuid);
+  assert.notEqual(stag[0].database_id, prod[0].database_id);
+});
+
+test('migrations are numbered, additive SQL files', () => {
+  const dir = new URL('../migrations/', import.meta.url);
+  const files = readdirSync(dir).filter((f) => f.endsWith('.sql')).sort();
+  assert.ok(files.length >= 1);
+  files.forEach((f, i) => {
+    assert.match(f, /^\d{4}_[a-z0-9_]+\.sql$/, f);
+    assert.equal(Number(f.slice(0, 4)), i + 1, `${f} is numbered in order`);
+    const sql = readFileSync(new URL(f, dir), 'utf8').replace(/--.*$/gm, '');
+    assert.doesNotMatch(sql, /\b(DROP|RENAME)\b/i, `${f} only adds`);
+  });
 });

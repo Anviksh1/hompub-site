@@ -6,11 +6,13 @@ import {
   DEFAULT_SETTINGS,
   LIMITS,
   csvEscape,
+  displayRanks,
   hasResults,
   idlePlan,
   isProfane,
   joinName,
   legacyNicknameMode,
+  mergeAway,
   mergeSettings,
   nameWords,
   normalizeSettings,
@@ -163,21 +165,18 @@ test('nameMode defaults to typed names; legacy values map for old rooms and old 
   assert.equal(mergeSettings(DEFAULT_SETTINGS, { nicknameMode: 'spin' }, true).nameMode, 'random');
 });
 
-test('joinName: version-2 pages are told why; version-1 pages keep the old silent spin', () => {
-  assert.deepEqual(joinName({ nameMode: 'typed', v2: true, nick: 'Priya', spin: false }), { kind: 'typed', nick: 'Priya', note: null });
-  assert.equal(joinName({ nameMode: 'typed', v2: true, nick: 'shit', spin: false }).kind, 'reject');
-  assert.equal(joinName({ nameMode: 'typed', v2: false, nick: 'shit', spin: false }).kind, 'random');
-  assert.equal(joinName({ nameMode: 'typed', v2: true, nick: '   ', spin: false }).kind, 'reject');
-  assert.equal(joinName({ nameMode: 'typed', v2: true, nick: '', spin: true }).kind, 'reject');   // no random names
-  assert.equal(joinName({ nameMode: 'typed', v2: false, nick: '', spin: true }).kind, 'random');  // old Spin honoured
-  assert.equal(joinName({ nameMode: 'either', v2: true, nick: '', spin: true }).kind, 'random');
-  assert.equal(joinName({ nameMode: 'random', v2: true, nick: 'Priya', spin: false }).kind, 'random');
-  assert.deepEqual(joinName({ nameMode: 'random', v2: true, nick: 'Priya', spin: false }), { kind: 'random', replaced: true });   // told why
-  assert.deepEqual(joinName({ nameMode: 'random', v2: true, nick: '', spin: true }), { kind: 'random' });
-  assert.deepEqual(joinName({ nameMode: 'random', v2: false, nick: 'Priya', spin: false }), { kind: 'random' });
-  const stripped = joinName({ nameMode: 'typed', v2: true, nick: '+91 Priya', spin: false });
+test('joinName: an unusable name is refused with a reason, never swapped silently', () => {
+  assert.deepEqual(joinName({ nameMode: 'typed', nick: 'Priya', spin: false }), { kind: 'typed', nick: 'Priya', note: null });
+  assert.equal(joinName({ nameMode: 'typed', nick: 'shit', spin: false }).kind, 'reject');
+  assert.equal(joinName({ nameMode: 'typed', nick: '   ', spin: false }).kind, 'reject');
+  assert.equal(joinName({ nameMode: 'typed', nick: '', spin: true }).kind, 'reject');   // no random names
+  assert.equal(joinName({ nameMode: 'either', nick: '', spin: true }).kind, 'random');
+  assert.equal(joinName({ nameMode: 'random', nick: 'Priya', spin: false }).kind, 'random');
+  assert.deepEqual(joinName({ nameMode: 'random', nick: 'Priya', spin: false }), { kind: 'random', replaced: true });   // told why
+  assert.deepEqual(joinName({ nameMode: 'random', nick: '', spin: true }), { kind: 'random' });
+  const stripped = joinName({ nameMode: 'typed', nick: '+91 Priya', spin: false });
   assert.ok(stripped.kind === 'typed' && stripped.nick === '91 Priya' && stripped.note?.reason === 'stripped');
-  const long = joinName({ nameMode: 'typed', v2: true, nick: 'Abcdefghijklmnopqrstuvwxyz', spin: false });
+  const long = joinName({ nameMode: 'typed', nick: 'Abcdefghijklmnopqrstuvwxyz', spin: false });
   assert.ok(long.kind === 'typed' && long.nick.length === LIMITS.nickChars && long.note?.reason === 'shortened');
 });
 
@@ -230,4 +229,41 @@ test('a room stored before allowRename existed gets it only while still in the l
   for (const phase of ['intro', 'open', 'closed', 'podium', 'ended'] as const) assert.equal(normalizeSettings(stored, phase).allowRename, false, phase);
   assert.equal(normalizeSettings({ ...stored, allowRename: true }, 'open').allowRename, true);   // the host turned it back on
   assert.equal(normalizeSettings(stored).allowRename, DEFAULT_SETTINGS.allowRename);               // a new room
+});
+
+test('Focus check is off by default, kept when stored, and changed through settings', () => {
+  assert.equal(DEFAULT_SETTINGS.focusCheck, false);
+  assert.equal(normalizeSettings({}).focusCheck, false);
+  assert.equal(normalizeSettings({ focusCheck: 'yes' }).focusCheck, false);
+  assert.equal(normalizeSettings({ focusCheck: true }).focusCheck, true);
+  assert.equal(mergeSettings(DEFAULT_SETTINGS, { focusCheck: true }, false).focusCheck, true);
+  assert.equal(mergeSettings({ ...DEFAULT_SETTINGS, focusCheck: true }, { mode: 'accuracy' }, true).focusCheck, true);
+});
+
+test('mergeAway: running totals only go up, are clamped, and need a real leave or a blocked copy', () => {
+  // 20 s question: at most 21 s away (with the 1 s grace).
+  assert.deepEqual(mergeAway(null, { n: 1, ms: 4000 }, 20), { n: 1, ms: 4000, copies: 0 });
+  assert.deepEqual(mergeAway(null, { n: 2, ms: 99_000, copies: 3 }, 20), { n: 2, ms: 21_000, copies: 3 });
+  assert.equal(mergeAway(null, { n: 1, ms: 400 }, 20), null);            // under a second: noise
+  assert.deepEqual(mergeAway(null, { n: 1, ms: 400, copies: 1 }, 20), { n: 0, ms: 0, copies: 1 });
+  assert.equal(mergeAway(null, { n: 0, ms: 0, copies: 0 }, 20), null);
+  assert.equal(mergeAway(null, { n: 'x', ms: 1000 }, 20), null);
+  assert.equal(mergeAway(null, { ms: 5000 }, 20), null);
+  const prev = { n: 3, ms: 9000, copies: 2 };
+  assert.deepEqual(mergeAway(prev, { n: 1, ms: 2000, copies: 0 }, 20), prev);   // a reloaded page cannot lower it
+  assert.deepEqual(mergeAway(prev, { n: 4, ms: 12_000, copies: 2 }, 20), { n: 4, ms: 12_000, copies: 2 });
+  assert.deepEqual(mergeAway(null, { n: 1e9, ms: 5000, copies: 1e9 }, 20), { n: 100, ms: 5000, copies: 1000 });
+  assert.deepEqual(mergeAway(null, { n: -3, ms: -5, copies: 2 }, 20), { n: 0, ms: 0, copies: 2 });
+});
+
+test('displayRanks: equal scores share a place and are marked tied', () => {
+  const r = displayRanks([
+    { pid: 'a', score: 3000 }, { pid: 'b', score: 2000 }, { pid: 'c', score: 2000 }, { pid: 'd', score: 0 }, { pid: 'e', score: 0 },
+  ]);
+  assert.deepEqual(r.get('a'), { rank: 1, tied: false });
+  assert.deepEqual(r.get('b'), { rank: 2, tied: true });
+  assert.deepEqual(r.get('c'), { rank: 2, tied: true });
+  assert.deepEqual(r.get('d'), { rank: 4, tied: true });
+  assert.deepEqual(r.get('e'), { rank: 4, tied: true });
+  assert.equal(displayRanks([]).size, 0);
 });

@@ -10,10 +10,12 @@
  *   HQ_PASSCODE='local test passcode' node test/load.mjs --url http://localhost:8787 --players 150 \
  *        --questions 20 --time-limit 5 --answer-window 2000 --drop 0.2 --join-burst 10000 [--seed 42] [--verbose]
  *
- * Protocol 2 (PROTOCOL.md §11): the harness signs in with the host passcode (--passcode, or the
+ * Protocol 3 (PROTOCOL.md §11): the harness signs in with the host passcode (--passcode, or the
  * HQ_PASSCODE environment variable), sends the session cookie and an Origin header, receives roster
- * deltas, and runs a share of the phones (--v1) as version-1 pages cached from before protocol 2.
- * Against a server without /api/session it falls back to the version-1 protocol for everyone.
+ * deltas, and runs a share of the phones (--v2) as version-2 pages cached from Phase 1. It also
+ * checks that a version-1 page is told to reload (4010). With --focus the room has Focus check on
+ * (§13): a share of version-3 phones report leaving the page, and the host's records and the CSV
+ * are checked. Against a server without /api/session it falls back to the version-1 protocol for everyone.
  *
  * Exit codes: 0 PASS, 1 FAIL (every violation is listed), 2 usage error or
  * server unreachable. stdout carries the report only; diagnostics go to stderr.
@@ -51,7 +53,8 @@ const DEFAULTS = {
   seed: 42,
   quiz: '',
   passcode: process.env.HQ_PASSCODE || '',
-  v1: 0.1,
+  v2: 0.1,
+  focus: false,
   'ip-per-bot': false,
   'dev-stats': false,
   verbose: false,
@@ -68,7 +71,8 @@ const USAGE = `Usage: node test/load.mjs [options]
   --seed <n>                     PRNG seed; same seed = same decisions     (default ${DEFAULTS.seed})
   --quiz <file>                  use this Quiz JSON (e.g. test/sample-quiz.json) instead of generating one
   --passcode <text>              host passcode (default: the HQ_PASSCODE environment variable)
-  --v1 <fraction>                share of phones that behave as version-1 pages (default ${DEFAULTS.v1})
+  --v2 <fraction>                share of phones that behave as version-2 pages from Phase 1 (default ${DEFAULTS.v2})
+  --focus                        turn Focus check on; about 10 % of version-3 phones report leaving the page each question
   --ip-per-bot                   give each phone its own client address (needs DEV_CLIENT_IP_HEADER in .dev.vars);
                                  without it every phone shares one address, like a school network
   --dev-stats                    ask the room for rows written at the podium (needs DEV_REPORT_ROWS in .dev.vars)
@@ -114,14 +118,15 @@ function parseCli(argv) {
     seed: raw.seed,
     quizFile: raw.quiz,
     passcode: raw.passcode,
-    v1: raw.v1,
+    v2: raw.v2,
+    focus: raw.focus,
     ipPerBot: raw['ip-per-bot'],
     devStats: raw['dev-stats'],
     verbose: raw.verbose,
   };
   if (!/^https?:\/\/[^/\s]+$/.test(o.url)) die(`--url must look like http://host:port (got "${o.url}")`);
   if (!Number.isInteger(o.players) || o.players < 1 || o.players > MAX_PLAYERS) die(`--players must be an integer from 1 to ${MAX_PLAYERS}`);
-  if (!(o.v1 >= 0 && o.v1 <= 1)) die('--v1 must be between 0 and 1');
+  if (!(o.v2 >= 0 && o.v2 <= 1)) die('--v2 must be between 0 and 1');
   if (!Number.isInteger(o.questions) || o.questions < 1 || o.questions > 100) die('--questions must be an integer from 1 to 100');
   if (!TIME_LIMITS.includes(o.timeLimit)) die(`--time-limit must be one of ${TIME_LIMITS.join(', ')}`);
   if (o.answerWindow < 0) die('--answer-window must be >= 0');
@@ -257,6 +262,8 @@ const stats = {
 
 const game = {
   pin: null, hostToken: null, quiz: null, N: 0, showOnDevices: false,
+  awaySent: new Map(),  // `${pid}|${q}` -> ms reported (--focus)
+  focusSeen: new Map(), // what the host was told (sync.focus and focus frames)
   legacy: false,        // the server has no /api/session: protocol 1 for everyone
   cookie: '',           // host session cookie (protocol 2)
   devStats: null,       // {statements, rowsWritten, alarms, players, wipeRows} from the room, if asked
@@ -334,7 +341,7 @@ class Player {
   constructor(i) {
     this.i = i;                       // 1-based, "Student <i>"
     this.spin = i % 7 === 0;          // every 7th player asks for a spun two-word name
-    this.v1 = false;                  // behaves as a version-1 page (set in main)
+    this.v2 = false;                  // behaves as a version-2 page from Phase 1 (set in main); else version 3
     this.isDup = false;               // deliberately answers twice (set in main)
     this.ws = null;
     this.token = null; this.pid = null; this.nick = null;
@@ -350,7 +357,7 @@ class Player {
     this.runningScore = 0; this.runningQ = -1;   // score confirmed through question runningQ
     this.results = new Map();         // q -> recorded result
     this.answers = new Map();         // q -> { choice, sentAt, ... }
-    this.finalScore = null; this.finalRank = null; this.gotEnded = false;
+    this.finalScore = null; this.finalRank = null; this.finalTied = false; this.gotEnded = false;
     this.backoff = 500;
     this.dead = false;                // closed with a no-retry code: stays offline
     this.deliberateClose = false;     // the harness itself closed the socket (simulated drop)
@@ -366,7 +373,7 @@ class Player {
     if (game.over || this.dead) return;
     this.clear('reconnect');
     const reconnecting = this.token !== null;
-    const v = this.v1 || game.legacy ? '' : '&v=2';
+    const v = game.legacy ? '' : this.v2 ? '&v=2' : '&v=3';
     const query = reconnecting ? `role=player${v}&token=${encodeURIComponent(this.token)}` : `role=player${v}`;
     let ws;
     try {
@@ -497,8 +504,8 @@ class Player {
       case 'sync': return this.onSync(f);
       case 'lobby': return undefined;
       case 'closing':
-        // §4: version-2 pages act on this as on the close itself; version-1 pages ignore unknown frames.
-        if (this.v1 || game.legacy) return undefined;
+        // §4: pages act on this as on the close itself (a protocol-1 server never sends it).
+        if (game.legacy) return undefined;
         try { ws.close(); } catch { /* ignore */ }
         return this.onClose(ws, f.code, f.reason);
       case 'intro':
@@ -513,6 +520,7 @@ class Player {
         if (typeof f.deadline !== 'number') violate(`${this.tag}: open for question ${f.q + 1} without a numeric deadline`);
         this.phase = 'open'; this.q = f.q; this.deadline = f.deadline;
         this.scheduleAnswer(f.q);
+        this.maybeLeave(f.q);
         return undefined;
       case 'ack': return this.onAck(f);
       case 'result':
@@ -527,7 +535,7 @@ class Player {
         this.phase = 'podium';
         if (!f.you || typeof f.you.score !== 'number') { violate(`${this.tag}: podium without you.score`); return undefined; }
         if (!Array.isArray(f.top) || f.top.length > 3) violate(`${this.tag}: podium.top must list at most 3 players`);
-        this.finalScore = f.you.score; this.finalRank = f.you.rank;
+        this.finalScore = f.you.score; this.finalRank = f.you.rank; this.finalTied = f.you.tied === true;
         return undefined;
       case 'ended':
         this.phase = 'ended'; this.gotEnded = true;
@@ -626,8 +634,10 @@ class Player {
       if (me.score !== 0) violate(`${this.tag}: score ${me.score} while still in the lobby`);
       this.runningScore = 0; this.runningQ = -1;
     } else if (s.phase === 'intro' || s.phase === 'open') {
-      // me.score already includes the current question once me.answered is true.
-      this.runningScore = me.score; this.runningQ = me.answered === true ? s.q : s.q - 1;
+      // While a question is starting or open, me.score is the score before it, answered or not, and the
+      // streak is withheld once answered: nothing may tell a player whether the answer was right (§4.3).
+      if (me.answered === true && me.streak !== null) violate(`${this.tag}: sync during question ${s.q + 1} shows streak ${me.streak} after answering`);
+      this.runningScore = me.score; this.runningQ = s.q - 1;
     } else if (s.phase === 'podium' || s.phase === 'ended') {
       this.runningScore = me.score; this.runningQ = game.N - 1;
     }
@@ -636,7 +646,7 @@ class Player {
       else violate(`${this.tag}: sync in closed phase without result`);
     }
     if (s.podium && s.podium.you) {
-      this.finalScore = s.podium.you.score; this.finalRank = s.podium.you.rank;
+      this.finalScore = s.podium.you.score; this.finalRank = s.podium.you.rank; this.finalTied = s.podium.you.tied === true;
     } else if (s.phase === 'podium' || s.phase === 'ended') {
       violate(`${this.tag}: sync in ${s.phase} without podium.you`);
     }
@@ -657,6 +667,19 @@ class Player {
     const choice = correct ? key.correct : wrong;
     this.clear('answer');
     this.timers.answer = setTimeout(() => { this.timers.answer = 0; this.sendAnswer(q, choice); }, delay);
+  }
+
+  /** --focus: a version-3 phone that "left the page" reports it once for this question (PROTOCOL §13). */
+  maybeLeave(q) {
+    if (!opts.focus || this.v2 || game.legacy) return;
+    const rng = mulberry32(mix(opts.seed, this.i, q + 1, 13));
+    if (rng() >= 0.1) return;
+    const ms = 1000 + Math.floor(rng() * 3000);
+    setTimeout(() => {
+      if (this.phase !== 'open' || this.q !== q || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      send(this.ws, { t: 'away', q, n: 1, ms, copies: 0 });
+      game.awaySent.set(`${this.pid}|${q}`, ms);
+    }, Math.floor(rng() * opts.answerWindow));
   }
 
   sendAnswer(q, choice) {
@@ -895,6 +918,10 @@ class Host {
       case 'reveal': return this.onReveal(f);
       case 'podium': return this.onPodium(f);
       case 'results_csv': return this.onCsv(f);
+      case 'focus':
+        if (!Array.isArray(f.records)) violate('host: focus frame without records');
+        else for (const r of f.records) game.focusSeen.set(`${r.pid}|${r.q}`, r);
+        return undefined;
       case 'wiped': return this.onWiped();
       case 'settings': return undefined;
       case 'error': violate(`host: error frame ${f.code}: ${f.message}`); return undefined;
@@ -911,7 +938,8 @@ class Host {
 
   onSync(s) {
     stats.hostSyncs += 1;
-    if (!game.legacy && s.proto !== 2) violate(`host: sync.proto is ${s.proto}, expected 2`);
+    if (!game.legacy && s.proto !== 3) violate(`host: sync.proto is ${s.proto}, expected 3`);
+    if (Array.isArray(s.focus)) for (const r of s.focus) game.focusSeen.set(`${r.pid}|${r.q}`, r);
     this.roster = new Map((Array.isArray(s.roster) ? s.roster : []).map((p) => [p.pid, p]));
     if (s.role !== 'host') violate(`host: sync.role is "${s.role}"`);
     if (s.hostToken !== game.hostToken) violate('host: sync.hostToken differs from the token returned by POST /api/room');
@@ -1222,6 +1250,7 @@ function finalChecks() {
   if (game.dupsSent === 0) warn('no duplicate answer was ever sent, so the "duplicate" ack path was not exercised');
   checkCsv(joined);
   checkFastest();
+  checkFocus(joined);
 }
 
 /** reveal.fastest.ms is the server's elapsed for the fastest correct answer; the harness knows bounds for each one it sent. */
@@ -1259,12 +1288,46 @@ function parseCsvLine(line) {
   return out;
 }
 
+/** --focus: every report a phone sent reached the host; version-2 phones are "not checked", never clean. */
+function checkFocus(players) {
+  if (!opts.focus || game.legacy) return;
+  for (const [key, ms] of game.awaySent) {
+    const r = game.focusSeen.get(key);
+    if (!r) { violate(`focus: the report ${key} (${ms} ms) never reached the host`); continue; }
+    if (r.n < 1 || r.ms !== ms) violate(`focus: ${key} reached the host as n=${r.n}, ms=${r.ms}; sent n=1, ms=${ms}`);
+  }
+  const v2 = new Set(players.filter((p) => p.v2 && p.pid).map((p) => p.pid));
+  let old = 0;
+  for (const [key, r] of game.focusSeen) {
+    const pid = key.slice(0, key.lastIndexOf('|'));
+    if (r.old) { old += 1; if (!v2.has(pid)) violate(`focus: ${key} is marked old but that phone speaks version 3`); }
+    else if (v2.has(pid)) violate(`focus: a version-2 phone has a report ${key}, which it cannot send`);
+  }
+  if (v2.size && !old) violate('focus: no version-2 phone was marked "not checked"');
+  log(`focus: ${game.awaySent.size} reports sent, ${game.focusSeen.size} records at the host, ${old} "not checked" marks`);
+}
+
+/** A page without `v` (from before protocol 2) is refused with 4010 and told to reload (PROTOCOL §11). */
+function checkV1Refused() {
+  return new Promise((resolve) => {
+    const ws = new WebSocket(`${WS_BASE}/api/room/${game.pin}/ws?role=player`);
+    const t = setTimeout(() => { violate('a version-1 page was not refused within 5 s'); try { ws.close(); } catch { /* ignore */ } resolve(); }, 5000);
+    ws.addEventListener('close', (ev) => {
+      clearTimeout(t);
+      if (ev.code !== 4010 || !/out of date/i.test(ev.reason)) violate(`a version-1 page was closed with ${ev.code} "${ev.reason}", expected 4010 out of date`);
+      resolve();
+    });
+    ws.addEventListener('error', () => { /* the close event follows */ });
+  });
+}
+
 function checkCsv(joined) {
   if (game.csv === null) { violate('no results_csv frame was received'); return; }
   if (!game.csv.endsWith('\r\n')) warn('CSV does not end with CRLF');
   const lines = game.csv.split(/\r?\n/);
   while (lines.length && lines[lines.length - 1] === '') lines.pop();
   const expectHeader = ['rank', 'nickname', 'score', 'correct', 'answered', ...Array.from({ length: game.N }, (_, i) => `q${i + 1}`)];
+  if (opts.focus) expectHeader.push(...Array.from({ length: game.N }, (_, i) => `q${i + 1} left page`), 'times left page', 'seconds away', 'copies blocked');
   if (parseCsvLine(lines[0] ?? '').join(',') !== expectHeader.join(',')) violate(`CSV header is "${lines[0]}"`);
   const rows = lines.slice(1).map(parseCsvLine).sort((a, b) => Number(a[0]) - Number(b[0]));
   if (rows.length !== joined.length) violate(`CSV has ${rows.length} data rows, expected ${joined.length} (one per joined player)`);
@@ -1286,9 +1349,11 @@ function checkCsv(joined) {
     if (seen.has(p)) violate(`CSV lists "${nick}" twice`);
     seen.add(p);
     if (p.finalScore !== null && score !== p.finalScore) violate(`${p.tag}: CSV score ${score} != final score ${p.finalScore}`);
-    if (p.finalRank !== null && rank !== p.finalRank) violate(`${p.tag}: CSV rank ${rank} != podium rank ${p.finalRank}`);
+    // The podium shows ties sharing a place (P0-19); the CSV keeps the strict order, so a tied
+    // player's CSV rank is at or below the shared place, and an untied one's is the same.
+    if (p.finalRank !== null && (p.finalTied ? rank < p.finalRank : rank !== p.finalRank)) violate(`${p.tag}: CSV rank ${rank} does not fit podium rank ${p.finalRank}${p.finalTied ? ' (tied)' : ''}`);
     let sum = 0; let nAnswered = 0; let nCorrect = 0;
-    cells.forEach((cell, q) => {
+    cells.slice(0, game.N).forEach((cell, q) => {             // after them: the Focus check columns (--focus)
       const key = game.quiz.questions[q];
       const r = p.results.get(q);
       const a = p.answers.get(q);
@@ -1461,7 +1526,7 @@ async function main() {
       method: 'POST',
       headers: game.legacy ? { 'content-type': 'application/json' } : { 'content-type': 'application/json', Origin: opts.url, Cookie: game.cookie },
       // Typed or random names: every 7th phone asks for a random one.
-      body: JSON.stringify({ quiz: game.quiz, settings: { nameMode: 'either', nicknameMode: 'free' } }),
+      body: JSON.stringify({ quiz: game.quiz, settings: { nameMode: 'either', nicknameMode: 'free', focusCheck: !!opts.focus } }),
       signal: AbortSignal.timeout(10000),
     });
     body = await res.json().catch(() => ({}));
@@ -1490,9 +1555,10 @@ async function main() {
 
   // 5. Players: who answers twice, and when each one joins.
   for (let i = 1; i <= opts.players; i++) players.push(new Player(i));
-  const v1Count = game.legacy ? opts.players : Math.round(opts.players * opts.v1);
-  for (const p of shuffle([...players], mulberry32(mix(opts.seed, 5))).slice(0, v1Count)) p.v1 = true;
-  if (!game.legacy) log(`${v1Count} of ${opts.players} phones behave as version-1 pages`);
+  const v2Count = game.legacy ? 0 : Math.round(opts.players * opts.v2);
+  for (const p of shuffle([...players], mulberry32(mix(opts.seed, 5))).slice(0, v2Count)) p.v2 = true;
+  if (!game.legacy) log(`${v2Count} of ${opts.players} phones behave as version-2 pages`);
+  if (!game.legacy) await checkV1Refused();
   const dupCount = Math.max(1, Math.round(opts.players * 0.05));
   for (const p of shuffle([...players], mulberry32(mix(opts.seed, 2))).slice(0, dupCount)) p.isDup = true;
   const joinRng = mulberry32(mix(opts.seed, 3));
@@ -1512,7 +1578,7 @@ async function main() {
   const stillOpen = players.filter((p) => p.ws !== null && p.ws.readyState !== WebSocket.CLOSING);
   if (host.ws) stillOpen.push(host);
   if (!game.aborted && stillOpen.length) violate(`${stillOpen.length} socket(s) were still open ${WIPE_CLOSE_WAIT_MS / 1000} s after wipe (expected 4004 closes)`);
-  if (process.env.DEBUG_OPEN) for (const p of stillOpen) process.stderr.write(`OPEN: ${p.tag || 'host'} v1=${p.v1} synced=${p.synced} readyState=${p.ws && p.ws.readyState} lastDisconnect=${p.lastDisconnectAt ? Math.round((Date.now() - p.lastDisconnectAt) / 1000) + 's ago' : '-'}\n`);
+  if (process.env.DEBUG_OPEN) for (const p of stillOpen) process.stderr.write(`OPEN: ${p.tag || 'host'} v2=${p.v2} synced=${p.synced} readyState=${p.ws && p.ws.readyState} lastDisconnect=${p.lastDisconnectAt ? Math.round((Date.now() - p.lastDisconnectAt) / 1000) + 's ago' : '-'}\n`);
   for (const s of stillOpen) { try { s.ws.close(1000, 'harness exit'); } catch { /* ignore */ } }
   if (stillOpen.length) await waitForSocketsClosed(1000);
   if (!game.aborted) finalChecks();

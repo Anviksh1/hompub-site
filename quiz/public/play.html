@@ -18,6 +18,8 @@
 </head>
 <body data-screen="connecting">
 
+<!-- Header and countdown bar stay at the top while the page scrolls (large text, P0-28) -->
+<div class="top">
 <header class="bar">
   <div class="mark" aria-label="HomPub Quiz">
     <span class="badge" aria-hidden="true">
@@ -32,7 +34,8 @@
     </span>
     <span class="mark-text">HomPub <span class="mark-sub">Quiz</span></span>
   </div>
-  <span id="pill" class="pill" data-conn="connecting" role="status" aria-live="polite">Connecting…</span>
+  <!-- Narrow headers show the dot and the short label; the long one stays for screen readers (P0-25) -->
+  <span id="pill" class="pill" data-conn="idle" role="status" aria-live="polite"><span id="pill-long" class="pill-long"></span><span id="pill-short" class="pill-short" aria-hidden="true"></span></span>
   <button id="contrast" class="icon-btn" type="button" aria-pressed="false"
           aria-label="High-contrast colours" title="High-contrast colours">
     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -42,14 +45,23 @@
   </button>
 </header>
 
-<!-- Thin countdown bar; only visible while a question is open -->
+<!-- Countdown bar; only visible while a question is open -->
 <div class="timebar" aria-hidden="true"><div id="timefill" class="timefill"></div></div>
+</div>
 
 <main id="main">
 
+  <!-- Focus check (PROTOCOL §13): shown on every game screen while the host has it on -->
+  <p id="focus-note" class="focus-note" hidden>Your teacher can see if you leave this page during a question.</p>
+  <!-- In-app browsers (WhatsApp, Instagram…): a one-time, dismissable suggestion (P0-16) -->
+  <div id="inapp" class="inapp" hidden>
+    <p>Open this page in your browser for the best experience.</p>
+    <button id="inapp-ok" class="btn secondary slim" type="button">OK</button>
+  </div>
+
   <section data-screen="nopin" class="center" hidden>
     <h1 id="nopin-heading" tabindex="-1">No game PIN</h1>
-    <p class="muted">This link is missing its 6-digit game PIN.</p>
+    <p id="nopin-text" class="muted">This link is missing its 6-digit game PIN.</p>
     <a class="btn primary" href="/">Enter a PIN</a>
   </section>
 
@@ -58,6 +70,7 @@
     <h1 id="join-heading" tabindex="-1">Join the game</h1>
     <p class="meta"><span id="join-pin" class="mono"></span> · <span id="join-count"></span></p>
     <p id="join-notice" class="notice" hidden></p>
+    <button id="join-retry" class="btn primary" type="button" hidden>Try again</button>
     <button id="join-cancel" class="btn secondary slim" type="button" hidden>Cancel</button>
     <form id="join-form" novalidate autocomplete="off">
       <div id="nick-row">
@@ -77,7 +90,8 @@
   <section data-screen="connecting" class="center" hidden>
     <h1 id="connecting-title" tabindex="-1">Connecting…</h1>
     <p id="connecting-text" class="muted"></p>
-    <p id="connecting-hint" class="hint" hidden>Still trying to reach the game… <a href="/">Back to the PIN page</a></p>
+    <p id="connecting-hint" class="hint" hidden>Still trying to reach the game…</p>
+    <a id="connecting-back" class="btn secondary" href="/" hidden>Back to the PIN page</a>
   </section>
 
   <section data-screen="lobby" class="center" hidden>
@@ -85,7 +99,9 @@
     <h1 id="lobby-heading" class="huge" tabindex="-1">You’re in, <span id="lobby-nick"></span>!</h1>
     <p class="big-hint">Watch the big screen.</p>
     <p id="lobby-count" class="meta"></p>
+    <p id="game-warn" class="notice" hidden></p>
     <p id="name-note" class="hint" hidden></p>
+    <p id="wake-hint" class="hint" hidden>Keep your screen on until the game ends.</p>
     <button id="respin-btn" class="btn secondary slim" type="button" hidden>Spin a new name</button>
     <button id="edit-name-btn" class="btn secondary slim" type="button" data-rename-open hidden>Change my name</button>
   </section>
@@ -95,6 +111,7 @@
     <h1 id="intro-q" class="huge" tabindex="-1"></h1>
     <p class="big-hint">Get ready…</p>
     <div id="intro-count" class="countdown" aria-hidden="true"></div>
+    <p id="intro-recap" class="recap" hidden></p>
   </section>
 
   <section data-screen="open" hidden>
@@ -102,7 +119,10 @@
       <h1 id="open-q" class="eyebrow" tabindex="-1"></h1>
       <span id="open-secs" class="mono secs"></span>
     </div>
+    <!-- Clamped on short screens; the projector shows the question in full (P0-24) -->
     <p id="open-text" class="qtext" hidden></p>
+    <!-- Above the tiles, so it is never below the fold (P0-24) -->
+    <p id="open-status" class="status" role="status" aria-live="polite"></p>
     <div id="grid" class="grid" data-count="4">
       <button class="opt" type="button" data-choice="0" aria-label="Red triangle">
         <svg class="shape" viewBox="0 0 100 100" aria-hidden="true"><polygon points="50,12 92,84 8,84"/></svg>
@@ -121,7 +141,6 @@
         <span class="opt-text"></span>
       </button>
     </div>
-    <p id="open-status" class="status" role="status" aria-live="polite"></p>
   </section>
 
   <section data-screen="closed" class="center" hidden>
@@ -160,8 +179,9 @@
 
   <section data-screen="ended" class="center" hidden>
     <h1 id="ended-heading" class="huge" tabindex="-1">Game over.</h1>
+    <p id="ended-rank" class="final" hidden></p>
     <p id="ended-text" class="big-hint">Nothing about this game is kept.</p>
-    <a class="btn primary slim" href="/">Join another game</a>
+    <a class="btn primary" href="/">Join another game</a>
   </section>
 
   <!-- Name change (lobby, or later while the host allows it). Outside the screens so it can open over any of them. -->
@@ -184,7 +204,7 @@
     <p id="fatal-text" class="muted"></p>
     <div class="row">
       <button id="fatal-retry" class="btn primary" type="button" hidden>Try again</button>
-      <a class="btn secondary" href="/">Back to the PIN page</a>
+      <a id="fatal-link" class="btn secondary" href="/">Back to the PIN page</a>
     </div>
   </section>
 

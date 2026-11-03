@@ -29,6 +29,7 @@ export interface Settings {
   nicknameMode: NicknameMode; // always legacyNicknameMode(nameMode)
   nameMode: NameMode;
   allowRename: boolean;       // students may change their own name (switched off at Start)
+  focusCheck: boolean;        // phones report leaving the page during a question (PROTOCOL.md §13)
 }
 
 export type Phase = 'lobby' | 'intro' | 'open' | 'closed' | 'podium' | 'ended';
@@ -41,6 +42,7 @@ export const DEFAULT_SETTINGS: Settings = {
   nicknameMode: 'free',
   nameMode: 'typed',
   allowRename: true,
+  focusCheck: false,
 };
 
 export function legacyNicknameMode(nameMode: NameMode): NicknameMode {
@@ -75,6 +77,10 @@ export const LIMITS = {
   pendingHosts: 5,              // host sockets waiting for their auth frame
   hostAuthMs: 10_000,           // a host socket must authenticate within this long
   joinIdMs: 60_000,             // a repeated join id is honoured this long after the join
+  awayMinMs: 1000,              // shorter trips away from the page are not counted
+  awayMaxTimes: 100,            // Focus check: the most leaves one report may claim
+  awayMaxCopies: 1000,          // ...and blocked copies
+  awayWrites: 3,                // Focus check rows saved per player per question while it is open
 } as const;
 
 // ---------------------------------------------------------------- validation
@@ -133,6 +139,7 @@ export function mergeSettings(base: Settings, patch: unknown, inLobby: boolean):
   if (typeof p.showOnDevices === 'boolean') out.showOnDevices = p.showOnDevices;
   if (typeof p.lateJoin === 'boolean') out.lateJoin = p.lateJoin;
   if (typeof p.allowRename === 'boolean') out.allowRename = p.allowRename;
+  if (typeof p.focusCheck === 'boolean') out.focusCheck = p.focusCheck;   // the Room refuses it mid-question
   if (inLobby) {
     if (p.mode === 'speed' || p.mode === 'accuracy' || p.mode === 'coarse') out.mode = p.mode;
     if (typeof p.earlyClose === 'boolean') out.earlyClose = p.earlyClose;
@@ -159,6 +166,7 @@ export function normalizeSettings(raw: unknown, phase?: Phase): Settings {
   if (typeof r.earlyClose === 'boolean') out.earlyClose = r.earlyClose;
   if (typeof r.allowRename === 'boolean') out.allowRename = r.allowRename;
   else if (phase !== undefined) out.allowRename = phase === 'lobby';
+  if (typeof r.focusCheck === 'boolean') out.focusCheck = r.focusCheck;
   if (r.nameMode === 'typed' || r.nameMode === 'either' || r.nameMode === 'random') out.nameMode = r.nameMode;
   else if (r.nicknameMode === 'spin') out.nameMode = 'random';
   else if (r.nicknameMode === 'free') out.nameMode = 'either';
@@ -290,25 +298,21 @@ function typedNote(raw: unknown, clean: string): NameNote | null {
 }
 
 export type JoinName =
-  /** replaced: a version-2 page typed a name, but this game gives random names only (the phone is told why). */
+  /** replaced: the student typed a name, but this game gives random names only (the phone is told why). */
   | { kind: 'random'; replaced?: boolean }
   | { kind: 'typed'; nick: string; note: NameNote | null }
   | { kind: 'reject'; reason: 'empty' | 'filtered' | 'random_off'; message: string };
 
-/**
- * The name a joining player gets. A version-1 page (v2 = false) keeps the old
- * behaviour: its Spin is honoured in every mode, and an empty or filtered name
- * becomes a spun one. A version-2 page is told why instead.
- */
-export function joinName(i: { nameMode: NameMode; v2: boolean; nick: unknown; spin: boolean }): JoinName {
-  if (i.nameMode === 'random') return i.v2 && !i.spin && sanitizeNick(i.nick) ? { kind: 'random', replaced: true } : { kind: 'random' };
+/** The name a joining player gets. A name that cannot be used is refused with a reason, never swapped silently. */
+export function joinName(i: { nameMode: NameMode; nick: unknown; spin: boolean }): JoinName {
+  if (i.nameMode === 'random') return !i.spin && sanitizeNick(i.nick) ? { kind: 'random', replaced: true } : { kind: 'random' };
   if (i.spin) {
-    if (i.v2 && i.nameMode === 'typed') return { kind: 'reject', reason: 'random_off', message: NAME_MESSAGES.random_off };
+    if (i.nameMode === 'typed') return { kind: 'reject', reason: 'random_off', message: NAME_MESSAGES.random_off };
     return { kind: 'random' };
   }
   const nick = sanitizeNick(i.nick);
-  if (nick.length === 0) return i.v2 ? { kind: 'reject', reason: 'empty', message: NAME_MESSAGES.empty } : { kind: 'random' };
-  if (isProfane(nick)) return i.v2 ? { kind: 'reject', reason: 'filtered', message: NAME_MESSAGES.filtered } : { kind: 'random' };
+  if (nick.length === 0) return { kind: 'reject', reason: 'empty', message: NAME_MESSAGES.empty };
+  if (isProfane(nick)) return { kind: 'reject', reason: 'filtered', message: NAME_MESSAGES.filtered };
   return { kind: 'typed', nick, note: typedNote(i.nick, nick) };
 }
 
@@ -338,6 +342,55 @@ export function renameCheck(i: { allowRename: boolean; nameMode: NameMode; renam
  * rules (PROTOCOL.md §6): 2 h after the last frame, or 30 min after `ended`.
  * `scale` shortens every period for local tests only (DEV_TTL_SCALE).
  */
+// ------------------------------------------------------------ Focus check
+
+/** What one player did during one question: times they left, ms away, blocked copies. */
+export interface AwayRecord { n: number; ms: number; copies: number }
+
+/**
+ * Fold a phone's report into what is already recorded. Reports are running
+ * totals for the question from that page, so each field only ever goes up (a
+ * reloaded page that lost its count cannot lower it), and each is clamped: time
+ * away to the question's length plus the grace period, counts to sane maxima.
+ * Returns null when the report is not usable at all.
+ */
+export function mergeAway(prev: AwayRecord | null, report: Record<string, unknown>, timeLimitS: number): AwayRecord | null {
+  const num = (v: unknown, max: number) => (typeof v === 'number' && Number.isFinite(v) ? Math.min(Math.max(Math.floor(v), 0), max) : null);
+  const n = num(report.n, LIMITS.awayMaxTimes);
+  const ms = num(report.ms, timeLimitS * 1000 + LIMITS.graceMs);
+  const copies = num(report.copies ?? 0, LIMITS.awayMaxCopies);
+  if (n === null || ms === null || copies === null) return null;
+  // A leave shorter than the minimum is noise; a report must carry a leave or a blocked copy.
+  const left = n > 0 && ms >= LIMITS.awayMinMs;
+  if (!left && copies === 0) return null;
+  const base = prev ?? { n: 0, ms: 0, copies: 0 };
+  return {
+    n: Math.max(base.n, left ? n : 0),
+    ms: Math.max(base.ms, left ? ms : 0),
+    copies: Math.max(base.copies, copies),
+  };
+}
+
+// ------------------------------------------------------------------ ranks
+
+/**
+ * Display ranks with ties: equal scores share the place of the first of them
+ * (1, 2, 2, 4), and `tied` says another player has the same score. `sorted`
+ * is the strict order (score, then speed, then join time), which the CSV keeps.
+ */
+export function displayRanks(sorted: { pid: string; score: number }[]): Map<string, { rank: number; tied: boolean }> {
+  const out = new Map<string, { rank: number; tied: boolean }>();
+  const count = new Map<number, number>();
+  for (const p of sorted) count.set(p.score, (count.get(p.score) ?? 0) + 1);
+  let rank = 0;
+  let prevScore: number | null = null;
+  sorted.forEach((p, i) => {
+    if (p.score !== prevScore) { rank = i + 1; prevScore = p.score; }
+    out.set(p.pid, { rank, tied: (count.get(p.score) ?? 0) > 1 });
+  });
+  return out;
+}
+
 export function idlePlan(i: { phase: Phase; lastActivity: number; phaseAt: number; scale?: number }): { wipeAt: number; warnAt: number | null } {
   const k = i.scale && i.scale > 0 ? i.scale : 1;
   if (i.phase === 'ended') return { wipeAt: i.phaseAt + LIMITS.ttlFinishedMs * k, warnAt: null };

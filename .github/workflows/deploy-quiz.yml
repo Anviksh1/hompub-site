@@ -17,6 +17,15 @@
 #                   secrets it was created with, so this can bring back an old
 #                   HOST_PASSCODE or SESSION_KEY. It only runs when
 #                   accept_secret_revert is ticked.
+#   d1-restore      put the quiz library (D1) back to a Time Travel bookmark. It
+#                   overwrites every quiz saved since; do "Export all" on the host page
+#                   first. Prints the bookmark to undo it, and changes the library
+#                   generation so every host page drops its cached copy and reloads.
+#                   Only runs when confirm_d1_restore is ticked.
+#
+# deploy and redeploy-ref apply new D1 migrations (quiz/migrations) before deploying,
+# after printing the database's current bookmark so a migration can be undone with
+# d1-restore. A ref from before the library existed has no migrations to apply.
 #
 # Every deploy restarts every Durable Object and drops every open WebSocket. Phones
 # reconnect within seconds, but run it outside class time.
@@ -29,7 +38,7 @@ on:
       action:
         description: 'What to do'
         type: choice
-        options: [deploy, redeploy-ref, rollback-version]
+        options: [deploy, redeploy-ref, rollback-version, d1-restore]
         default: deploy
       release_tag:
         description: 'deploy: tag to create on the deployed commit (quiz-phase-N)'
@@ -45,6 +54,14 @@ on:
         default: ''
       accept_secret_revert:
         description: 'rollback-version: I understand secrets from that version may come back'
+        type: boolean
+        default: false
+      bookmark:
+        description: 'd1-restore: the D1 Time Travel bookmark to restore to'
+        type: string
+        default: ''
+      confirm_d1_restore:
+        description: 'd1-restore: I exported all quizzes; quizzes saved after the bookmark will be lost'
         type: boolean
         default: false
       reason:
@@ -73,6 +90,8 @@ jobs:
       REF_INPUT: ${{ inputs.ref }}
       VERSION_ID: ${{ inputs.version_id }}
       ACCEPT_SECRET_REVERT: ${{ inputs.accept_secret_revert }}
+      BOOKMARK: ${{ inputs.bookmark }}
+      CONFIRM_D1_RESTORE: ${{ inputs.confirm_d1_restore }}
       REASON: ${{ inputs.reason }}
     # bash -eo pipefail: a failing `wrangler … | tee` fails the step instead of passing.
     defaults:
@@ -89,6 +108,8 @@ jobs:
           ref_re='^(quiz-phase-[0-9]+([.][0-9]+)?|[0-9a-f]{40})$'
           uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
           reason_re='^[A-Za-z0-9][A-Za-z0-9 .,:()_/-]{0,99}$'
+          # A bookmark looks like 00000085-0000024c-00004c6d-8e61117bf38d7adb71b934ebbf891683.
+          bookmark_re='^[0-9a-f]{8}(-[0-9a-f]{8,64}){1,6}$'
           case "$ACTION" in
             deploy)
               if [ "$GITHUB_REF" != "refs/heads/main" ]; then echo "::error::Run this from main."; exit 1; fi
@@ -100,6 +121,11 @@ jobs:
             rollback-version)
               [[ $VERSION_ID =~ $uuid_re ]] || { echo "::error::version_id must be a UUID"; exit 1; }
               if [ "$ACCEPT_SECRET_REVERT" != "true" ]; then echo "::error::Tick accept_secret_revert, or use redeploy-ref, which keeps current secrets."; exit 1; fi
+              echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT" ;;
+            d1-restore)
+              if [ "$GITHUB_REF" != "refs/heads/main" ]; then echo "::error::Run this from main."; exit 1; fi
+              [[ $BOOKMARK =~ $bookmark_re ]] || { echo "::error::bookmark must be a D1 Time Travel bookmark, as printed by an earlier run"; exit 1; }
+              if [ "$CONFIRM_D1_RESTORE" != "true" ]; then echo "::error::Do Export all on the host page, then tick confirm_d1_restore."; exit 1; fi
               echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT" ;;
             *) echo "::error::Unknown action"; exit 1 ;;
           esac
@@ -138,7 +164,58 @@ jobs:
           npm run typecheck
           npm test
 
+      # The bookmark printed here is the "before" point: restore it with d1-restore to undo
+      # what the migrations did. Wrangler skips its confirmation prompt in CI.
+      - name: Apply quiz library migrations (D1)
+        if: env.ACTION == 'deploy' || env.ACTION == 'redeploy-ref'
+        working-directory: quiz
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -u
+          if [ ! -d migrations ]; then echo "This code has no D1 migrations; nothing to apply."; exit 0; fi
+          BM=$(npx wrangler d1 time-travel info DB --env="" --json | jq -r '.bookmark // empty')
+          if [ -z "$BM" ]; then echo "::error::Could not read the D1 bookmark. Check that the production token has Account → D1 → Edit."; exit 1; fi
+          echo "D1 bookmark before migrations: $BM" | tee -a "$GITHUB_STEP_SUMMARY"
+          npx wrangler d1 migrations apply DB --remote --env="" 2>&1 | tee ../d1-out.txt
+
+      - name: Restore the quiz library (D1)
+        if: env.ACTION == 'd1-restore'
+        working-directory: quiz
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -u
+          # --json skips the interactive "OK to proceed" prompt, which would answer no in CI.
+          npx wrangler d1 time-travel restore DB --env="" --bookmark="$BOOKMARK" --json | tee ../restore-out.json
+          PREV=$(jq -r '.previous_bookmark // empty' ../restore-out.json || true)
+          if [ -z "$PREV" ]; then echo "::error::Wrangler did not confirm the restore; check the log above."; exit 1; fi
+          # The undo point goes in the summary first, whatever happens next.
+          echo "Restored the quiz library to $BOOKMARK. To undo, run d1-restore with bookmark $PREV." >> "$GITHUB_STEP_SUMMARY"
+          # A new generation tells every host page that its cached quizzes are from before the restore
+          # (PROTOCOL.md §12). An upsert, so it works even if the row is missing; tried three times.
+          GEN=$(date +%s%3N)
+          SQL="INSERT INTO library (id, generation) VALUES ('main', $GEN) ON CONFLICT(id) DO UPDATE SET generation = excluded.generation"
+          done_gen=""
+          for i in 1 2 3; do
+            if npx wrangler d1 execute DB --remote --env="" --yes --command "$SQL" 2>&1 | tee ../gen-out.txt; then done_gen=1; break; fi
+            if grep -q "no such table" ../gen-out.txt; then break; fi
+            sleep $((i * 5))
+          done
+          if [ -z "$done_gen" ]; then
+            if grep -q "no such table" ../gen-out.txt; then
+              echo "::error::The restore went back to before the quiz library existed. Run this workflow with deploy (or redeploy-ref) to recreate its tables; host pages then ask about every quiz they still hold."
+            else
+              echo "::error::The restore worked, but the library generation could not be changed, so host pages would not notice the restore. From a laptop run: npx wrangler d1 execute DB --remote --command \"$SQL\""
+            fi
+            exit 1
+          fi
+          echo "Library generation set to $GEN: host pages set their cached copies aside and reload." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Deploy or roll back
+        if: env.ACTION != 'd1-restore'
         working-directory: quiz
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -151,7 +228,7 @@ jobs:
             if ! grep -q "Current Version ID: $VERSION_ID" ../wrangler-out.txt; then echo "::error::Wrangler did not confirm the rollback to $VERSION_ID; check the log above."; exit 1; fi
             echo "Rolled back to $VERSION_ID. Secrets are those of that version: re-set any secret rotated since." >> "$GITHUB_STEP_SUMMARY"
           else
-            npx wrangler deploy --durable-objects-code-update-mode immediate --message="$REASON" 2>&1 | tee ../wrangler-out.txt
+            npx wrangler deploy --env="" --durable-objects-code-update-mode immediate --message="$REASON" 2>&1 | tee ../wrangler-out.txt
             VID=$(grep -Eo 'Current Version ID: [0-9a-f-]{36}' ../wrangler-out.txt | awk '{print $4}' || true)
             if [ -z "$VID" ]; then echo "::error::Wrangler printed no version id; check the log above before trusting this deploy."; exit 1; fi
             echo "Deployed $CHECKOUT_REF. Version id: $VID" >> "$GITHUB_STEP_SUMMARY"

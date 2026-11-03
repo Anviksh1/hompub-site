@@ -226,7 +226,7 @@ body[data-mode="stage"] .link-btn { color: var(--stage-ink-soft); }
 .btn-row.end { justify-content: flex-end; }
 
 /* ---------- page (home / editor / setup) ---------- */
-.page { padding: 24px 0 72px; display: flex; flex-direction: column; gap: 22px; }
+.page { padding-block: 24px 72px; display: flex; flex-direction: column; gap: 22px; }   /* block only: .wrap keeps the 16 px gutters */
 .page-head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 12px; }
 .page-head h1 { font-size: clamp(1.7rem, 4vw, 2.4rem); font-weight: 650; line-height: 1.1; }
 .lede { color: var(--ink-soft); max-width: 60ch; }
@@ -441,14 +441,14 @@ textarea.importer-text { min-height: 240px; font-family: 'IBM Plex Mono', ui-mon
 
 .options { display: grid; grid-template-columns: 1fr; gap: 12px; }
 .opt-tile {
-  position: relative; display: flex; align-items: center; gap: 16px; min-height: 92px; padding: 16px 20px;
+  position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; min-height: 92px; padding: 16px 20px;
   border-radius: var(--tile-radius, 16px); background: var(--opt-color); color: var(--opt-ink);
   font-size: clamp(1.1rem, 2.6vw, 2.6rem); font-weight: 600; line-height: 1.2; overflow: hidden;
   border: var(--border-w) solid rgba(255,255,255,0.25);
 }
 .opt-tile .shape { width: clamp(36px, 5vw, 56px); height: clamp(36px, 5vw, 56px); flex: none; display: flex; }
 .opt-tile .shape svg { width: 100%; height: 100%; fill: currentColor; }
-.opt-tile .label { flex: 1; overflow-wrap: anywhere; }
+.opt-tile .label { flex: 1 1 8ch; min-width: 0; overflow-wrap: break-word; hyphens: auto; }   /* breaks between words (P0-66) */
 .opt-tile .count { font-family: 'IBM Plex Mono', monospace; font-size: clamp(1.3rem, 3vw, 2.8rem); font-weight: 500; flex: none; }
 .opt-tile .tick { flex: none; width: 1.2em; height: 1.2em; }
 .opt-tile .bar { position: absolute; left: 0; bottom: 0; height: 8px; background: rgba(255,255,255,0.85); border-radius: 0 4px 4px 0; }
@@ -528,7 +528,7 @@ body[data-mode="stage"] .site-footer { display: none; }
 
 /* ---------- phones: the options menu becomes a bottom sheet so it cannot overflow the viewport ---------- */
 @media (max-width: 639px) {
-  .stage-menu .menu-body { position: fixed; left: 16px; right: 16px; top: auto; bottom: 16px; min-width: 0; max-width: none; }
+  .stage-menu .menu-body { position: fixed; left: 16px; right: 16px; top: auto; bottom: 16px; min-width: 0; max-width: none; max-height: calc(100dvh - 32px); overflow: auto; }
 }
 
 /* ---------- wider screens ---------- */
@@ -536,7 +536,7 @@ body[data-mode="stage"] .site-footer { display: none; }
   .options { grid-template-columns: 1fr 1fr; }
   .importer-grid { grid-template-columns: 1.25fr 1fr; align-items: start; }
   .quiz-row { flex-direction: row; justify-content: space-between; align-items: center; }
-  .page { padding-top: 32px; }
+  .page { padding-block-start: 32px; }
 }
 @media (min-width: 900px) {
   .lobby { grid-template-columns: minmax(300px, 1fr) 1.2fr; align-items: start; }
@@ -592,3 +592,137 @@ body[data-mode="stage"] .site-footer { display: none; }
 .players-list li.empty { color: var(--stage-ink-soft); border: 0; }
 .players-panel .fine { color: var(--stage-ink-soft); }
 .btn[disabled][aria-busy="true"] { opacity: 0.6; cursor: progress; }
+
+/* ---------- Phase 2: dialogs, the library on screen, the editor, Focus check ---------- */
+
+dialog.ask {
+  border: 0; padding: 0; margin: auto; background: transparent; color: var(--ink);
+  width: min(560px, calc(100vw - 32px)); max-width: none; max-height: calc(100dvh - 32px); overflow: auto;
+}
+dialog.ask::backdrop { background: rgba(28,23,48,0.6); }
+dialog.ask[open]:not(:modal) { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 70; box-shadow: 0 20px 50px rgba(0,0,0,0.45); }
+.ask-panel h2 { font-size: 1.3rem; font-weight: 650; }
+.ask-body { display: flex; flex-direction: column; gap: 8px; }
+.ask-body .problems { margin: 0; }
+
+.toast { display: flex; align-items: center; gap: 12px; }
+.toast .btn { pointer-events: auto; background: var(--paper); color: var(--ink); border-color: var(--paper); }
+
+.sync-status { font-size: 0.86rem; color: var(--ink-soft); padding-left: 18px; position: relative; }
+.sync-status::before { content: ''; position: absolute; left: 0; top: 0.5em; width: 10px; height: 10px; border-radius: 50%; background: var(--ink-soft); }
+.sync-status[data-kind="ok"]::before { background: var(--ok); }
+.sync-status[data-kind="warn"]::before { background: var(--warn); }
+.sync-status[data-kind="bad"]::before { background: var(--bad); }
+.sync-status[data-kind="pending"]::before { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
+.list-head { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; justify-content: space-between; }
+.first-step h3 { font-size: 1.05rem; font-weight: 600; margin-top: 4px; }
+.first-step .btn-row a.btn { text-decoration: none; }
+.netcheck.compact { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 12px 18px; }
+.netcheck.compact h2 { font-size: 1rem; flex: 1 1 14ch; }
+.netcheck.compact > .fine { flex: 1 1 100%; order: 3; }
+.netcheck.compact .net-result { flex: 1 1 100%; order: 4; }
+.quiz-row .meta.bad { color: var(--bad); }
+.trash summary { cursor: pointer; font-weight: 600; min-height: 44px; display: flex; align-items: center; }
+.trash-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.trash-list li { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; justify-content: space-between; padding: 8px 0; border-top: var(--border-w) solid var(--rule); }
+a.btn { display: inline-flex; align-items: center; text-decoration: none; }
+
+/* Editor: inline problems (P0-38) and a bar that keeps the status in view */
+.editor-fields { border: 0; padding: 0; margin: 0; min-width: 0; display: flex; flex-direction: column; gap: 22px; }
+.field-error { color: var(--bad); font-size: 0.86rem; margin-top: -6px; }
+.input[aria-invalid="true"] { border-color: var(--bad); box-shadow: 0 0 0 1px var(--bad); }
+.opt-list[aria-invalid="true"] { outline: 2px dashed var(--bad); outline-offset: 4px; border-radius: 8px; }
+.editor-bar {
+  position: sticky; bottom: 0; z-index: 10; display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: center; justify-content: space-between;
+  padding: 10px 16px; margin: 0 -16px -72px; background: var(--paper-raised); border-top: var(--border-w) solid var(--rule);
+  box-shadow: 0 -6px 16px rgba(36,30,51,0.06); font-size: 0.9rem;
+}
+.editor-bar .bar-problems { font-weight: 600; }
+.editor-bar .bar-problems[data-kind="warn"] { color: var(--warn); }
+.editor-bar .bar-problems[data-kind="ok"] { color: var(--ok); }
+.editor-bar .autosave { color: var(--ink-soft); }
+.why { font-size: 0.9rem; color: var(--warn); }
+
+/* Focus check */
+.focus-line { font-size: clamp(1rem, 1.8vw, 1.5rem); color: var(--stage-ink); border-left: 4px solid #ffd27a; padding-left: 12px; }
+.focus-mark { color: #ffd27a; font-size: 0.92em; }
+.offline-note { font-size: clamp(1rem, 1.8vw, 1.5rem); color: #ffd27a; }
+.menu-note { color: var(--stage-ink-soft); font-size: 0.8rem; }
+.join-link { color: var(--stage-ink); }
+.mini-qr .qr { width: clamp(52px, 8.5vh, 110px); padding: 3px; border-radius: 8px; }
+.q-top { display: flex; flex-direction: column; gap: 18px; }
+.reveal-facts { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 28px; }
+.podium-left { display: flex; flex-direction: column; gap: 8px; }
+
+/* ---------- Phase 2: the projector screens fit 1280×720 and 1920×1080 without scrolling (P0-62) ----------
+   On a laptop or projector the stage is exactly one screen tall: the body scrolls inside itself if it
+   ever must, and the controls stay at the bottom, always visible. Sizes follow the screen's height, so
+   the PIN, the join link, the counter and the leaderboard grow on a big screen (P0-64). Phones (an
+   emergency host) keep the normal scrolling page. */
+@media (min-width: 900px) and (min-height: 540px) {
+  body[data-mode="stage"] { height: 100vh; height: 100dvh; min-height: 0; overflow: hidden; }
+  body[data-mode="stage"] .topbar .wrap { min-height: 44px; padding-top: 2px; padding-bottom: 2px; }
+  body[data-mode="stage"] #app { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  body[data-mode="stage"] .stage { flex: 1; min-height: 0; padding-top: 6px; padding-bottom: 10px; gap: 1.4vh; }
+  body[data-mode="stage"] .stage > .stage-body { min-height: 0; overflow: auto; gap: 1.6vh; }
+  body[data-mode="stage"] .stage > .controls { padding-top: 1vh; }
+  /* The Options menu and the players panel scroll inside the screen instead of running off it. */
+  body[data-mode="stage"] .stage-menu .menu-body { max-height: calc(100dvh - 140px); overflow: auto; }
+  body[data-mode="stage"] .stage > .players-panel { flex: 0 1 auto; min-height: 0; max-height: 72%; overflow: hidden; }
+  body[data-mode="stage"] .players-panel .players-list { flex: 1 1 auto; min-height: 0; max-height: none; }
+  .stage-head { font-size: clamp(0.95rem, 2.4vh, 1.5rem); padding-bottom: 0.8vh; }
+  .stage-head .pin b { font-size: clamp(1.6rem, 5vh, 3rem); }
+
+  /* Lobby: join link, PIN and a QR of 30–40 % of the height on the left; the newest names on the right. */
+  .lobby { flex: 1; min-height: 0; grid-template-columns: minmax(300px, 1fr) 1.2fr; align-items: stretch; }
+  .lobby-join { justify-content: center; gap: 0.5vh; }
+  .join-url { font-size: clamp(1.1rem, 3.4vh, 2.4rem); line-height: 1.25; }
+  .pin-big { font-size: clamp(3rem, 15vh, 11rem); margin: 0 0 1vh; }
+  .qr { width: clamp(160px, 33vh, 440px); padding: 1.1vh; }
+  .lobby-players { min-height: 0; }
+  .lobby-players h2 { font-size: clamp(1.4rem, 4.4vh, 2.8rem); }
+  .players-grid { min-height: 0; overflow: auto; }
+  .player-chip { font-size: clamp(0.95rem, 2.6vh, 1.6rem); min-height: 44px; padding: 0.6vh 16px; }
+
+  /* Question */
+  .q-counter { font-size: clamp(0.95rem, 2.8vh, 1.7rem); }
+  .q-top { display: grid; grid-template-columns: 1fr auto; gap: 1vh 28px; align-items: center; }
+  .q-text { font-size: clamp(1.3rem, min(3.4vw, 5vh), 4rem); }
+  .q-meta { gap: 1vh 20px; flex-wrap: nowrap; }
+  .ring { width: clamp(80px, 16vh, 190px); height: clamp(80px, 16vh, 190px); }
+  .ring .num { font-size: clamp(1.6rem, 5vh, 3.4rem); }
+  .answered { font-size: clamp(1.1rem, 3.4vh, 2.2rem); }
+  .options { gap: 1.2vh 12px; }
+  .opt-tile { min-height: clamp(48px, 10vh, 140px); padding: 1vh 1.4vw; font-size: clamp(1rem, min(2.1vw, 3.6vh), 3rem); }
+  .opt-tile .shape { width: clamp(30px, 6vh, 64px); height: clamp(30px, 6vh, 64px); }
+  .opt-tile .count { font-size: clamp(1.2rem, 4.4vh, 3rem); }
+
+  /* Reveal: answers on the left, the top 10 on the right, every row visible at 720p */
+  .reveal-row { grid-template-columns: 1.4fr 1fr; align-items: start; gap: 1.2vh 24px; }
+  .reveal-row > .stage-body { gap: 1.2vh; }
+  .q-text.q-small { font-size: clamp(1.1rem, min(2.1vw, 3.4vh), 3rem); }
+  /* Wide tiles keep the count on the label's line; the label breaks between words. */
+  .reveal-options .opt-tile { flex-wrap: nowrap; min-height: clamp(44px, 8vh, 120px); padding: 0.8vh 1vw; gap: 4px 10px; font-size: clamp(0.9rem, min(1.4vw, 2.4vh), 2.2rem); }
+  .reveal-options .opt-tile .shape { width: clamp(24px, 4.4vh, 52px); height: clamp(24px, 4.4vh, 52px); }
+  .reveal-options .opt-tile .count { font-size: clamp(1rem, 3.4vh, 2.6rem); }
+  .reveal-row .answered { font-size: clamp(1rem, 2.8vh, 2rem); }
+  .reveal-facts { gap: 0.4vh 28px; }
+  .fastest, .focus-line { font-size: clamp(0.95rem, 2.4vh, 2rem); }
+  .board { gap: 0.5vh; }
+  .board li { padding: 0.3vh 14px; font-size: clamp(0.9rem, 2.6vh, 1.9rem); }
+  .board-title { font-size: clamp(1rem, 2.8vh, 1.9rem); }
+
+  /* Podium: the three places beside the top 10 */
+  .podium-row { display: grid; grid-template-columns: 1.3fr 1fr; gap: 24px; align-items: start; min-height: 0; }
+  .podium-left { min-height: 0; gap: 1vh; }
+  .podium { margin-top: 0; }
+  .podium-title { font-size: clamp(1.6rem, 6vh, 3.6rem); }
+  .place .nick { font-size: clamp(1rem, 4.4vh, 2.8rem); }
+  .place .score { font-size: clamp(0.9rem, 2.8vh, 1.7rem); }
+  .place .block { font-size: clamp(1.4rem, 5vh, 3.2rem); }
+  .place-1 .block { height: clamp(80px, 24vh, 280px); }
+  .place-2 .block { height: clamp(60px, 17vh, 200px); }
+  .place-3 .block { height: clamp(44px, 12vh, 150px); }
+
+  .center-card { margin: 2vh auto; }
+}

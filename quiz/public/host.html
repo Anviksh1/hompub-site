@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>HomPub Quiz — Host</title>
-<meta name="description" content="Host a live HomPub Quiz from your laptop: build the quiz here, show the PIN on the projector, students answer on their phones. One host passcode, no student accounts, nothing kept after the game.">
+<meta name="description" content="Host a live HomPub Quiz from your laptop: build the quiz here, show the PIN on the projector, students answer on their phones. One host passcode, no student accounts; your quizzes are kept in your library, games are not.">
 <meta name="theme-color" content="#1c1730">
 <meta name="robots" content="noindex">
 <!-- The host is one laptop, so loading the site's fonts here is fine. Player pages must not. -->
@@ -46,6 +46,8 @@
 <main id="app"></main>
 
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
+<!-- Changes a screen reader should hear without a new screen (a question moved, problems left to fix). -->
+<div id="announce" class="sr-only" role="status" aria-live="polite"></div>
 
 <!-- Hidden file pickers for "Import .json" and "Import Word or text"; both triggered from visible buttons. -->
 <input type="file" id="import-file" accept=".json,application/json" hidden>
@@ -53,14 +55,16 @@
 
 <footer class="site-footer">
   <div class="wrap">
-    <div>HomPub Quiz — one host passcode, no student accounts, no analytics. Quizzes live only in this browser; games are wiped when you say so.</div>
+    <div>HomPub Quiz — one host passcode, no student accounts, no analytics. Your quizzes are kept in your library; games are wiped when you say so.</div>
     <div><a href="/">Join page</a></div>
   </div>
 </footer>
 
 <script src="vendor/qrcode.js" defer></script>
-<!-- import-text.js defines window.HomPubImport (Word/text → quiz parser); host.js reads it, so it loads first. -->
+<!-- import-text.js defines window.HomPubImport (Word/text → quiz parser) and library.js window.HomPubLibrary
+     (the synced quiz library); host.js reads both, so they load first. -->
 <script src="import-text.js" defer></script>
+<script src="library.js" defer></script>
 <script src="host.js" defer></script>
 </body>
 </html>

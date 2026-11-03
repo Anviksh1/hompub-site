@@ -1,4 +1,4 @@
-# HomPub Quiz — protocol and contract (v2, pilot)
+# HomPub Quiz — protocol and contract (v3, pilot)
 
 This document is the single source of truth for every component in `quiz/`:
 the Cloudflare Worker (`src/worker.ts`), the `Room` Durable Object
@@ -7,9 +7,10 @@ player page (`public/play.html`), the host page (`public/host.html`), the join
 page (`public/index.html`) and the load harness (`test/load.mjs`). If code and
 this document disagree, fix one of them in the same commit.
 
-Protocol 2 (this version) adds host sign-in, roster deltas, renames and the
-other Phase 1 changes. What changed, and how pages from before it keep working,
-is in §11.
+Protocol 2 added host sign-in, roster deltas, renames and the other Phase 1
+changes. Protocol 3 (this version) adds Focus check (§13); the synced quiz
+library (§12) arrived with it. What changed, and how pages from before it keep
+working, is in §11.
 
 ## 1. Roles, pages, URLs
 
@@ -25,16 +26,17 @@ budget). Only `/api/*` invokes the Worker.
 | `GET /` | Join page: enter a 6-digit PIN → navigates to `/play?pin=XXXXXX` |
 | `GET /play?pin=XXXXXX` | Player page (phone). Also the target of the QR code. |
 | `GET /host` | Host page (laptop): quiz editor, lobby, game control, results |
-| `GET /api/health` | `200 {"ok":true,"now":<ms>,"version":"0.2.0","proto":2}` |
+| `GET /api/health` | `200 {"ok":true,"now":<ms>,"version":"0.3.0","proto":3}` |
 | `POST /api/session` | Sign in. Body `{"passcode": "...", "shared"?: true}`. `200 {"signedIn":true,"shared","expiresAt","library"}` and `Set-Cookie: __Host-hq_session=…; Path=/; Secure; HttpOnly; SameSite=Strict` (with `Max-Age`, except for a shared computer). `401 {"error":"wrong_passcode","remaining","message"}`. `429 {"error":"locked","retryAfter","message"}` + `Retry-After` after 5 wrong passcodes from one network in 15 minutes. `503 {"error":"not_configured"\|"passcode_too_short"\|"try_again","message"}`. |
 | `GET /api/session` | `200 {"signedIn":true,…}` (renews the cookie when due) or `200 {"signedIn":false[,"problem","message"]}`. `?passive=1`: the host page's timer, not the teacher, is asking; a shared-computer session is then not renewed, so its 4-hour idle limit holds while the tab stays open (it is never renewed past 12 hours in any case). |
 | `DELETE /api/session` | Sign out on this device: clears the cookie. `200 {"signedIn":false}`. |
 | `GET /api/rooms` | Signed in: `200 {"rooms":[{"pin","title","phase","playerCount","createdAt"}]}`, this library's live games (at most 10, newest first). Never contains host tokens. `401` signed out. |
+| `/api/library…` | Signed in only: the synced quiz library (§12). |
 | `GET /api/echo` | WebSocket echo (handled in the Worker, no Durable Object). Used by the network preflight. Any text frame is echoed back verbatim. Closes after 60 s. |
 | `POST /api/room` | Signed in only (`401 {"error":"sign_in"}` otherwise). Create a room. Body: `{"quiz": Quiz, "settings"?: Settings}`. Response `200 {"pin":"123456","hostToken":"<32 hex>","roomKey":"<16 hex>","joinUrl":"https://<host>/play?pin=123456&k=<roomKey>"}`. Errors: `400 {"error":"..."}` (invalid quiz), `413` (body > 200 KB), `429 {"error":"too_many_rooms"}` (whole-deployment daily cap; signed-in hosts skip the per-network cap), `503 {"error":"no_pin_available"\|"not_configured"\|…}`. |
 | `GET /api/room/:pin[?k=<roomKey>]` | Room summary for the join page: `200 {"pin","phase","playerCount","locked","lateJoin","nicknameMode","nameMode","allowRename"}` or `404 {"error":"not_found"}`, or `429 {"error":"rate_limited","retryAfter","message"}` (§9). No quiz title: anyone who guesses a PIN could read it. |
-| `GET /api/room/:pin/ws?role=host&v=2` | Host WebSocket. Needs the session cookie (checked by the Worker); the host token goes in a first `auth` frame (§4.2). A version-1 page (`token` in the URL, no `v`) is refused with `4010` "This page is out of date…" because it cannot sign in. |
-| `GET /api/room/:pin/ws?role=player&v=2[&k=<roomKey>][&token=<playerToken>]` | Player WebSocket. `token` present = reconnect attempt. `k` = the room key from the QR code / join link. Without `v`, the page is treated as version 1 (§11). |
+| `GET /api/room/:pin/ws?role=host&v=3` | Host WebSocket. Needs the session cookie (checked by the Worker, which then vouches for the socket); otherwise the host token goes in a first `auth` frame (§4.2). A token in the URL is ignored. A version-1 page (no `v`) is refused with `4010` "This page is out of date…" because it cannot sign in. |
+| `GET /api/room/:pin/ws?role=player&v=3[&k=<roomKey>][&token=<playerToken>]` | Player WebSocket. `token` present = reconnect attempt. `k` = the room key from the QR code / join link. `v=2` pages still play (§11); a page without `v` (version 1) is refused with `4010` "This page is out of date. Reload it to join the game." |
 
 `:pin` must match `^[1-9][0-9]{5}$`. Any other `/api/*` path → `404 {"error":"not_found"}`.
 The join page treats a summary whose `phase` is `podium` or `ended` as too late to join, matching the Room, which refuses new players in both phases with `4004`.
@@ -46,7 +48,7 @@ the `ALLOWED_ORIGINS` var (comma-separated). Otherwise `403`. Requests without
 an `Origin` header (curl, the load harness) are allowed.
 
 **Requests that use the session cookie** (`/api/session`, `/api/rooms`,
-`POST /api/room`, the host socket) follow a stricter rule: POST, PUT, DELETE
+`/api/library…`, `POST /api/room`, the host socket) follow a stricter rule: POST, PUT, DELETE
 and WebSocket upgrades need `Origin` equal to the page's origin, and a missing
 Origin is refused; GET and HEAD refuse a foreign Origin and a `Sec-Fetch-Site`
 that is present and not `same-origin`, but accept a missing Origin (browsers
@@ -62,7 +64,7 @@ and `wss://` in production; clients derive the scheme from `location.protocol`.
 
 ## 2. Data shapes
 
-### Quiz (authored on the host page, stored in the host's localStorage, sent once in `POST /api/room`)
+### Quiz (authored on the host page, stored in the quiz library (§12) and cached in the host's localStorage, sent once in `POST /api/room`)
 
 ```jsonc
 {
@@ -79,11 +81,15 @@ and `wss://` in production; clients derive the scheme from `location.protocol`.
 }
 ```
 
+A stored quiz may also carry `"schema": 1` (missing means 1) and fields this
+version does not know; the library keeps both. A page that meets a quiz with a
+newer `schema` opens it read-only and never saves, hosts or changes it (§12).
+
 Option slots are fixed to Kahoot's shape/colour pairs so colour-blind players
 can play by shape: index 0 = red triangle, 1 = blue diamond, 2 = yellow
 circle, 3 = green square. Letters A–D are used in CSV and text.
 
-### Settings (host may change until `start`; `showOnDevices`, `lateJoin` and `allowRename` may change any time)
+### Settings (host may change until `start`; `showOnDevices`, `lateJoin` and `allowRename` may change any time; `focusCheck` any time except during `intro` and `open`)
 
 ```jsonc
 {
@@ -93,7 +99,8 @@ circle, 3 = green square. Letters A–D are used in CSV and text.
   "earlyClose": false,      // close the question as soon as every player who was connected when it opened has answered
   "nameMode": "typed",      // "typed" (default) = typed names only, no random-name button | "either" = typed or random | "random" = random two-word names only
   "allowRename": true,      // students may change their own name (rename frame). Switched off by the server at start; the host may switch it on again.
-  "nicknameMode": "free"    // legacy, always derived: "spin" when nameMode is "random", else "free". Kept for version-1 pages (§11).
+  "focusCheck": false,      // phones report leaving the page during a question (§13). Off by default.
+  "nicknameMode": "free"    // legacy, always derived: "spin" when nameMode is "random", else "free". Still written, so a server rolled back to protocol 2 reads stored rooms unchanged.
 }
 ```
 
@@ -110,7 +117,7 @@ pages offered a Spin button next to the name box).
 - `open`: answers accepted from `opensAt` until `deadline = opensAt + timeLimit*1000`, plus a 1,000 ms grace for frames in flight (a grace answer is scored as if `elapsed = timeLimit*1000`). Phones switch to the answer buttons at `opensAt` on the shared clock without waiting for the `open` frame; an `answer` that reaches the server at or after `opensAt` while it is still in `intro` opens the question on the spot. Closes on the server timer, on host **Close**, or (if `earlyClose`) when every eligible player has answered.
 - `closed`: correct answer revealed; players see their own result and rank; host sees counts, fastest correct player and the top 10. Host presses **Next** (→ `intro` of the next question, or → `podium` after the last).
 - `podium`: top 3 on the projector, everyone sees their own final rank. Host presses **End game**.
-- `ended`: host receives the results CSV; players see "Game over, nothing about this game is kept". The room is wiped when the host sends `ack_results`, or by TTL.
+- `ended`: host receives the results CSV; players keep their final rank on screen and are told nothing about the game is kept (or, if the host ended it before any answer, that the host ended it). The room is wiped when the host sends `ack_results`, or by TTL.
 
 Time is **always the server's clock**. Every frame that carries a time also
 carries `serverNow`; clients compute `offset = serverNow - Date.now()` on
@@ -134,8 +141,10 @@ mode "speed" (Kahoot's published formula):
 
 Worked check: 2 s on a 30 s, 1000-point question → 1000 × (1 − (2/30)/2) = 966.7 → **967**.
 
-Rank: by `score` descending, ties broken by lower `elapsedTotal` (sum of
-`elapsed` over *correct* answers), then by earlier `joinedAt`. `streak` counts
+Order: by `score` descending, then lower `elapsedTotal` (sum of `elapsed` over
+*correct* answers), then earlier `joinedAt`. This strict order decides the top
+three and the CSV. The rank shown (`rank`, with `tied`) is by score alone:
+equal scores share a place (1, 2, 2, 4) and are marked tied. `streak` counts
 consecutive correct answers and is display-only (no bonus points).
 
 One answer per player per question: enforced in the Room by an in-memory set
@@ -152,7 +161,7 @@ reason="duplicate"`).
   of a ping, the page treats the connection as dead and reconnects at once.
 - Frame > 4,096 bytes → server closes with **1009**.
 - More than 10 frames/s sustained (burst allowance 20) → server closes with **4008**.
-- Server close codes: `4000` bad request (also `Join timed out` for a player socket that has not joined after 60 s without a `join` attempt, or 3 minutes in all) · `4001` bad host token · `4003` kicked · `4004` room not found / already ended / unknown player token · `4008` rate limited · `4009` room full, or too many sockets for one player · `4010` room locked / late join disabled / a version-1 host page (out of date) / a version-1 player over the PIN-guess limit · `4011` host session missing or expired: sign in again · `4012` this player is now connected in another tab or device · `4013` replaced by a newer connection from the same tab (version 2; the page has normally abandoned that socket already and ignores it; on its live socket it means a duplicated tab id, so the page takes a new tab id and reconnects) · `4014` too many wrong PINs from this network (version 2) · `1009` frame too large. Clients **must not** auto-reconnect after 4001, 4003, 4004, 4009, 4010, 4011, 4012, 4014; show the message instead (a host page first checks its session after 4011, below). Any other close → reconnect with backoff; the backoff restarts only once a frame has arrived, so a server that accepts and closes at once is not retried at full speed.
+- Server close codes: `4000` bad request (also `Join timed out` for a player socket that has not joined after 60 s without a `join` attempt, or 3 minutes in all) · `4001` bad host token · `4003` kicked · `4004` room not found / already ended / unknown player token · `4008` rate limited · `4009` room full · `4010` room locked / late join disabled / a version-1 page (out of date: reload) · `4011` host session missing or expired: sign in again · `4012` this player is now connected in another tab or device · `4013` replaced by a newer connection from the same tab (version 2; the page has normally abandoned that socket already and ignores it; on its live socket it means a duplicated tab id, so the page takes a new tab id and reconnects) · `4014` too many wrong PINs from this network (version 2) · `1009` frame too large. Clients **must not** auto-reconnect after 4001, 4003, 4004, 4009, 4010, 4011, 4012, 4014; show the message instead (a host page first checks its session after 4011, below). Any other close → reconnect with backoff; the backoff restarts only once a frame has arrived, so a server that accepts and closes at once is not retried at full speed.
 - Before the Room closes a socket from another socket's event or an alarm (a second tab, the wipe, an expired host sign-in), it sends `{"t":"closing","code":4012,"reason":"…"}`; version-2 pages act on it as on the close itself. In local workerd the close handshake of a socket that has not sent a frame yet stalls in that case (a phone that reconnected and has not answered yet), and the frame does not depend on it.
 - A close issued by a Room timer (the 10 s host sign-in limit, the join limits) is preceded by an `error` frame with code `auth_timeout` / `join_timeout`, because in local workerd such a close does not always reach the client; version-2 pages close the socket themselves on that frame.
 
@@ -160,28 +169,27 @@ reason="duplicate"`).
 
 | Frame | When | Notes |
 |---|---|---|
-| `{"t":"join","nick":"Priya","joinId":"<32 hex>"}` | first connection, no token | nick is trimmed, control chars stripped, a leading `= + - @` removed, max 20 characters; duplicate → numeric suffix (`Priya 2`) and `welcome.note`. Invisible characters (soft hyphens, zero-width and other format characters) are removed first, so the name shown is the name checked. Version 2: empty or profane (whole-word deny-list, §9) → `join_rejected`, the socket stays open for another try. Version 1: empty or profane → a spun name, silently. `nameMode: "random"` → a spun name whatever was typed (version 2: `welcome.note` with reason `random` says so). `joinId` (optional): a join repeated with the same id within 60 s of its `welcome` (the welcome was lost) gets the same player back instead of a second one; if the host has removed that player meanwhile, it gets `kicked` and 4003. |
-| `{"t":"join","spin":true,"joinId":"…"}` | first connection | a random two-word name (adjective + animal, e.g. `Brave Otter`). Refused with `join_rejected` (`random_off`) for a version-2 page when `nameMode` is `"typed"`; always honoured for version 1. A version-1 page may send further `join` + `spin` frames before its first answer to re-spin (max 3 spins); a version-2 page gets `error` `already_joined` and uses `rename`. |
+| `{"t":"join","nick":"Priya","joinId":"<32 hex>"}` | first connection, no token | nick is trimmed, control chars stripped, a leading `= + - @` removed, max 20 characters; duplicate → numeric suffix (`Priya 2`) and `welcome.note`. Invisible characters (soft hyphens, zero-width and other format characters) are removed first, so the name shown is the name checked. Empty or profane (whole-word deny-list, §9) → `join_rejected`, the socket stays open for another try. `nameMode: "random"` → a spun name whatever was typed (`welcome.note` with reason `random` says so). `joinId` (optional): a join repeated with the same id within 60 s of its `welcome` (the welcome was lost) gets the same player back instead of a second one; if the host has removed that player meanwhile, it gets `kicked` and 4003. |
+| `{"t":"join","spin":true,"joinId":"…"}` | first connection | a random two-word name (adjective + animal, e.g. `Brave Otter`). Refused with `join_rejected` (`random_off`) when `nameMode` is `"typed"`. A `join` after joining gets `error` `already_joined`; a new name goes through `rename`. |
 | `{"t":"rename","nick":"Priya S"}` / `{"t":"rename","random":true}` | any phase while `settings.allowRename` | Same checks as joining (sanitising, deny-list, 20 characters, duplicate numbering). At most 3 renames per player, counted apart from spins. Typed names refused when `nameMode` is `"random"`, random ones when it is `"typed"`. Reply `renamed` or `rename_rejected` (old name kept); the host gets `player_updated`. |
 | `{"t":"answer","q":3,"choice":1}` | phase `open` | `q` must equal the current question index; `choice` an integer in `[0, optionCount)`. Refusal reasons are checked in this order: wrong `q` or not open/closed → `closed`; phase `closed` → `late`; bad `choice` → `invalid`; already answered → `duplicate`. |
+| `{"t":"away","q":3,"n":2,"ms":14000,"copies":1}` | version 3, a question checked by Focus check (§13) | running totals for question `q` from this page: times the student left the page, ms away, blocked copies. No reply. |
 
 A reconnecting player (`?token=`) sends nothing; the server replies with `sync`.
-Version-2 pages add `tab=<32 hex>` (one id per browser tab, kept in
-sessionStorage and checked against other tabs over a BroadcastChannel, since a
-duplicated tab copies it) and `seq=<n>` (how many connections this page has
-opened). A version-2 reconnect closes the player's other open version-2 sockets:
-another tab's with `4012` (one live page per player), the same tab's older one
-with `4013`; an upgrade from the same tab with a lower `seq` than an open socket
-is one the page already abandoned, and is itself closed with `4013`. Version-1
-sockets are not evicted for a second tab; at 3 per player the oldest is closed
-with 4009 (it is usually a half-open socket a phone abandoned on waking). The
-room-wide socket cap is checked before anything is closed.
+Pages add `tab=<32 hex>` (one id per browser tab, kept in sessionStorage and
+checked against other tabs over a BroadcastChannel, since a duplicated tab
+copies it) and `seq=<n>` (how many connections this page has opened). A
+reconnect closes the player's other open sockets: another tab's with `4012`
+(one live page per player), the same tab's older one with `4013`; an upgrade
+from the same tab with a lower `seq` than an open socket is one the page
+already abandoned, and is itself closed with `4013`. The room-wide socket cap
+is checked before anything is closed.
 
 ### 4.2 Client → server (host)
 
 | Frame | Allowed in phase | Effect |
 |---|---|---|
-| `{"t":"auth","token":"<hostToken>"}` | first frame of a version-2 host socket | Authenticates a host socket the Worker did not vouch for (the Worker vouches for a signed-in host with a signed header, so normally the socket is ready at once and `auth` is ignored). Until then the socket receives nothing; a wrong token or another frame closes it with 4001; after 10 s it gets `error` `auth_timeout`. |
+| `{"t":"auth","token":"<hostToken>"}` | first frame of a host socket | Authenticates a host socket the Worker did not vouch for (the Worker vouches for a signed-in host with a signed header, so normally the socket is ready at once and `auth` is ignored). Until then the socket receives nothing; a wrong token or another frame closes it with 4001; after 10 s it gets `error` `auth_timeout`. |
 | `{"t":"start"}` | lobby | → `intro` of question 0 (allowed with 0 players, for testing). Switches `allowRename` off (a `settings` frame follows). |
 | `{"t":"next"}` | closed | → `intro` of q+1, or `podium` after the last question |
 | `{"t":"close"}` | open | close the question now |
@@ -192,7 +200,7 @@ room-wide socket cap is checked before anything is closed.
 | `{"t":"keep"}` | any but `ended` | counts as activity: postpones the idle wipe by 2 h ("Keep 2 more hours"); the host gets `expiry`. In `ended` the room is wiped 30 min after `end` whatever happens, so `keep` changes nothing there. |
 | `{"t":"dev_stats"}` | any | dev only (`DEV_MODE` and `DEV_REPORT_ROWS` in `.dev.vars`): reply `dev_stats {statements, rowsWritten, alarms, players, wipeRows}` |
 | `{"t":"lock","on":true}` | any | locked rooms reject new players with 4010 (reconnects still work) |
-| `{"t":"settings","settings":{...partial...}}` | any (`mode`, `earlyClose`, `nameMode` only in lobby) | server replies with `settings` to host and, if `showOnDevices`, `nameMode` or `allowRename` changed, to players |
+| `{"t":"settings","settings":{...partial...}}` | any (`mode`, `earlyClose`, `nameMode` only in lobby; `focusCheck` not during `intro` or `open`, which gets `error` `focus_mid_question` while the rest of the patch applies) | server replies with `settings` to host and, if `showOnDevices`, `nameMode`, `allowRename` or `focusCheck` changed, to players |
 
 Anything not allowed in the current phase → `{"t":"error","code":"bad_phase","message":"..."}` in plain words (for example "This question is already closed."), no state change.
 
@@ -214,10 +222,11 @@ Every frame has `t`. Frames with times carry `serverNow` (ms since epoch, server
 
 ```jsonc
 {
-  "t": "sync", "proto": 2, "serverNow": 1760000000000,
+  "t": "sync", "proto": 3, "serverNow": 1760000000000,
   "role": "player" | "host",
   "pin": "123456", "title": "Cell biology — week 6",
   "phase": "open", "q": 3, "total": 20,
+  "focusQs": [0, 1, 2, 3],                   // questions opened while Focus check was on (§13)
   "locked": false, "settings": { ...Settings... }, "playerCount": 97,
   "question": null | {                       // present in intro / open / closed
     "q": 3, "total": 20, "optionCount": 4, "timeLimit": 20, "points": 1000,
@@ -225,17 +234,24 @@ Every frame has `t`. Frames with times carry `serverNow` (ms since epoch, server
     "text": "...", "options": ["..."]        // host always; players only when settings.showOnDevices
   },
   // ---- player only ----
-  "me": { "pid": "p_ab12", "nick": "Priya", "score": 2310, "rank": 12, "streak": 2,
+  // During intro and open, score and rank are as before the current question, and streak is null once
+  // the player has answered it: nothing a player gets may tell whether this answer was right before `closed`.
+  "me": { "pid": "p_ab12", "nick": "Priya", "score": 2310, "rank": 12, "tied": false, "streak": 2,
           "answered": true, "choice": 1,       // answered/choice refer to the current question
           "spins": 1,                          // name spins used so far (max 3)
           "renamesLeft": 3 },                  // student renames still allowed (max 3)
   "result": { ...same fields as the result frame, without t... },   // only in phase closed
-  "podium": { "top": [{"nick":"...","score":1234}, ...], "you": {"score": 2310, "rank": 12} }, // podium / ended
+  "recap": { "q": 2, "right": true, "choice": 1, "points": 912, "survey": false, "closedAt": 1760000041000, "score": 2310, "rank": 12, "tied": false, "playerCount": 97 },
+                                             // intro / open of question 2 onwards: the result of question q-1, for a phone away at its reveal.
+                                             // `right`: true / false / null (no answer). No `correct` index: players never get one before `closed`.
+  "podium": { "top": [{"nick":"...","score":1234,"rank":1,"tied":false}, ...], "you": {"score": 2310, "rank": 12, "tied": false} }, // podium / ended
+  "played": true,                                                    // ended only: whether any question was answered
   // ---- host only ----
   "roster": [ {"pid":"p_ab12","nick":"Priya","connected":true,"score":2310,"answered":true}, ... ],
   "tally": { "counts": [12, 60, 3, 9], "answered": 84, "expected": 97 },          // intro/open/closed
   "reveal": { ...same fields as the reveal frame, without t... },                   // closed
-  "leaderboard": [ {"pid":"...","nick":"...","score":2310,"delta":967}, ... ],      // top 10, closed/podium/ended
+  "leaderboard": [ {"pid":"...","nick":"...","score":2310,"delta":967,"rank":1,"tied":false}, ... ], // top 10, closed/podium/ended
+  "focus": [ {"pid":"p_ab12","q":3,"n":2,"ms":14000,"copies":1,"old":false}, ... ], // Focus check records (§13), removed players included
   "hostToken": "<32 hex>",                                                          // so a resumed host can persist it
   "roomKey": "<16 hex>",                                                            // for the QR code / join link (&k=)
   "hostCount": 1,                                                                   // authenticated host sockets
@@ -255,38 +271,38 @@ Every frame has `t`. Frames with times carry `serverNow` (ms since epoch, server
 | `intro` | `question` (same object as in `sync`), `serverNow` |
 | `open` | `q, deadline, serverNow` |
 | `ack` | `q, accepted:boolean, reason?: "late" \| "duplicate" \| "closed" \| "invalid" \| "unavailable"` (`unavailable`: the answer could not be saved, see `storage_full`) |
-| `result` | `q, correct:int, choice:int\|null, points:int, score:int, rank:int, streak:int, playerCount:int` (sent to every player at close, including those who did not answer) |
-| `podium` | `top:[{nick,score}] (≤3), you:{score,rank}, playerCount` |
-| `ended` | — (clear the localStorage entry; show "Game over. Nothing about this game is kept.") |
+| `result` | `q, correct:int, choice:int\|null, points:int, score:int, rank:int, tied:boolean, streak:int, playerCount:int, closedAt` (sent to every player at close, including those who did not answer; `closedAt` is when the question closed, server time) |
+| `podium` | `top:[{nick,score,rank,tied}] (≤3), you:{score,rank,tied}, playerCount` |
+| `ended` | `played:boolean` — clear the localStorage entry. `played: false`: the host ended the game before any answer. |
 | `kicked` | — (then close 4003) |
-| `settings` | `settings`, plus `question` (the same object as in `sync`, present in intro/open/closed, only when `showOnDevices` changed) — sent when the host changes `showOnDevices`, `nameMode` or `allowRename`; clients update settings and question and keep any in-progress answer UI |
+| `settings` | `settings`, plus `question` (the same object as in `sync`, present in intro/open/closed, only when `showOnDevices` changed) — sent when the host changes `showOnDevices`, `nameMode`, `allowRename` or `focusCheck`; clients update settings and question and keep any in-progress answer UI |
 | `error` | `code, message` (also `join_timeout`: no successful join within 60 s) |
 
 **Host frames**
 
 | Frame | Fields |
 |---|---|
-| `roster` | version-1 hosts only: `players:[{pid,nick,connected,score,answered}], playerCount` (coalesced, ≤ 2/s) |
-| `player_joined` / `player_updated` | version 2: `players:[{pid,nick,connected,score,answered}], playerCount` — new players / players whose name or connection changed since the last frame (coalesced, ≤ 2/s). Scores and `answered` reach the host through `tally`, `reveal` and the leaderboard, and are fresh only in `sync`. After the Room wakes from hibernation the host gets a full `sync` instead, and a rename during `closed` or `podium` (where names also show in the leaderboard and the top three) sends every host a `sync`. |
-| `player_left` | version 2: `pids:[...], playerCount` — removed players |
+| `player_joined` / `player_updated` | `players:[{pid,nick,connected,score,answered}], playerCount` — new players / players whose name or connection changed since the last frame (coalesced, ≤ 2/s). Scores and `answered` reach the host through `tally`, `reveal` and the leaderboard, and are fresh only in `sync`. After the Room wakes from hibernation the host gets a full `sync` instead, and a rename during `closed` or `podium` (where names also show in the leaderboard and the top three) sends every host a `sync`. |
+| `player_left` | `pids:[...], playerCount` — removed players |
+| `focus` | `records:[{pid,q,n,ms,copies,old}]` — Focus check records that changed (§13), coalesced, ≤ 2/s |
 | `hosts` | `count` — authenticated host sockets (another device or tab took over too) |
 | `expiry` | `wipeAt, warnAt, serverNow` — sent at `warnAt` (15 min before an idle wipe that would delete results), after `keep`, and on the first activity after a warning (the wipe has moved). A phase frame also means activity, so pages drop a shown warning on one. |
 | `notice` | `code: "pin_limited", retryAfterMs, serverNow` — lookups for this PIN from some network are being refused because of the PIN-guess limit (§9), so typing the PIN does not work there for about `retryAfterMs`; scanning the QR code still does. At most once a minute. |
 | `intro` | `question` (with text and options), `serverNow` |
 | `open` | `q, deadline, serverNow` |
 | `tally` | `q, counts:int[], answered, expected` (coalesced, ≤ 4/s while open) |
-| `reveal` | `q, correct, counts:int[], answered, expected, fastest:{nick, ms}\|null, leaderboard:[{pid,nick,score,delta}] (top 10), playerCount` |
-| `podium` | `top:[{pid,nick,score}] (≤3), leaderboard (top 10), playerCount` |
+| `reveal` | `q, correct, counts:int[], answered, expected, fastest:{nick, ms}\|null, leaderboard:[{pid,nick,score,delta,rank,tied}] (top 10), playerCount` |
+| `podium` | `top:[{pid,nick,score,rank,tied}] (≤3), leaderboard (top 10), playerCount` |
 | `results_csv` | `csv:string, filename:string, update?:true` (`update`: a player was renamed after `end`; replace the held file without downloading it again) |
 | `wiped` | — (then close 4004) |
 | `settings` | `settings, locked` |
-| `error` | `code, message`. `storage_full`: the Room could not save (most likely Cloudflare's free daily write allowance is used up; it resets at 00:00 UTC, 05:30 IST); `auth_timeout`: no `auth` frame within 10 s. |
+| `error` | `code, message`. `storage_full`: the Room could not save (most likely Cloudflare's free daily write allowance is used up; it resets at 00:00 UTC, 05:30 IST); `auth_timeout`: no `auth` frame within 10 s; `focus_mid_question`: Focus check cannot change during a question. |
 
 Players never receive `correct` before `closed`. The Room never sends the quiz's answer key to a player-tagged socket.
 
 ## 5. Reconnect and resume
 
-- **Player:** keeps `{pin, token, pid, nick}` in localStorage. On socket close (except the no-retry codes), on `visibilitychange` → visible, and on `online`, reconnect to `/api/room/<pin>/ws?role=player&token=<token>` with backoff 500 ms → 8 s (×2, ±30 % jitter). The server replies `sync`. One page per player plays at a time (version 2: §4.1, `4012`); answers are de-duplicated per player in any case, so two tabs cannot answer twice. A student offline for a whole question scores 0 for it. Players also request a Screen Wake Lock after joining (ignored where unsupported).
+- **Player:** keeps `{pin, token, pid, nick, title}` in localStorage. On socket close (except the no-retry codes), on `visibilitychange` → visible, and on `online`, reconnect to `/api/room/<pin>/ws?role=player&v=3&token=<token>` with backoff 500 ms → 8 s (×2, ±30 % jitter). The server replies `sync`. One page per player plays at a time (§4.1, `4012`); answers are de-duplicated per player in any case, so two tabs cannot answer twice. A student offline for a whole question scores 0 for it. Players also request a Screen Wake Lock after joining (ignored where unsupported).
 - **Unknown or stale player token** (the room was wiped and the PIN reused, or storage is from another deployment): the server accepts the socket and closes it with `4004` and reason `Unknown player token; join again`. The player page clears its stored entry for that PIN and shows the join screen.
 - **Host:** keeps `{pin, hostToken, title}` in localStorage key `hompub-quiz:host`. After a reload the page goes straight back to the stage (with "Not now"). Another signed-in browser or device lists the library's live games (`GET /api/rooms`) and can take over without the host token: the Worker vouches for its session. While the host is disconnected the server timers still close questions; phones show "Waiting for the host" only in `closed`. A host that connects while the phase is `ended` receives `sync` and then `results_csv` again, so the results file is never lost to a reload. A host socket closed with `4011` keeps its key: if the page's session is still valid (it was renewed since the socket opened) it reconnects at once, otherwise it asks for the passcode over the stage, still offering a results file it holds, and reconnects after sign-in. On a shared-computer session that has lapsed, and on "Sign out on this device", the page forgets the game screen and any results file it holds (asking first if the file was not downloaded); the game keeps running and can be resumed after signing in.
 - **Deploys** restart every Durable Object and drop every socket; clients reconnect and resync within seconds. Deploy outside school hours.
@@ -320,7 +336,12 @@ rank,nickname,score,correct,answered,q1,q2,...,qN
 1,Priya,18345,19,20,B 967,A 1000,,C 812,...
 ```
 `qN` = `<letter> <points>` for an answered question (letter A–D of the choice), empty if unanswered.
+When Focus check was on for at least one question (§13), the columns
+`q1 left page … qN left page, times left page, seconds away, copies blocked`
+follow: `2x 14 s` (left twice, 14 s away in all), `0`, `not checked` (the
+player's page could not report), or empty for a question that was not checked.
 Players the host removed follow, in join order, with `removed` in the rank column and the answers they gave.
+The `rank` column is the strict order of §3 (1, 2, 3 … even for equal scores); the screens show equal scores sharing a place.
 Filename: `hompub-quiz-<pin>-<YYYYMMDD>.csv`.
 
 ## 9. Limits (pilot defaults; all enforced server-side)
@@ -328,11 +349,13 @@ Filename: `hompub-quiz-<pin>-<YYYYMMDD>.csv`.
 | Thing | Limit |
 |---|---|
 | Players per room | `MAX_PLAYERS` = 400 joined players (→ 4009); at most 2 × that many player sockets including not-yet-joined ones, plus 50 for reconnects |
-| Sockets per player | version 2: one (another tab's is closed with 4012, the same tab's with 4013); version 1: at most 3 (the oldest is closed with 4009) |
+| Sockets per player | one (another tab's is closed with 4012, the same tab's with 4013) |
 | Not-yet-joined sockets | at most `MAX_PLAYERS` at once (→ 4009); each is closed 60 s after its last `join` attempt and 3 minutes after it connected (→ `join_timeout`, 4000) |
 | Wrong host passcodes | 5 per network (IPv4 address, or IPv6 /64) per 15 minutes, then 15 minutes locked (→ 429). Checked in the Directory, reserved before the check, so parallel guesses cannot exceed it. The count is saved at the 4th wrong passcode and the lockout at the 5th, so a restart of the Directory does not reset them (up to 500 such rows a day; beyond that, memory only). There is no limit across all networks: one person could then block sign-in for everyone. |
 | PIN guesses | per network per 10 minutes: `PIN_MISS_LIMIT` (100) lookups or joins of PINs that do not exist, unknown player tokens, or ended games; and 2 × `MAX_PLAYERS` + 100 new joins. Over either limit, every lookup and new join from that network is refused (→ 429 / 4014, or 4010 for version-1 pages) unless it carries the room key (`k`) or a valid player token for that PIN; such callers are not counted either (a phone reconnecting with its token after the game was wiped is not guessing). The host of a PIN whose lookups were refused gets `notice` `pin_limited`. |
-| Quiz body | 200 KB, 100 questions, text 200 chars, option 80 chars, title 80 chars |
+| Quiz body | 200 KB, 100 questions, text 200 chars, option 80 chars, title 80 chars (to host; the library also stores drafts, §12) |
+| Quiz library | 500 quizzes, 1,000 counting the Trash; 50 quizzes per batch read; Trash kept 30 days |
+| Focus check | a leave under 1 s is not counted; ms away clamped to the question's time limit + 1 s; 100 leaves and 1,000 blocked copies per report at most; 3 saved rows per player per question while it is open, the rest saved when it closes |
 | Nickname | 20 characters after trim; a leading `= + - @` is removed |
 | Name changes | 3 student renames per player; host renames unlimited |
 | Frame size | 4,096 bytes of UTF-8 (→ 1009) |
@@ -350,7 +373,10 @@ SQLite in the Room: one `room` row (pin, hostToken, phase, q, opensAt,
 deadline, settings, quiz incl. answer key, locked, timestamps) and one
 `players` row per player (pid, token, nick, joinedAt, kicked, score,
 elapsedTotal, streak, answers JSON `{"3":{"c":1,"ms":1834,"p":967}}`,
-renames, joinId).
+renames, joinId), and, when Focus check is on (§13), one `away` row per
+player and checked question that had something to report (times left, ms
+away, blocked copies, whether the page was too old to report) plus the list of
+checked questions on the `room` row.
 Nothing else. No IPs, no user agents, no logs (observability stays off in
 `wrangler.jsonc`). Everything is deleted at `ack_results` or by TTL. The
 only lasting copy is the CSV the host downloads.
@@ -377,32 +403,37 @@ Once a day, just after the free daily allowance resets (00:05 UTC), the
 Directory asks every room that still holds a PIN to re-arm its idle-wipe
 alarm if a failed save lost it, so the wipe still happens.
 
-## 11. Protocol 2 and compatibility
+The quiz library (§12, D1) keeps every quiz the host saves (title, questions,
+answer key, version, content hash, times) until it is deleted, and 30 days in
+the Trash after that. It holds no student data: games, names and answers stay
+in the Room and are deleted with it. The host page caches the library in its
+localStorage (§12).
 
-Pages say which protocol they speak: `v=2` in the WebSocket URL; the server
-puts `proto: 2` in every `sync`. Pages cached before protocol 2 (version 1)
-keep working until the fallbacks are removed in Phase 2:
+## 11. Protocol 3 and compatibility
 
-- **Version-1 player pages** get what they understood: `nicknameMode` with
-  `"free"`/`"spin"` (in `sync` and the summary), a silent spun name instead of
-  `join_rejected`, their Spin honoured in every name mode, no eviction of a
-  second tab (only the 3-socket cap), and a fresh `sync` where version-2 pages
-  get `renamed`.
-- **Version-1 host pages** cannot sign in, so the Worker refuses their socket
-  with 4010 and a reason that tells the teacher to reload. The page keeps its
-  host key (it deletes the key only on 4001 or 4004).
-- **A version-2 page meeting an older server** (a rolled-back deployment) sees
-  a `sync` without `proto` or a 404 from `/api/session`. The host page keeps
-  the full-`roster` handler, hides Rename, "Remove and lock" and "Students can
-  change their name", and says the server is older and to reload; closed with
-  4001 after its `auth` frame, it tries once more with the token in the URL.
-  The phone page shows no notice: it hides "Change my name" and offers the old
-  re-spin instead.
-- **What version 1 means for name settings:** the version is what the page
-  says (`v=2`). Until Phase 2 removes the fallbacks, a client that claims
-  version 1 can still spin a name in a "Typed names only" room and re-spin
-  before its first answer, so `nameMode` and `allowRename` hold for version-2
-  pages only. The host can rename or remove anyone at any time.
+Pages say which protocol they speak: `v=3` in the WebSocket URL; the server
+puts `proto: 3` in every `sync`.
+
+- **Version-2 pages** (cached from Phase 1, for the hour or so after a deploy)
+  work as before: they ignore `focus`, `focusQs`, `recap`, `played` and `tied`.
+  They cannot send `away`, so while Focus check is on, a player on such a page
+  is shown as "not checked" for each checked question (§13), never as clean.
+- **Version-1 pages** (from before protocol 2) are no longer served: a player
+  socket without `v` is closed with `4010` "This page is out of date. Reload it
+  to join the game." (a code those pages do not retry, and they show the
+  reason); a host socket without `v` gets the same, signed in or not. The name
+  fallbacks they needed (silent spun names, re-spin by `join`, the 3-socket
+  rule, full `roster` frames) are gone, so `nameMode` and `allowRename` hold
+  for every player.
+- **The host token is no longer accepted in the URL.** A host socket is ready
+  when the Worker vouches for its session, or after an `auth` frame.
+- **A version-3 page meeting an older server** (a rolled-back deployment):
+  pages send `away` only for a question the room checked (listed in
+  `focusQs`, or opened while `settings.focusCheck` was true), which a
+  protocol-2 server never reports, so it never receives the frame. The
+  host page sees `proto: 2` and hides Focus check. A 404 from `/api/library`
+  means the library is not there: the host page keeps its local copy, saves
+  nothing, and says the server is older (Export all still works).
 - **New error codes and messages** read sensibly on old pages (old pages toast
   the message of an unknown `error`).
 - **Deploys and rollbacks** use `--durable-objects-code-update-mode immediate`
@@ -411,3 +442,95 @@ keep working until the fallbacks are removed in Phase 2:
   objects accept the previous Worker's calls. The Room trusts a host only with
   a valid signed header (HMAC, 60 s) or the host token, never with a header a
   client could send.
+
+## 12. Quiz library
+
+The signed-in teacher's quizzes live in D1 (binding `DB`, one database per
+Cloudflare account; schema in `migrations/`, applied by the deploy workflows
+before `wrangler deploy`). Every request needs the session cookie and the
+stricter Origin rule (§1); `401 {"error":"sign_in"}` signed out. Every `200`,
+`409` and `422` reply carries `generation` (below); errors about the request
+itself (`400`, `404`, `405`, `413`) and the Worker's `401`/`403`/`503` do not. `503 {"error":"library_unavailable","message"}`
+when D1 cannot be reached or its daily free allowance is used up; the page
+keeps the change and retries.
+
+| Request | Reply |
+|---|---|
+| `GET /api/library` | `200 {generation, quizzes:[Meta], trash:[Meta], limits:{maxLive, maxRows, trashDays}}`, newest first. Quizzes deleted more than 30 days ago are purged first. |
+| `GET /api/library/quizzes?ids=a,b,…` | `200 {generation, quizzes:[Meta + body]}`, at most 50 ids (`400 bad_ids` otherwise). Unknown ids are left out. |
+| `PUT /api/library/quizzes/:id` body `{baseVersion, generation, quiz}` | `baseVersion` 0 creates, otherwise it must be the version the change was made from (saving a quiz that is in the Trash takes it out, and counts against the 500-quiz limit like a restore). `200 {generation, quiz: Meta}`. `409 {error:"conflict", message, server: Meta + body}` when the server's version differs (another device saved first); `409 {error:"gone", server:null}` when the quiz was deleted for good; `409 {error:"newer_schema", server}` when the stored quiz has a newer `schema` (never lowered); `422 {error:"library_full"}`; `413` over 200 KB; `400 invalid_quiz` / `bad_base_version`. Saving unchanged content is not a write (the version stays). Saving a quiz that is in the Trash takes it out. |
+| `DELETE /api/library/quizzes/:id?baseVersion=n&generation=g` | Moves it to the Trash (version + 1). `409 conflict` with the server copy if `n` is not current. Deleting again is harmless. |
+| `DELETE /api/library/quizzes/:id?forever=1` | Removes a quiz that is in the Trash; `409 not_in_trash` if it is not (move it to the Trash first). Already gone: `200`. |
+| `POST /api/library/quizzes/:id/restore` | Takes it out of the Trash (version + 1); `422 library_full` if there is no room. |
+
+Every change (PUT, DELETE, restore) also names the `generation` the page's copy
+is from (body field or query parameter; optional, but the host page always
+sends it once it knows it). A different generation is refused with
+`409 {error:"generation_changed", generation}`, so an edit made before a
+restore from backup can never land on the restored library.
+
+`Meta = {id, title, schema, questions, version, hash, updatedAt, deletedAt}`.
+`id` matches `^[A-Za-z0-9_-]{1,64}$` (the page makes UUIDs; the sample quiz
+has a fixed id). `body` is the quiz exactly as saved: the shape is checked
+(title text, at most 100 question objects with text, up to 4 option texts,
+numeric `correct`, `timeLimit`, `points`), the content is not, so drafts with
+problems can be saved; `POST /api/room` still checks everything before a game.
+Fields this version does not know are kept, and a body with a newer `schema`
+is stored without looking inside. `hash` is the SHA-256 (hex) of the stored
+body text, `JSON.stringify(body)`; the page computes the same to match quizzes.
+
+**Generation.** One number per library, in table `library`. It changes only
+when the database is restored from a backup (the production workflow's
+`d1-restore` sets it to the restore time). A page that sees a generation other
+than the one its cache was built from copies its cache and unsent changes to
+`hompub-quiz:backup:<time>`, drops them, reloads from the server and says so,
+instead of re-applying edits made before the restore.
+
+**The host page's cache** (localStorage): `hompub-quiz:lib:index`
+(`{generation, ids, syncedAt}`), one `hompub-quiz:lib:q:<id>` per quiz
+(`{id, version, hash, body, updatedAt, deletedAt, exportedAt}`, the last
+version the server confirmed plus local edits), and `hompub-quiz:lib:outbox`
+(unsent changes, at most one per quiz). The page works offline from the cache
+and sends the outbox when it can, one tab at a time (Web Locks, with a
+fallback), merging other tabs' changes through `storage` events. A `409` opens
+"Keep mine / Use theirs / Save as copy"; nothing is overwritten silently.
+
+**Moving quizzes from Phase 1.** The first time a signed-in Phase 2 page loads
+in a browser whose `hompub-quiz:quizzes` key holds quizzes and has no
+`hompub-quiz:lib:migrated` marker, it uploads them: by id (same content: skip;
+different content: the conflict dialog; missing: create), entries without an id
+by content hash. It shows what was imported, sets the marker only after the
+server confirmed, and leaves the old key untouched.
+
+## 13. Focus check
+
+An optional setting (`settings.focusCheck`, off by default) that tells the
+teacher when a student left the quiz page during a question. It is a signal,
+not proof: nothing is automatic and scores never change.
+
+- **Which questions:** only those opened while it was on (`focusQs` in `sync`).
+  It cannot be switched during `intro` or `open`.
+- **Phones (version 3):** while it is on, every screen says "Your teacher can
+  see if you leave this page during a question." During an open checked
+  question the page counts the times it was hidden (`visibilitychange`) or lost
+  focus (`blur`) for 1 s or more and the time away, stopping when the question
+  closed (`closedAt` in `result` and `recap`; never past the next question's intro),
+  and, when questions are shown on phones, blocks selecting, copying and the
+  long-press menu on the question and options, counting blocked copies. On
+  return (or when it reconnects) it sends `away` with the running totals for
+  that question; an unsent report is kept in sessionStorage.
+- **Server:** accepts `away` only from a joined player, for a checked question
+  that is open or just closed (or the previous one during the next `intro`,
+  `open` or `closed`). Totals only go up and are clamped (§9). A player whose page is
+  older than version 3 gets `old: true` for each checked question. Hosts get
+  `focus` frames, the full list in `sync`, and the CSV columns (§8). The
+  records live in the Room's `away` table and are deleted with the game.
+- **Host:** All players marks each student ("left 2×, 14 s", "not checked");
+  after a checked question the stage shows only a count ("3 students left the
+  page during this question"), never names.
+- **Limits:** it cannot see a second device, a photo of the projector or a
+  friend's help; a screen lock, a call or a notification looks the same as
+  switching app; some Android split-screen and floating-window modes are not
+  detected; a page the browser closes entirely reports nothing; screenshots
+  cannot be blocked.
+

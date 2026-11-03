@@ -33,12 +33,13 @@ import {
   type Session,
 } from './auth';
 import { DEFAULT_SETTINGS, LIMITS, PIN_RE, mergeSettings, sha256Hex, validateQuiz } from './shared';
+import { handleLibrary } from './library';
 
 export { Room } from './room';
 export { Directory } from './directory';
 
-const VERSION = '0.2.0'; // not exported: the entry module may only export handlers and Durable Object classes
-const PROTO = 2;
+const VERSION = '0.3.0'; // not exported: the entry module may only export handlers and Durable Object classes
+const PROTO = 3;
 
 // API responses may not be framed and send no referrer (static pages get the same from public/_headers).
 const BASE_HEADERS: Record<string, string> = {
@@ -60,6 +61,7 @@ const MESSAGES = {
   sign_in: 'Sign in with the host passcode to host a game.',
   try_again: 'The server is restarting. Try again in a minute.',
   bad_origin: 'This request did not come from the host page.',
+  library_unavailable: 'The quiz library cannot be reached just now. Your changes are kept on this device and will be saved when it is back.',
 } as const;
 
 function originAllowed(request: Request, url: URL, env: Env): boolean {
@@ -216,6 +218,26 @@ async function handleSession(request: Request, url: URL, env: Env): Promise<Resp
   return json({ error: result.error, message: MESSAGES[result.error] }, 503);
 }
 
+// ---------------------------------------------------------------- library
+
+/** /api/library…: the signed-in teacher's synced quizzes (PROTOCOL.md §12). */
+async function libraryRequest(request: Request, url: URL, env: Env): Promise<Response> {
+  if (!sessionOrigin(request, url)) return json({ error: 'bad_origin', message: MESSAGES.bad_origin }, 403);
+  const problem = secretsProblem(env);
+  if (problem) return json({ error: problem, message: MESSAGES[problem] }, 503);
+  const si = await signedIn(request, url, env);
+  if (!si) return json({ error: 'sign_in', message: MESSAGES.sign_in }, 401);
+  const renewed = si.renewed ? { 'set-cookie': si.renewed } : undefined;
+  if (!env.DB) return json({ error: 'library_unavailable', message: MESSAGES.library_unavailable }, 503, renewed);
+  try {
+    const reply = await handleLibrary(request, url, env.DB, si.session.lib, Date.now());
+    return json(reply.body, reply.status, renewed);
+  } catch {
+    // D1 overloaded, the daily free allowance used up, or a migration not yet applied.
+    return json({ error: 'library_unavailable', message: MESSAGES.library_unavailable }, 503, renewed);
+  }
+}
+
 // ------------------------------------------------------------------ rooms
 
 async function createRoom(request: Request, url: URL, env: Env): Promise<Response> {
@@ -291,7 +313,7 @@ async function listRooms(request: Request, url: URL, env: Env): Promise<Response
 /** GET summary or WebSocket upgrade for one PIN. */
 async function roomRequest(request: Request, url: URL, env: Env, ctx: ExecutionContext, pin: string, wantsSocket: boolean): Promise<Response> {
   const role = url.searchParams.get('role');
-  const v = Number(url.searchParams.get('v')) >= 2 ? 2 : 1;
+  const v = Number(url.searchParams.get('v')) >= 2 ? 2 : 1;   // 2 and 3 are handled alike here; the Room tells them apart
   const isHost = wantsSocket && role === 'host';
   const notFound = () => (wantsSocket ? wsReject(4004, 'Room not found') : json({ error: 'not_found' }, 404));
   if (!PIN_RE.test(pin)) return notFound();
@@ -299,14 +321,11 @@ async function roomRequest(request: Request, url: URL, env: Env, ctx: ExecutionC
   let library: string | null = null;
   let sessionExp = 0;
   if (isHost) {
-    // A host socket needs a valid session. A page from before protocol 2 cannot sign in at all.
+    // A host socket needs a valid session. A page from before protocol 2 is refused whatever its cookie.
+    if (v < 2) return wsReject(4010, `This page is out of date. Reload it and sign in to continue game ${pin}.`);
     if (!sessionOrigin(request, url)) return wsReject(4011, 'Sign in again to continue this game.');
     const si = await signedIn(request, url, env);
-    if (!si) {
-      return v < 2
-        ? wsReject(4010, `This page is out of date. Reload it and sign in to continue game ${pin}.`)
-        : wsReject(4011, 'Sign in again to continue this game.');
-    }
+    if (!si) return wsReject(4011, 'Sign in again to continue this game.');
     library = si.session.lib;
     // The cookie's own expiry: a WebSocket response cannot carry a renewed cookie, and a reconnect is not use.
     sessionExp = si.held.exp;
@@ -380,6 +399,7 @@ export default {
     if (url.pathname === '/api/echo') return echo(request);
     if (url.pathname === '/api/session') return handleSession(request, url, env);
     if (url.pathname === '/api/rooms') return listRooms(request, url, env);
+    if (url.pathname === '/api/library' || url.pathname.startsWith('/api/library/')) return libraryRequest(request, url, env);
     if (url.pathname === '/api/room') {
       if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
       return createRoom(request, url, env);
