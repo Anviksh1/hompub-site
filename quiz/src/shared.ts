@@ -2,17 +2,69 @@
 // deterministic and side-effect free so it can be unit-tested in isolation.
 // The authoritative description of these shapes is ../PROTOCOL.md.
 
-export interface Question {
+/** Question types (PROTOCOL.md §2). A question without `type` is a single-answer question. */
+export type QuestionType = 'single' | 'multi' | 'typein' | 'poll';
+export const QUESTION_TYPES: readonly QuestionType[] = ['single', 'multi', 'typein', 'poll'];
+
+/** A picture in the image bucket (PROTOCOL.md §14); `w` and `h` are its pixel size, for layout. */
+export interface QuestionImage { key: string; alt: string; w?: number; h?: number }
+
+interface QuestionCommon {
   text: string;
-  options: string[];
-  correct: number;
   timeLimit: number; // seconds
-  points: number;    // 0 | 1000 | 2000
+  points: number;    // 0 | 1000 | 2000; always 0 for a poll
+  explanation?: string;
+  image?: QuestionImage;
 }
+
+export type Question = QuestionCommon & (
+  | { type?: 'single'; options: string[]; correct: number }
+  /** `correct`: every right option. `partial`: points for a partly right choice. */
+  | { type: 'multi'; options: string[]; correct: number[]; partial: boolean }
+  /** `accept`: answers counted right, compared by normalizeAnswer(). */
+  | { type: 'typein'; accept: string[] }
+  | { type: 'poll'; options: string[] }
+);
 
 export interface Quiz {
   title: string;
   questions: Question[];
+}
+
+export function questionType(q: { type?: unknown }): QuestionType {
+  return q.type === 'multi' || q.type === 'typein' || q.type === 'poll' ? q.type : 'single';
+}
+
+/** The options a question shows (none for a typed answer). */
+export function optionsOf(q: Question): string[] {
+  return 'options' in q && Array.isArray(q.options) ? q.options : [];
+}
+
+/** Whether a quiz uses a field a schema-1 page does not know (a new type, an explanation, a picture). */
+export function usesSchema2Fields(quiz: { questions?: unknown }): boolean {
+  const qs = Array.isArray(quiz.questions) ? quiz.questions : [];
+  for (const raw of qs) {
+    if (!raw || typeof raw !== 'object') continue;
+    const q = raw as Record<string, unknown>;
+    if (q.type !== undefined && q.type !== 'single') return true;
+    if (q.explanation !== undefined || q.image !== undefined) return true;
+  }
+  return false;
+}
+
+/**
+ * The schema a page saves a quiz with: 2 once it uses a new field or text over
+ * 200 characters, which a Phase 2 server cannot host. A Phase 2 page opens a
+ * schema-2 quiz read-only and keeps it as it is.
+ */
+export function quizSchema(quiz: { questions?: unknown }): 1 | 2 {
+  if (usesSchema2Fields(quiz)) return 2;
+  const qs = Array.isArray(quiz.questions) ? quiz.questions : [];
+  for (const raw of qs) {
+    const t = raw && typeof raw === 'object' ? (raw as Record<string, unknown>).text : undefined;
+    if (typeof t === 'string' && t.length > LIMITS.textCharsV1) return 2;
+  }
+  return 1;
 }
 
 export type Mode = 'speed' | 'accuracy' | 'coarse';
@@ -30,6 +82,7 @@ export interface Settings {
   nameMode: NameMode;
   allowRename: boolean;       // students may change their own name (switched off at Start)
   focusCheck: boolean;        // phones report leaving the page during a question (PROTOCOL.md §13)
+  shuffle: boolean;           // each phone shows the options in its own order (only with showOnDevices)
 }
 
 export type Phase = 'lobby' | 'intro' | 'open' | 'closed' | 'podium' | 'ended';
@@ -43,6 +96,7 @@ export const DEFAULT_SETTINGS: Settings = {
   nameMode: 'typed',
   allowRename: true,
   focusCheck: false,
+  shuffle: false,
 };
 
 export function legacyNicknameMode(nameMode: NameMode): NicknameMode {
@@ -57,8 +111,14 @@ export const LIMITS = {
   quizBytes: 200 * 1024,
   questions: 100,
   titleChars: 80,
-  textChars: 200,
+  textChars: 400,               // schema 2; a schema-1 quiz keeps to textCharsV1
+  textCharsV1: 200,
   optionChars: 80,
+  explanationChars: 400,
+  acceptAnswers: 10,            // accepted answers of a typed-answer question
+  acceptChars: 80,
+  typedChars: 80,               // what a student may type as an answer
+  altChars: 150,                // a picture's description
   minOptions: 2,
   maxOptions: 4,
   nickChars: 20,
@@ -92,7 +152,29 @@ function isPlainString(v: unknown, max: number): v is string {
   return typeof v === 'string' && v.trim().length > 0 && v.length <= max;
 }
 
-/** Validate an untrusted quiz object from POST /api/room. Returns a cleaned copy. */
+export const IMAGE_KEY_RE = /^[0-9a-f]{64}\.(?:webp|jpg|png|gif)$/;
+
+function checkOptions(r: Record<string, unknown>, where: string): Ok<string[]> | Err {
+  if (!Array.isArray(r.options) || r.options.length < LIMITS.minOptions || r.options.length > LIMITS.maxOptions) {
+    return { ok: false, error: `${where}: options must have ${LIMITS.minOptions}-${LIMITS.maxOptions} entries` };
+  }
+  const options: string[] = [];
+  for (const o of r.options) {
+    if (!isPlainString(o, LIMITS.optionChars)) return { ok: false, error: `${where}: each option must be 1-${LIMITS.optionChars} characters` };
+    options.push(o.trim());
+  }
+  return { ok: true, value: options };
+}
+
+function isIndex(v: unknown, n: number): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < n;
+}
+
+/**
+ * Validate an untrusted quiz object from POST /api/room. Returns a cleaned copy
+ * holding only the fields the game uses. Schema-1 quizzes (no `type`) come out
+ * exactly as before.
+ */
 export function validateQuiz(input: unknown): Ok<Quiz> | Err {
   if (!input || typeof input !== 'object') return { ok: false, error: 'quiz must be an object' };
   const q = input as Record<string, unknown>;
@@ -106,23 +188,66 @@ export function validateQuiz(input: unknown): Ok<Quiz> | Err {
     const where = `question ${i + 1}`;
     if (!raw || typeof raw !== 'object') return { ok: false, error: `${where} must be an object` };
     const r = raw as Record<string, unknown>;
+    if (r.type !== undefined && !QUESTION_TYPES.includes(r.type as QuestionType)) return { ok: false, error: `${where}: type must be one of ${QUESTION_TYPES.join(', ')}` };
+    const type = questionType(r);
     if (!isPlainString(r.text, LIMITS.textChars)) return { ok: false, error: `${where}: text must be 1-${LIMITS.textChars} characters` };
-    if (!Array.isArray(r.options) || r.options.length < LIMITS.minOptions || r.options.length > LIMITS.maxOptions) {
-      return { ok: false, error: `${where}: options must have ${LIMITS.minOptions}-${LIMITS.maxOptions} entries` };
-    }
-    const options: string[] = [];
-    for (const o of r.options) {
-      if (!isPlainString(o, LIMITS.optionChars)) return { ok: false, error: `${where}: each option must be 1-${LIMITS.optionChars} characters` };
-      options.push(o.trim());
-    }
-    if (typeof r.correct !== 'number' || !Number.isInteger(r.correct) || r.correct < 0 || r.correct >= options.length) {
-      return { ok: false, error: `${where}: correct must index an option` };
-    }
     const timeLimit = typeof r.timeLimit === 'number' ? r.timeLimit : 20;
     if (!TIME_LIMITS.includes(timeLimit)) return { ok: false, error: `${where}: timeLimit must be one of ${TIME_LIMITS.join(', ')}` };
-    const points = typeof r.points === 'number' ? r.points : 1000;
+    const points = typeof r.points === 'number' ? r.points : type === 'poll' ? 0 : 1000;
     if (!POINT_VALUES.includes(points)) return { ok: false, error: `${where}: points must be one of ${POINT_VALUES.join(', ')}` };
-    questions.push({ text: r.text.trim(), options, correct: r.correct, timeLimit, points });
+    if (type === 'poll' && points !== 0) return { ok: false, error: `${where}: a poll gives no points` };
+
+    const common: QuestionCommon = { text: r.text.trim(), timeLimit, points };
+    if (r.explanation !== undefined && r.explanation !== '') {
+      if (!isPlainString(r.explanation, LIMITS.explanationChars)) return { ok: false, error: `${where}: explanation must be 1-${LIMITS.explanationChars} characters` };
+      common.explanation = r.explanation.trim();
+    }
+    if (r.image !== undefined && r.image !== null) {
+      const img = r.image as Record<string, unknown>;
+      if (typeof img !== 'object' || typeof img.key !== 'string' || !IMAGE_KEY_RE.test(img.key)) return { ok: false, error: `${where}: image must name a picture saved to this server` };
+      if (!isPlainString(img.alt, LIMITS.altChars)) return { ok: false, error: `${where}: the picture needs a description of 1-${LIMITS.altChars} characters` };
+      const image: QuestionImage = { key: img.key, alt: img.alt.trim() };
+      for (const k of ['w', 'h'] as const) {
+        if (img[k] === undefined) continue;
+        if (typeof img[k] !== 'number' || !Number.isInteger(img[k]) || (img[k] as number) < 1 || (img[k] as number) > 10000) return { ok: false, error: `${where}: image ${k} must be a whole number of pixels` };
+        image[k] = img[k] as number;
+      }
+      common.image = image;
+    }
+
+    if (type === 'typein') {
+      if (Array.isArray(r.options) && r.options.length > 0) return { ok: false, error: `${where}: a typed-answer question has no options` };
+      if (!Array.isArray(r.accept) || r.accept.length < 1 || r.accept.length > LIMITS.acceptAnswers) {
+        return { ok: false, error: `${where}: accept must list 1-${LIMITS.acceptAnswers} answers` };
+      }
+      const accept: string[] = [];
+      const seen = new Set<string>();
+      for (const a of r.accept) {
+        if (!isPlainString(a, LIMITS.acceptChars) || normalizeAnswer(a) === '') return { ok: false, error: `${where}: each accepted answer must be 1-${LIMITS.acceptChars} characters` };
+        const n = normalizeAnswer(a);
+        if (seen.has(n)) continue;
+        seen.add(n);
+        accept.push(a.trim());
+      }
+      questions.push({ ...common, type, accept });
+      continue;
+    }
+
+    const opts = checkOptions(r, where);
+    if (!opts.ok) return opts;
+    const options = opts.value;
+    if (type === 'poll') { questions.push({ ...common, type, options }); continue; }
+    if (type === 'multi') {
+      if (!Array.isArray(r.correct) || r.correct.length < 1 || !r.correct.every((c) => isIndex(c, options.length))) {
+        return { ok: false, error: `${where}: correct must list the right options` };
+      }
+      const correct = [...new Set(r.correct as number[])].sort((a, b) => a - b);
+      if (r.partial !== undefined && typeof r.partial !== 'boolean') return { ok: false, error: `${where}: partial must be true or false` };
+      questions.push({ ...common, type, options, correct, partial: r.partial === true });
+      continue;
+    }
+    if (!isIndex(r.correct, options.length)) return { ok: false, error: `${where}: correct must index an option` };
+    questions.push({ text: common.text, options, correct: r.correct, timeLimit, points, ...(common.explanation ? { explanation: common.explanation } : {}), ...(common.image ? { image: common.image } : {}) });
   }
   return { ok: true, value: { title: q.title.trim(), questions } };
 }
@@ -140,6 +265,7 @@ export function mergeSettings(base: Settings, patch: unknown, inLobby: boolean):
   if (typeof p.lateJoin === 'boolean') out.lateJoin = p.lateJoin;
   if (typeof p.allowRename === 'boolean') out.allowRename = p.allowRename;
   if (typeof p.focusCheck === 'boolean') out.focusCheck = p.focusCheck;   // the Room refuses it mid-question
+  if (typeof p.shuffle === 'boolean') out.shuffle = p.shuffle;             // takes effect from the next question
   if (inLobby) {
     if (p.mode === 'speed' || p.mode === 'accuracy' || p.mode === 'coarse') out.mode = p.mode;
     if (typeof p.earlyClose === 'boolean') out.earlyClose = p.earlyClose;
@@ -167,6 +293,7 @@ export function normalizeSettings(raw: unknown, phase?: Phase): Settings {
   if (typeof r.allowRename === 'boolean') out.allowRename = r.allowRename;
   else if (phase !== undefined) out.allowRename = phase === 'lobby';
   if (typeof r.focusCheck === 'boolean') out.focusCheck = r.focusCheck;
+  if (typeof r.shuffle === 'boolean') out.shuffle = r.shuffle;
   if (r.nameMode === 'typed' || r.nameMode === 'either' || r.nameMode === 'random') out.nameMode = r.nameMode;
   else if (r.nicknameMode === 'spin') out.nameMode = 'random';
   else if (r.nicknameMode === 'free') out.nameMode = 'either';
@@ -188,6 +315,63 @@ export function scoreAnswer(correct: boolean, elapsedMs: number, timeLimitS: num
   if (mode === 'coarse') e = Math.min(Math.ceil(e / 1000) * 1000, T);
   if (e < 500) return points;
   return Math.round(points * (1 - (e / T) / 2));
+}
+
+/**
+ * A multi-select answer: right only when exactly the right options are chosen.
+ * With partial credit, a partly right choice gets the share (right picks minus
+ * wrong picks) / (right options) of what a right answer at that moment would
+ * get, never below 0. Accuracy mode counts right answers only, so a partly
+ * right choice scores 0 there. scoreAnswer() itself is unchanged.
+ */
+export function scoreMulti(picked: number[], correct: number[], partial: boolean, elapsedMs: number, timeLimitS: number, points: number, mode: Mode): { points: number; right: boolean } {
+  const want = new Set(correct);
+  let hits = 0;
+  let wrong = 0;
+  for (const c of new Set(picked)) { if (want.has(c)) hits += 1; else wrong += 1; }
+  const right = wrong === 0 && hits === want.size;
+  if (right) return { points: scoreAnswer(true, elapsedMs, timeLimitS, points, mode), right };
+  if (!partial || mode === 'accuracy' || want.size === 0) return { points: 0, right };
+  const share = (hits - wrong) / want.size;
+  if (share <= 0) return { points: 0, right };
+  return { points: Math.round(scoreAnswer(true, elapsedMs, timeLimitS, points, mode) * share), right };
+}
+
+/**
+ * How typed answers are compared: case and Latin accents ignored (so IAST
+ * "Kṛṣṇa" matches "Krsna"), spaces collapsed, closing punctuation and
+ * surrounding quotes dropped. Only the Combining Diacritical Marks block is
+ * removed: Devanagari vowel signs, virama and anusvara are kept, as are
+ * leading signs ("-5" is not "5"). Zero-width joiners only shape the text and
+ * are ignored.
+ */
+export function normalizeAnswer(raw: string): string {
+  return raw
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\u200b-\u200d\u2060\ufeff]/g, '')
+    .normalize('NFC')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^["'\u201c\u201d\u2018\u2019\u00ab\u00bb]+|["'\u201c\u201d\u2018\u2019\u00ab\u00bb]+$/g, '')
+    .replace(/[.!?,;:\u0964\u0965]+$/u, '')
+    .trim();
+}
+
+/** Whether a typed answer matches one of the accepted answers. */
+export function typedRight(typed: string, accept: string[]): boolean {
+  const t = normalizeAnswer(typed);
+  return t !== '' && accept.some((a) => normalizeAnswer(a) === t);
+}
+
+/** What a student typed, as stored: control and invisible characters removed, at most typedChars. Null if empty or too long. */
+export function cleanTyped(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  // eslint-disable-next-line no-control-regex
+  const t = raw.replace(/[\u0000-\u001f\u007f-\u009f\u2028-\u202e\u2066-\u2069\ufeff]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (t === '' || Array.from(t).length > LIMITS.typedChars) return null;
+  return t;
 }
 
 // --------------------------------------------------------------------- names

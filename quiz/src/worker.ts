@@ -34,12 +34,13 @@ import {
 } from './auth';
 import { DEFAULT_SETTINGS, LIMITS, PIN_RE, mergeSettings, sha256Hex, validateQuiz } from './shared';
 import { handleLibrary } from './library';
+import { serveImage, uploadImage } from './images';
 
 export { Room } from './room';
 export { Directory } from './directory';
 
-const VERSION = '0.3.0'; // not exported: the entry module may only export handlers and Durable Object classes
-const PROTO = 3;
+const VERSION = '0.4.0'; // not exported: the entry module may only export handlers and Durable Object classes
+const PROTO = 4;
 
 // API responses may not be framed and send no referrer (static pages get the same from public/_headers).
 const BASE_HEADERS: Record<string, string> = {
@@ -62,6 +63,7 @@ const MESSAGES = {
   try_again: 'The server is restarting. Try again in a minute.',
   bad_origin: 'This request did not come from the host page.',
   library_unavailable: 'The quiz library cannot be reached just now. Your changes are kept on this device and will be saved when it is back.',
+  images_unavailable: 'Pictures cannot be saved just now. Try again in a minute.',
 } as const;
 
 function originAllowed(request: Request, url: URL, env: Env): boolean {
@@ -230,11 +232,30 @@ async function libraryRequest(request: Request, url: URL, env: Env): Promise<Res
   const renewed = si.renewed ? { 'set-cookie': si.renewed } : undefined;
   if (!env.DB) return json({ error: 'library_unavailable', message: MESSAGES.library_unavailable }, 503, renewed);
   try {
-    const reply = await handleLibrary(request, url, env.DB, si.session.lib, Date.now());
+    const reply = await handleLibrary(request, url, env.DB, si.session.lib, Date.now(), env.IMAGES);
     return json(reply.body, reply.status, renewed);
   } catch {
     // D1 overloaded, the daily free allowance used up, or a migration not yet applied.
     return json({ error: 'library_unavailable', message: MESSAGES.library_unavailable }, 503, renewed);
+  }
+}
+
+// ----------------------------------------------------------------- images
+
+/** POST /api/images: a signed-in host adds a picture (PROTOCOL.md §14). */
+async function imageUpload(request: Request, url: URL, env: Env): Promise<Response> {
+  if (!sessionOrigin(request, url)) return json({ error: 'bad_origin', message: MESSAGES.bad_origin }, 403);
+  const problem = secretsProblem(env);
+  if (problem) return json({ error: problem, message: MESSAGES[problem] }, 503);
+  const si = await signedIn(request, url, env);
+  if (!si) return json({ error: 'sign_in', message: MESSAGES.sign_in }, 401);
+  const renewed = si.renewed ? { 'set-cookie': si.renewed } : undefined;
+  if (!env.DB || !env.IMAGES) return json({ error: 'images_unavailable', message: MESSAGES.images_unavailable }, 503, renewed);
+  try {
+    const reply = await uploadImage(request, env.DB, env.IMAGES, si.session.lib, Date.now());
+    return json(reply.body, reply.status, renewed);
+  } catch {
+    return json({ error: 'images_unavailable', message: MESSAGES.images_unavailable }, 503, renewed);
   }
 }
 
@@ -400,6 +421,13 @@ export default {
     if (url.pathname === '/api/session') return handleSession(request, url, env);
     if (url.pathname === '/api/rooms') return listRooms(request, url, env);
     if (url.pathname === '/api/library' || url.pathname.startsWith('/api/library/')) return libraryRequest(request, url, env);
+    if (url.pathname === '/api/images') return imageUpload(request, url, env);
+    const img = url.pathname.match(/^\/api\/images\/([^/]+)$/);
+    if (img) {
+      if (!sessionOrigin(request, url)) return new Response(null, { status: 403 });
+      if (!env.IMAGES) return new Response(null, { status: 503, headers: { 'cache-control': 'no-store' } });
+      try { return await serveImage(request, env.IMAGES, img[1]); } catch { return new Response(null, { status: 503, headers: { 'cache-control': 'no-store' } }); }
+    }
     if (url.pathname === '/api/room') {
       if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
       return createRoom(request, url, env);

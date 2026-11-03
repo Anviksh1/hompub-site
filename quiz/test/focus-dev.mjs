@@ -65,15 +65,15 @@ const created = await fetch(`${BASE}/api/room`, {
 assert.equal(created.status, 200, 'create room');
 const { pin, hostToken } = await created.json();
 
-const host = open(`${WS}/api/room/${pin}/ws?role=host&v=3`, { Origin: BASE, Cookie: cookie });
+const host = open(`${WS}/api/room/${pin}/ws?role=host&v=4`, { Origin: BASE, Cookie: cookie });
 await host.opened;
 host.send({ t: 'auth', token: hostToken });
 const hsync = await host.wait((f) => f.t === 'sync', 8000, 'host sync');
-assert.equal(hsync.proto, 3);
+assert.equal(hsync.proto, 4);
 assert.equal(hsync.settings.focusCheck, true);
 assert.deepEqual(hsync.focusQs, []);
 assert.deepEqual(hsync.focus, []);
-ok('protocol 3 host sync carries Focus check');
+ok('protocol 4 host sync carries Focus check');
 
 async function phone(name, v) {
   const p = open(`${WS}/api/room/${pin}/ws?role=player${v ? `&v=${v}` : ''}`, { Origin: BASE });

@@ -31,8 +31,13 @@ import {
   randomHex,
   renameCheck,
   sanitizeNick,
+  cleanTyped,
+  optionsOf,
+  questionType,
   scoreAnswer,
+  scoreMulti,
   spinName,
+  typedRight,
   type AwayRecord,
   type NameNote,
   type Phase,
@@ -78,8 +83,39 @@ type PlayerRow = {
   join_id?: string | null;
 };
 
-/** One recorded answer: choice, elapsed ms (server clock), points awarded. */
-interface AnswerRecord { c: number; ms: number; p: number }
+/**
+ * One recorded answer: choice (an option index; the sorted indices of a
+ * multi-select answer; null for a typed answer, whose text is `x`), elapsed ms
+ * (server clock), points awarded, and `ok`: whether it was right (null for a
+ * poll). Answers saved before protocol 4 have no `ok`: see answerRight().
+ */
+interface AnswerRecord { c: number | number[] | null; x?: string; ms: number; p: number; ok?: boolean | null }
+
+/** Whether an answer was right; null for a poll, which has no right answer. */
+function answerRight(question: Question, a: AnswerRecord): boolean | null {
+  if (a.ok !== undefined) return a.ok;
+  if (question.type === 'poll') return null;
+  return 'correct' in question && a.c === question.correct;
+}
+
+/** What the reveal and a student's result call right: an index, the indices, or the accepted answers. */
+function rightAnswer(question: Question): number | number[] | string[] | null {
+  if (question.type === 'typein') return question.accept;
+  if (question.type === 'poll') return null;
+  return question.correct;
+}
+
+/** A results-file cell: "B 912", "A+C 500", the typed text and points, or a poll's letter. */
+function answerCell(question: Question, a: AnswerRecord): string {
+  if (a.x !== undefined) return csvEscape(`${a.x} ${a.p}`);
+  const letters = (Array.isArray(a.c) ? a.c : typeof a.c === 'number' ? [a.c] : []).map(letterFor).join('+');
+  return question.type === 'poll' ? letters : `${letters} ${a.p}`;
+}
+
+/** Whether a quiz needs a protocol-4 page: a version-3 page cannot show or answer the new types. */
+function needsProto4(quiz: Quiz): boolean {
+  return quiz.questions.some(q => questionType(q) !== 'single');
+}
 
 interface Player {
   pid: string;
@@ -140,7 +176,9 @@ interface Keys { host: CryptoKey; token: CryptoKey; room: CryptoKey }
 type Frame = Record<string, unknown> & { t: string };
 type Timer = ReturnType<typeof setTimeout>;
 
-const PROTO = 3;
+const PROTO = 4;
+/** Pages before this cannot report for Focus check (PROTOCOL.md §13). */
+const FOCUS_PROTO = 3;
 type Ranks = Map<string, { rank: number; tied: boolean }>;
 
 /** The stored list of checked questions; anything unreadable means none. */
@@ -340,7 +378,7 @@ export class Room extends DurableObject<Env> {
     const role = url.searchParams.get('role');
     const token = url.searchParams.get('token') || '';
     const vp = Math.floor(Number(url.searchParams.get('v')));
-    const v = vp >= PROTO ? PROTO : vp === 2 ? 2 : 1;
+    const v = Number.isFinite(vp) ? Math.min(Math.max(vp, 1), PROTO) : 1;
     const tabParam = url.searchParams.get('tab') || '';
     const tab = /^[0-9a-f]{16,32}$/.test(tabParam) ? tabParam : undefined;
     const seqParam = Number(url.searchParams.get('seq'));
@@ -362,7 +400,7 @@ export class Room extends DurableObject<Env> {
       const s = this.state;
       if (!s) return reject(4004, 'Room not found');
       // A page from before protocol 2 cannot follow the roster deltas, even with a valid sign-in.
-      if (v < 2) return reject(4010, `This page is out of date. Reload it and sign in to continue game ${s.pin}.`);
+      if (v < 2 || (v < 4 && needsProto4(s.quiz))) return reject(4010, `This page is out of date. Reload it and sign in to continue game ${s.pin}.`);
       // The Worker vouches for a signed-in host with a short-lived signed header; a client cannot forge it.
       const sx = keys ? await verifyHostHeader(keys.host, request.headers.get('X-HQ-Host'), s.pin, Date.now()) : null;
       let authed: boolean;
@@ -387,6 +425,8 @@ export class Room extends DurableObject<Env> {
     if (role !== 'player') return reject(4000, 'Unknown role');
     // Version-1 pages were cached before protocol 2 (two releases ago). 4010 is a code they do not retry, and they show the reason.
     if (v < 2) return reject(4010, 'This page is out of date. Reload it to join the game.');
+    // A version-3 page works for single-answer quizzes; the new question types need a reload.
+    if (v < 4 && needsProto4(this.state.quiz)) return reject(4010, 'This page is out of date. Reload it to join the game.');
 
     if (token) {
       const pid = this.byToken.get(token);
@@ -422,7 +462,7 @@ export class Room extends DurableObject<Env> {
       }
       this.accept(server, { role: 'player', pid, v, ...(tab ? { tab } : {}), ...(seq !== undefined ? { seq } : {}) });
       this.touch();
-      if (v < PROTO) this.markOld(pid);
+      if (v < FOCUS_PROTO) this.markOld(pid);
       this.send(server, this.buildSync('player', pid));
       this.scheduleRoster();
       return respond();
@@ -663,7 +703,7 @@ export class Room extends DurableObject<Env> {
         this.send(ws, { t: 'welcome', pid, token, nick, pin: s.pin, ...(note ? { note } : {}) });
         this.send(ws, this.buildSync('player', pid));
         this.scheduleRoster();
-        if ((att.v ?? 1) < PROTO) this.markOld(pid);
+        if ((att.v ?? 1) < FOCUS_PROTO) this.markOld(pid);
         return;
       }
       case 'rename': {
@@ -748,7 +788,6 @@ export class Room extends DurableObject<Env> {
   private answer(ws: WebSocket, pid: string, frame: Frame): void {
     const s = this.state!;
     const q = frame.q;
-    const choice = frame.choice;
     const ack = (accepted: boolean, reason?: string) => this.send(ws, { t: 'ack', q, accepted, ...(reason ? { reason } : {}) });
 
     // Phones switch to the answer buttons at opensAt on the shared clock; if a frame
@@ -758,7 +797,22 @@ export class Room extends DurableObject<Env> {
     if (typeof q !== 'number' || q !== s.q || (s.phase !== 'open' && s.phase !== 'closed')) { ack(false, 'closed'); return; }
     if (s.phase === 'closed') { ack(false, 'late'); return; }
     const question = s.quiz.questions[s.q];
-    if (typeof choice !== 'number' || !Number.isInteger(choice) || choice < 0 || choice >= question.options.length) { ack(false, 'invalid'); return; }
+    const n = optionsOf(question).length;
+    const isIndex = (c: unknown): c is number => typeof c === 'number' && Number.isInteger(c) && c >= 0 && c < n;
+    // The answer's shape for this question's type (PROTOCOL.md §3); anything else is invalid.
+    let record: { c: number | number[] | null; x?: string } | null = null;
+    if (question.type === 'multi') {
+      const picked = frame.choice;
+      if (Array.isArray(picked) && picked.length >= 1 && picked.length <= n && picked.every(isIndex) && new Set(picked).size === picked.length) {
+        record = { c: [...picked].sort((a, b) => a - b) };
+      }
+    } else if (question.type === 'typein') {
+      const text = cleanTyped(frame.text);
+      if (text !== null) record = { c: null, x: text };
+    } else if (isIndex(frame.choice)) {
+      record = { c: frame.choice };
+    }
+    if (!record) { ack(false, 'invalid'); return; }
     const p = this.players.get(pid);
     if (!p || p.kicked) { ws.close(4003, 'Removed by the host'); return; }
     if (this.answered.has(pid) || p.answers[String(q)]) { ack(false, 'duplicate'); return; }
@@ -766,13 +820,27 @@ export class Room extends DurableObject<Env> {
     const now = Date.now();
     const T = question.timeLimit * 1000;
     const elapsed = Math.min(Math.max(now - (s.opensAt ?? now), 0), T);
-    const correct = choice === question.correct;
-    const points = scoreAnswer(correct, elapsed, question.timeLimit, question.points, s.settings.mode);
+    let right: boolean | null;
+    let points: number;
+    if (question.type === 'multi') {
+      ({ points, right } = scoreMulti(record.c as number[], question.correct, question.partial, elapsed, question.timeLimit, question.points, s.settings.mode));
+    } else if (question.type === 'typein') {
+      right = typedRight(record.x!, question.accept);
+      points = scoreAnswer(right, elapsed, question.timeLimit, question.points, s.settings.mode);
+    } else if (question.type === 'poll') {
+      right = null;
+      points = 0;
+    } else {
+      right = record.c === question.correct;
+      points = scoreAnswer(right, elapsed, question.timeLimit, question.points, s.settings.mode);
+    }
+    const correct = right === true;
 
     const before = { score: p.score, elapsedTotal: p.elapsedTotal, streak: p.streak };
-    p.answers[String(q)] = { c: choice, ms: elapsed, p: points };
+    p.answers[String(q)] = { ...record, ms: elapsed, p: points, ok: right };
     p.score += points;
-    if (correct) { p.elapsedTotal += elapsed; p.streak += 1; } else { p.streak = 0; }
+    // A poll has no right answer: it neither extends nor breaks a streak.
+    if (correct) { p.elapsedTotal += elapsed; p.streak += 1; } else if (right === false) { p.streak = 0; }
     try {
       this.persistPlayer(p); // persist before ack: nothing acknowledged is ever lost
     } catch (e) {
@@ -883,10 +951,16 @@ export class Room extends DurableObject<Env> {
           delete patch.focusCheck;
           this.sendError(ws, 'focus_mid_question', 'Focus check can be turned on or off between questions, not during one.');
         }
+        // A new option order would move the tiles under a student's thumb: it starts with the next question.
+        if (patch && typeof patch.shuffle === 'boolean' && patch.shuffle !== before.shuffle && (s.phase === 'intro' || s.phase === 'open')) {
+          delete patch.shuffle;
+          this.sendError(ws, 'shuffle_mid_question', 'Shuffling can be turned on or off between questions, not during one.');
+        }
         s.settings = mergeSettings(before, patch, s.phase === 'lobby');
         try { this.persistRoom(); } catch (e) { s.settings = before; throw e; }
         this.settingsChanged(
-          before.nameMode !== s.settings.nameMode || before.allowRename !== s.settings.allowRename || before.focusCheck !== s.settings.focusCheck,
+          before.nameMode !== s.settings.nameMode || before.allowRename !== s.settings.allowRename || before.focusCheck !== s.settings.focusCheck
+            || before.shuffle !== s.settings.shuffle,
           before.showOnDevices !== s.settings.showOnDevices,
         );
         return;
@@ -985,7 +1059,7 @@ export class Room extends DurableObject<Env> {
     this.eligible = this.connectedPids();
     if (s.focusQs.includes(s.q)) {
       for (const pid of this.eligible) {
-        if (this.socketsOf(pid).every(ws => ((ws.deserializeAttachment() as Attachment | null)?.v ?? 1) < PROTO)) this.markOld(pid);
+        if (this.socketsOf(pid).every(ws => ((ws.deserializeAttachment() as Attachment | null)?.v ?? 1) < FOCUS_PROTO)) this.markOld(pid);
       }
     }
     const frame = { t: 'open', q: s.q, deadline: s.deadline, serverNow: now };
@@ -1190,10 +1264,16 @@ export class Room extends DurableObject<Env> {
     const s = this.state!;
     const q = s.quiz.questions[s.q];
     const view: Record<string, unknown> = {
-      q: s.q, total: s.quiz.questions.length, optionCount: q.options.length,
+      q: s.q, total: s.quiz.questions.length, type: questionType(q), optionCount: optionsOf(q).length,
       timeLimit: q.timeLimit, points: q.points, opensAt: s.opensAt, deadline: s.deadline,
     };
-    if (withText) { view.text = q.text; view.options = q.options; }
+    if (withText) {
+      view.text = q.text;
+      view.options = optionsOf(q);
+      // Each phone then shows the options in its own order, seeded by its player id (PROTOCOL.md §3).
+      if (s.settings.shuffle && s.settings.showOnDevices && view.options && (view.options as string[]).length > 0) view.shuffle = true;
+      if (q.image) view.image = { url: `/api/images/${q.image.key}`, alt: q.image.alt, ...(q.image.w ? { w: q.image.w, h: q.image.h } : {}) };
+    }
     return view;
   }
 
@@ -1225,7 +1305,7 @@ export class Room extends DurableObject<Env> {
         const r = shown.get(pid);
         base.me = {
           pid: p.pid, nick: p.nick, score: before(p), rank: r?.rank ?? playerCount, tied: r?.tied ?? false,
-          streak: hide && ans ? null : p.streak, answered: !!ans, choice: ans ? ans.c : null, spins: p.spins,
+          streak: hide && ans ? null : p.streak, answered: !!ans, choice: ans ? ans.c : null, ...(ans?.x !== undefined ? { typed: ans.x } : {}), spins: p.spins,
           renamesLeft: Math.max(0, LIMITS.maxRenames - p.renames),
         };
         if (s.phase === 'closed') base.result = this.resultFor(p, s.q, ranks, playerCount);
@@ -1257,7 +1337,8 @@ export class Room extends DurableObject<Env> {
     const ans = p.answers[String(q)];
     const r = ranks.get(p.pid);
     return {
-      q, correct: question.correct, choice: ans ? ans.c : null, points: ans ? ans.p : 0,
+      q, type: questionType(question), correct: rightAnswer(question), right: ans ? answerRight(question, ans) : null,
+      choice: ans ? ans.c : null, ...(ans?.x !== undefined ? { typed: ans.x } : {}), points: ans ? ans.p : 0,
       score: p.score, rank: r?.rank ?? playerCount, tied: r?.tied ?? false, streak: p.streak, playerCount,
       ...(q === s.q && s.closedAt !== null ? { closedAt: s.closedAt } : {}),
     };
@@ -1273,8 +1354,9 @@ export class Room extends DurableObject<Env> {
     const r = ranks.get(p.pid);
     const question = s.quiz.questions[q];
     return {
-      q, right: ans ? ans.c === question.correct : null, choice: ans ? ans.c : null, points: ans ? ans.p : 0,
-      survey: question.points === 0, score, rank: r?.rank ?? playerCount, tied: r?.tied ?? false, playerCount,
+      q, type: questionType(question), right: ans ? answerRight(question, ans) : null, choice: ans ? ans.c : null,
+      ...(ans?.x !== undefined ? { typed: ans.x } : {}), points: ans ? ans.p : 0,
+      survey: question.points === 0 || question.type === 'poll', score, rank: r?.rank ?? playerCount, tied: r?.tied ?? false, playerCount,
       ...(q === s.q - 1 && s.closedAt !== null ? { closedAt: s.closedAt } : {}),
     };
   }
@@ -1304,20 +1386,26 @@ export class Room extends DurableObject<Env> {
     const s = this.state!;
     const question = s.quiz.questions[s.q];
     const key = String(s.q);
-    const counts = new Array<number>(question.options.length).fill(0);
+    const counts = new Array<number>(optionsOf(question).length).fill(0);
     let answered = 0;
+    let right = 0;
     let fastest: { nick: string; ms: number } | null = null;
+    // "Fastest" only means something when speed scored points and there was a right answer.
+    const timed = question.points > 0 && question.type !== 'poll';
     const active = this.activePlayers();
     for (const p of active) {
       const a = p.answers[key];
       if (!a) continue;
       answered += 1;
-      counts[a.c] += 1;
-      if (a.c === question.correct && (fastest === null || a.ms < fastest.ms)) fastest = { nick: p.nick, ms: a.ms };
+      for (const c of Array.isArray(a.c) ? a.c : typeof a.c === 'number' ? [a.c] : []) if (c < counts.length) counts[c] += 1;
+      if (answerRight(question, a) === true) {
+        right += 1;
+        if (timed && (fastest === null || a.ms < fastest.ms)) fastest = { nick: p.nick, ms: a.ms };
+      }
     }
     const sorted = this.sortedPlayers();
     return {
-      q: s.q, correct: question.correct, counts, answered,
+      q: s.q, type: questionType(question), correct: rightAnswer(question), counts, answered, right,
       expected: this.eligible ? this.eligible.size : this.connectedPids().size,
       fastest, leaderboard: this.leaderboard(sorted, this.rankMap(sorted)), playerCount: active.length,
     };
@@ -1348,13 +1436,13 @@ export class Room extends DurableObject<Env> {
     const s = this.state!;
     const question = s.quiz.questions[s.q];
     const key = String(s.q);
-    const counts = new Array<number>(question.options.length).fill(0);
+    const counts = new Array<number>(optionsOf(question).length).fill(0);
     let answered = 0;
     for (const p of this.activePlayers()) {
       const a = p.answers[key];
       if (!a) continue;
       answered += 1;
-      counts[a.c] += 1;
+      for (const c of Array.isArray(a.c) ? a.c : typeof a.c === 'number' ? [a.c] : []) if (c < counts.length) counts[c] += 1;
     }
     const expected = this.eligible ? this.eligible.size : this.connectedPids().size;
     return withType ? { t: 'tally', q: s.q, counts, answered, expected } : { counts, answered, expected };
@@ -1387,8 +1475,9 @@ export class Room extends DurableObject<Env> {
         const a = p.answers[String(qi)];
         if (!a) { cells.push(''); continue; }
         answered += 1;
-        if (a.c === s.quiz.questions[qi].correct) correct += 1;
-        cells.push(`${letterFor(a.c)} ${a.p}`);
+        const question = s.quiz.questions[qi];
+        if (answerRight(question, a) === true) correct += 1;
+        cells.push(answerCell(question, a));
       }
       if (checked) {
         let times = 0, ms = 0, copies = 0;

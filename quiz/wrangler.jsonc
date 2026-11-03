@@ -27,6 +27,11 @@
       "migrations_dir": "migrations"
     }
   ],
+  // Question pictures (PROTOCOL.md §14). Private bucket: pictures are served only
+  // through /api/images/<key>. The bucket is created by hand in each account.
+  "r2_buckets": [
+    { "binding": "IMAGES", "bucket_name": "hompub-quiz-images" }
+  ],
   // SQLite-backed classes are the only kind the Workers Free plan can create.
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Room", "Directory"] }
@@ -63,6 +68,9 @@
           "database_id": "8deca85b-8b80-4032-ac2d-64d58aa36e06",
           "migrations_dir": "migrations"
         }
+      ],
+      "r2_buckets": [
+        { "binding": "IMAGES", "bucket_name": "hompub-quiz-images-staging" }
       ],
       "vars": {
         "ALLOWED_ORIGINS": "",
