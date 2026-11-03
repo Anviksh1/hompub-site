@@ -28,13 +28,14 @@ const KEYS = {
 };
 // Quizzes live in the synced library (PROTOCOL §12): library.js keeps one localStorage key per quiz
 // (hompub-quiz:lib:*) and moves the Phase 1 list (hompub-quiz:quizzes) over once, without changing it.
-const LIMITS = { title: 80, text: 200, option: 80, questions: 100, bodyBytes: 200 * 1024 };
+// text: 400 from quiz schema 2 (textV1 is the schema-1 limit); pictures are shrunk to `pictureBytes` before upload.
+const LIMITS = { title: 80, text: 400, textV1: 200, option: 80, questions: 100, bodyBytes: 200 * 1024, explanation: 400, accept: 10, acceptChars: 80, alt: 150, pictureBytes: 1024 * 1024, picturePx: 1600 };
 const TIME_LIMITS = [5, 10, 15, 20, 30, 60, 90, 120, 240];
 const POINTS = [0, 1000, 2000];
 const INTRO_MS = 3000;
 const LETTERS = ['A', 'B', 'C', 'D'];
 const PIN_RE = /^[1-9][0-9]{5}$/;
-const PROTO = 3;                 // protocol version this page speaks (PROTOCOL §11)
+const PROTO = 4;                 // protocol version this page speaks (PROTOCOL §11)
 const NO_RETRY_CODES = new Set([4001, 4003, 4004, 4009, 4010, 4011]);
 const SYNC_EVERY_MS = 2 * 60 * 1000;   // fetch library changes from other devices while the page is open
 const SAMPLE_ID = 'sample-warm-up';    // "Load sample" opens this quiz again instead of adding another copy
@@ -49,7 +50,7 @@ const DEFAULT_CLOSE_MSG = {
   4009: 'The room is full.',
   4010: 'The room is locked.',
 };
-const DEFAULT_SETTINGS = { mode: 'speed', showOnDevices: false, lateJoin: true, earlyClose: false, nameMode: 'typed', allowRename: true, focusCheck: false, nicknameMode: 'free' };
+const DEFAULT_SETTINGS = { mode: 'speed', showOnDevices: false, lateJoin: true, earlyClose: false, nameMode: 'typed', allowRename: true, focusCheck: false, shuffle: false, nicknameMode: 'free' };
 const NAME_MODES = [
   { id: 'typed', label: 'Typed names only', desc: 'Students type their name. Rude words are refused; duplicates get a number. No random-name button.' },
   { id: 'either', label: 'Typed or random', desc: 'Students type a name, or tap for a random two-word name such as “Brave Otter”.' },
@@ -63,7 +64,7 @@ function prefSettings(raw) {
   const r = raw && typeof raw === 'object' ? raw : {};
   const out = Object.assign({}, DEFAULT_SETTINGS);
   if (MODES_IDS.includes(r.mode)) out.mode = r.mode;
-  ['showOnDevices', 'lateJoin', 'earlyClose', 'allowRename', 'focusCheck'].forEach((k) => { if (typeof r[k] === 'boolean') out[k] = r[k]; });
+  ['showOnDevices', 'lateJoin', 'earlyClose', 'allowRename', 'focusCheck', 'shuffle'].forEach((k) => { if (typeof r[k] === 'boolean') out[k] = r[k]; });
   if (NAME_MODES.some((m) => m.id === r.nameMode)) out.nameMode = r.nameMode;
   else if (r.nicknameMode === 'spin') out.nameMode = 'random';
   out.nicknameMode = legacyNick(out.nameMode);
@@ -252,6 +253,7 @@ function findQuiz(id) {
 // After an edit: store it (and queue it for the server). Returns whether this browser could store it.
 function saveQuiz(q) {
   if (!lib || q.readOnly) return false;
+  stampSchema(q.draft ? state.draft.body : lib.get(q.id).body);
   if (q.draft) {
     lib.create(state.draft.body, { id: state.draft.id });
     state.draft = null;
@@ -261,11 +263,54 @@ function saveQuiz(q) {
 }
 function addQuiz(body, opts) {
   if (!lib) { toast('The quiz library did not load. Reload the page.'); return null; }
+  stampSchema(body);
   const e = lib.create(body, opts);
   state.storageBlocked = lib.storageBlocked();
   return quizView(e);
 }
 function newQuestion(timeLimit) { return { text: '', options: ['', '', '', ''], correct: 0, timeLimit: TIME_LIMITS.includes(timeLimit) ? timeLimit : 20, points: 1000 }; }
+
+// Question types (PROTOCOL §2). A question without `type` has one right answer, as in quiz schema 1.
+const QTYPES = [
+  { id: 'single', label: 'One right answer' },
+  { id: 'multi', label: 'Several right answers' },
+  { id: 'typein', label: 'Typed answer' },
+  { id: 'poll', label: 'Poll: no right answer' },
+];
+function qType(qq) { return qq && (qq.type === 'multi' || qq.type === 'typein' || qq.type === 'poll') ? qq.type : 'single'; }
+function hasOptions(qq) { return qType(qq) !== 'typein'; }
+function multiCorrect(qq) { return Array.isArray(qq.correct) ? qq.correct.filter((c) => Number.isInteger(c)) : []; }
+// Switching type keeps what the other types use (options while typed, accepted answers while not),
+// so switching back loses nothing; cleanQuiz() sends only what the chosen type needs.
+function setType(qq, type) {
+  const from = qType(qq);
+  if (from === type) return;
+  if (!Array.isArray(qq.options) || qq.options.length < 2) qq.options = ['', '', '', ''];
+  if (type === 'multi') qq.correct = from === 'single' && Number.isInteger(qq.correct) && qq.correct >= 0 ? [qq.correct] : multiCorrect(qq);
+  else if (type === 'single') qq.correct = Array.isArray(qq.correct) ? (qq.correct.length ? qq.correct[0] : -1) : (Number.isInteger(qq.correct) ? qq.correct : -1);
+  if (type === 'multi' && typeof qq.partial !== 'boolean') qq.partial = false;
+  if (type === 'typein' && (!Array.isArray(qq.accept) || !qq.accept.length)) {
+    const right = from === 'single' && Number.isInteger(qq.correct) ? String(qq.options[qq.correct] || '').trim() : '';
+    qq.accept = [right];
+  }
+  if (type === 'poll') qq.points = 0;
+  else if (from === 'poll' && qq.points === 0) qq.points = 1000;
+  if (type === 'single') delete qq.type; else qq.type = type;
+}
+// Quiz schema (PROTOCOL §12): 2 once a quiz uses a new type, an explanation, a picture, or text
+// over 200 characters. A Phase 2 page opens a schema-2 quiz read-only, so it never loses those parts.
+function usesSchema2Fields(body) {
+  return (body.questions || []).some((qq) => qq && (qType(qq) !== 'single' || qq.explanation !== undefined || qq.image !== undefined));
+}
+function neededSchema(body) {
+  if (usesSchema2Fields(body)) return 2;
+  return (body.questions || []).some((qq) => qq && String(qq.text || '').length > LIMITS.textV1) ? 2 : 1;
+}
+// The server never lets a lower schema replace a higher one, so a quiz stays at 2 once it got there.
+function stampSchema(body) {
+  const want = Math.max(neededSchema(body), Number.isInteger(body.schema) ? body.schema : 1);
+  if (want > 1) body.schema = want; else delete body.schema;
+}
 // A quiz counts as exported only while no edit is newer than its last export; otherwise the
 // "not exported" marker and the setup-screen notice must come back.
 function isExported(q) { return !!q.exportedAt && !(q.updatedAt > q.exportedAt); }
@@ -277,36 +322,76 @@ function isExported(q) { return !!q.exportedAt && !(q.updatedAt > q.exportedAt);
 // import toast can say so instead of pretending the file came through whole.
 function normaliseQuiz(raw) {
   if (!raw || typeof raw !== 'object' || !Array.isArray(raw.questions)) return null;
-  const dropped = { questions: Math.max(0, raw.questions.length - LIMITS.questions), options: 0, timers: 0, points: 0 };
+  const dropped = { questions: Math.max(0, raw.questions.length - LIMITS.questions), options: 0, timers: 0, points: 0, pollPoints: 0, answers: 0 };
   const questions = raw.questions.slice(0, LIMITS.questions).map((item) => {
     const o = item && typeof item === 'object' ? item : {};
+    const type = qType(o);
     const rawOptions = Array.isArray(o.options) ? o.options : null;
-    if (rawOptions) dropped.options += Math.max(0, rawOptions.length - 4);
+    if (rawOptions && type !== 'typein') dropped.options += Math.max(0, rawOptions.length - 4);
     const options = rawOptions ? rawOptions.slice(0, 4).map((x) => String(x == null ? '' : x)) : ['', ''];
     while (options.length < 2) options.push('');
-    const correct = Number.isInteger(o.correct) && o.correct >= 0 && o.correct < options.length ? o.correct : -1;
     const timeLimit = TIME_LIMITS.includes(Number(o.timeLimit)) ? Number(o.timeLimit) : 20;
-    const points = POINTS.includes(Number(o.points)) ? Number(o.points) : 1000;
     // A value the file had but the game does not allow is reported, not changed silently (P0-48).
     if (o.timeLimit !== undefined && timeLimit !== Number(o.timeLimit)) dropped.timers += 1;
-    if (o.points !== undefined && points !== Number(o.points)) dropped.points += 1;
-    return { text: String(o.text == null ? '' : o.text), options, correct, timeLimit, points };
+    let points;
+    if (type === 'poll') {
+      points = 0;
+      if (o.points !== undefined && Number(o.points) !== 0) dropped.pollPoints += 1;
+    } else {
+      points = POINTS.includes(Number(o.points)) ? Number(o.points) : 1000;
+      if (o.points !== undefined && points !== Number(o.points)) dropped.points += 1;
+    }
+    const out = { text: String(o.text == null ? '' : o.text), options, timeLimit, points };
+    if (type === 'single') {
+      out.correct = Number.isInteger(o.correct) && o.correct >= 0 && o.correct < options.length ? o.correct : -1;
+    } else {
+      out.type = type;
+      if (type === 'multi') {
+        out.correct = Array.isArray(o.correct) ? [...new Set(o.correct.filter((c) => Number.isInteger(c) && c >= 0 && c < options.length))].sort((a, b) => a - b) : [];
+        out.partial = o.partial === true;
+      }
+      if (type === 'typein') {
+        const acc = Array.isArray(o.accept) ? o.accept.map((x) => String(x == null ? '' : x)) : [];
+        dropped.answers += Math.max(0, acc.length - LIMITS.accept);
+        out.accept = acc.length ? acc.slice(0, LIMITS.accept) : [''];
+        if (!rawOptions) delete out.options;
+      }
+    }
+    if (typeof o.explanation === 'string' && o.explanation !== '') out.explanation = o.explanation;
+    // A picture comes with its key on this server, or as data from "Export" (uploaded by importPictures()).
+    if (o.image && typeof o.image === 'object') {
+      const img = o.image;
+      const pic = { key: typeof img.key === 'string' ? img.key : '', alt: String(img.alt == null ? '' : img.alt) };
+      if (Number.isInteger(img.w) && Number.isInteger(img.h)) { pic.w = img.w; pic.h = img.h; }
+      if (typeof img.data === 'string' && img.data.startsWith('data:image/')) pic.data = img.data;
+      if (pic.key || pic.data) out.image = pic;
+    }
+    return out;
   });
   if (!questions.length) questions.push(newQuestion());
   return { title: String(raw.title == null ? '' : raw.title), questions, dropped };
 }
 
-// The exact object sent in POST /api/room (PROTOCOL §2): nothing but title + questions, trimmed.
+// The exact object sent in POST /api/room (PROTOCOL §2): only what each question's type uses, trimmed.
 function cleanQuiz(q) {
   return {
     title: String(q.title || '').trim(),
-    questions: (q.questions || []).map((qq) => ({
-      text: String(qq.text || '').trim(),
-      options: (qq.options || []).map((o) => String(o || '').trim()),
-      correct: qq.correct,
-      timeLimit: qq.timeLimit,
-      points: qq.points,
-    })),
+    questions: (q.questions || []).map((qq) => {
+      const type = qType(qq);
+      const out = { text: String(qq.text || '').trim(), timeLimit: qq.timeLimit, points: type === 'poll' ? 0 : qq.points };
+      if (type !== 'single') out.type = type;
+      if (type !== 'typein') out.options = (qq.options || []).map((o) => String(o || '').trim());
+      if (type === 'single') out.correct = qq.correct;
+      if (type === 'multi') { out.correct = multiCorrect(qq); out.partial = qq.partial === true; }
+      if (type === 'typein') out.accept = (qq.accept || []).map((a) => String(a || '').trim()).filter(Boolean);
+      const ex = String(qq.explanation || '').trim();
+      if (ex) out.explanation = ex;
+      if (qq.image && qq.image.key) {
+        out.image = { key: qq.image.key, alt: String(qq.image.alt || '').trim() };
+        if (qq.image.w && qq.image.h) { out.image.w = qq.image.w; out.image.h = qq.image.h; }
+      }
+      return out;
+    }),
   };
 }
 function quizBytes(q) {
@@ -326,17 +411,31 @@ function validateQuiz(q) {
   if (qs.length > LIMITS.questions) p.push(`Too many questions: ${qs.length} (max ${LIMITS.questions}).`);
   qs.forEach((qq, i) => {
     const n = `Question ${i + 1}`;
+    const type = qType(qq);
     const text = String(qq.text || '').trim();
     if (text.length < 1 || text.length > LIMITS.text) p.push(`${n}: text must be 1–${LIMITS.text} characters.`);
-    const opts = Array.isArray(qq.options) ? qq.options : [];
-    if (opts.length < 2 || opts.length > 4) p.push(`${n}: needs 2–4 options.`);
-    opts.forEach((o, j) => {
-      const s = String(o || '').trim();
-      if (s.length < 1 || s.length > LIMITS.option) p.push(`${n}, option ${LETTERS[j] || j + 1}: 1–${LIMITS.option} characters.`);
-    });
-    if (!Number.isInteger(qq.correct) || qq.correct < 0 || qq.correct >= opts.length) p.push(`${n}: tick the correct option.`);
+    if (type === 'typein') {
+      const acc = (qq.accept || []).map((a) => String(a || '').trim());
+      if (!acc.some(Boolean)) p.push(`${n}: type at least one accepted answer.`);
+      acc.forEach((a, j) => { if (a.length > LIMITS.acceptChars) p.push(`${n}, accepted answer ${j + 1}: at most ${LIMITS.acceptChars} characters.`); });
+    } else {
+      const opts = Array.isArray(qq.options) ? qq.options : [];
+      if (opts.length < 2 || opts.length > 4) p.push(`${n}: needs 2–4 options.`);
+      opts.forEach((o, j) => {
+        const s2 = String(o || '').trim();
+        if (s2.length < 1 || s2.length > LIMITS.option) p.push(`${n}, option ${LETTERS[j] || j + 1}: 1–${LIMITS.option} characters.`);
+      });
+      if (type === 'single' && (!Number.isInteger(qq.correct) || qq.correct < 0 || qq.correct >= opts.length)) p.push(`${n}: tick the correct option.`);
+      if (type === 'multi' && !multiCorrect(qq).some((c) => c >= 0 && c < opts.length)) p.push(`${n}: tick every right option (at least one).`);
+    }
     if (!TIME_LIMITS.includes(qq.timeLimit)) p.push(`${n}: time limit must be one of ${TIME_LIMITS.join(', ')} seconds.`);
-    if (!POINTS.includes(qq.points)) p.push(`${n}: points must be 0, 1000 or 2000.`);
+    if (type !== 'poll' && !POINTS.includes(qq.points)) p.push(`${n}: points must be 0, 1000 or 2000.`);
+    if (String(qq.explanation || '').trim().length > LIMITS.explanation) p.push(`${n}: the explanation can have at most ${LIMITS.explanation} characters.`);
+    if (qq.image) {
+      if (!qq.image.key) p.push(`${n}: the picture is not saved yet.`);
+      const alt = String(qq.image.alt || '').trim();
+      if (alt.length < 1 || alt.length > LIMITS.alt) p.push(`${n}: describe the picture in 1–${LIMITS.alt} characters, for students who cannot see it.`);
+    }
   });
   if (quizBytes(q) > LIMITS.bodyBytes) p.push('The quiz is larger than 200 KB. Shorten some text.');
   return p;
@@ -932,15 +1031,29 @@ function fieldIssues(q) {
   if (title.length < 1) m.set('title-input', 'Give the quiz a title.');
   else if (title.length > LIMITS.title) m.set('title-input', `Shorten the title to ${LIMITS.title} characters.`);
   (q.questions || []).forEach((qq, i) => {
+    const type = qType(qq);
     const text = String(qq.text || '').trim();
     if (text.length < 1) m.set(`q-${i}-text`, 'Type the question.');
     else if (text.length > LIMITS.text) m.set(`q-${i}-text`, `Shorten this to ${LIMITS.text} characters (it has ${text.length}).`);
-    (qq.options || []).forEach((o, j) => {
-      const t = String(o || '').trim();
-      if (t.length < 1) m.set(`q-${i}-opt-${j}`, `Type option ${LETTERS[j]}, or remove it.`);
-      else if (t.length > LIMITS.option) m.set(`q-${i}-opt-${j}`, `Shorten option ${LETTERS[j]} to ${LIMITS.option} characters.`);
-    });
-    if (!Number.isInteger(qq.correct) || qq.correct < 0 || qq.correct >= (qq.options || []).length) m.set(`q-${i}-opts`, 'Tick the correct option.');
+    if (type === 'typein') {
+      const acc = (qq.accept || []).map((a) => String(a || '').trim());
+      acc.forEach((a, j) => { if (a.length > LIMITS.acceptChars) m.set(`q-${i}-acc-${j}`, `Shorten this to ${LIMITS.acceptChars} characters.`); });
+      if (!acc.some(Boolean)) m.set(`q-${i}-accs`, 'Type at least one answer that counts as right.');
+    } else {
+      (qq.options || []).forEach((o, j) => {
+        const t = String(o || '').trim();
+        if (t.length < 1) m.set(`q-${i}-opt-${j}`, `Type option ${LETTERS[j]}, or remove it.`);
+        else if (t.length > LIMITS.option) m.set(`q-${i}-opt-${j}`, `Shorten option ${LETTERS[j]} to ${LIMITS.option} characters.`);
+      });
+      if (type === 'single' && (!Number.isInteger(qq.correct) || qq.correct < 0 || qq.correct >= (qq.options || []).length)) m.set(`q-${i}-opts`, 'Tick the correct option.');
+      if (type === 'multi' && !multiCorrect(qq).some((c) => c >= 0 && c < (qq.options || []).length)) m.set(`q-${i}-opts`, 'Tick every right option (at least one).');
+    }
+    if (String(qq.explanation || '').trim().length > LIMITS.explanation) m.set(`q-${i}-explain`, `Shorten this to ${LIMITS.explanation} characters.`);
+    if (qq.image) {
+      const alt = String(qq.image.alt || '').trim();
+      if (alt.length < 1) m.set(`q-${i}-alt`, 'Describe the picture, for students who cannot see it.');
+      else if (alt.length > LIMITS.alt) m.set(`q-${i}-alt`, `Shorten this to ${LIMITS.alt} characters.`);
+    }
   });
   return m;
 }
@@ -971,7 +1084,7 @@ function renderProblems(problems) {
 }
 
 function renderQuestionCard(qq, i, total, issues) {
-  const opts = qq.options;
+  const type = qType(qq);
   return h('section', { class: 'card q-card', 'aria-label': `Question ${i + 1}` },
     h('div', { class: 'q-head' },
       h('h3', null, `Question ${i + 1}`),
@@ -980,28 +1093,93 @@ function renderQuestionCard(qq, i, total, issues) {
         btn('↓', 'move-q', { cls: 'small icon', disabled: i === total - 1, attrs: { id: `q-${i}-down`, 'data-q': i, 'data-dir': 1, 'aria-label': `Move question ${i + 1} down` } }),
         btn('Remove', 'remove-q', { cls: 'small danger', disabled: total <= 1, attrs: { id: `q-${i}-remove`, 'data-q': i, 'aria-label': `Remove question ${i + 1}` } }))),
     h('label', { class: 'field' },
+      h('span', null, 'Type of question'),
+      h('select', { class: 'input', id: `q-${i}-type`, 'data-field': 'q-type', 'data-q': i, style: 'width:auto' },
+        QTYPES.map((t) => h('option', { value: t.id, selected: t.id === type || null }, t.label)))),
+    h('label', { class: 'field' },
       h('span', null, `Question text (1–${LIMITS.text} characters)`),
       fieldInput('textarea', { class: 'input', id: `q-${i}-text`, maxlength: LIMITS.text, rows: 2, 'data-field': 'q-text', 'data-q': i }, issues, qq.text || '')),
     fieldError(`q-${i}-text`, issues),
-    h('div', { class: 'field' },
-      h('span', { class: 'field-label', id: `q-${i}-opts-label` }, `Options (2–4, each 1–${LIMITS.option} characters) — tick the correct one`),
-      h('div', { class: 'opt-list', id: `q-${i}-opts`, role: 'radiogroup', 'aria-labelledby': `q-${i}-opts-label`, 'aria-describedby': `err-q-${i}-opts`, 'aria-invalid': issues.has(`q-${i}-opts`) ? 'true' : null },
-        opts.map((o, j) => [h('div', { class: 'opt-row' },
-          swatch(j),
-          fieldInput('input', { class: 'input', id: `q-${i}-opt-${j}`, type: 'text', maxlength: LIMITS.option, value: o || '', 'data-field': 'opt', 'data-q': i, 'data-i': j, autocomplete: 'off', 'aria-label': `Option ${LETTERS[j]} (${SHAPES[j].name})` }, issues),
-          h('span', { class: 'radio-wrap' },
-            h('input', { type: 'radio', id: `q-${i}-correct-${j}`, name: `correct-${i}`, value: j, checked: qq.correct === j || null, 'data-field': 'correct', 'data-q': i, 'aria-label': `Option ${LETTERS[j]} is the correct answer` })),
-          btn('×', 'remove-opt', { cls: 'small icon', disabled: opts.length <= 2, attrs: { id: `q-${i}-opt-${j}-remove`, 'data-q': i, 'data-i': j, 'aria-label': `Remove option ${LETTERS[j]}` } })),
-          fieldError(`q-${i}-opt-${j}`, issues)]),
-        opts.length < 4 && h('div', null, btn('+ Add option', 'add-opt', { cls: 'small', attrs: { id: `q-${i}-addopt`, 'data-q': i } }))),
-      fieldError(`q-${i}-opts`, issues)),
+    renderPictureField(qq, i, issues),
+    type === 'typein' ? renderAcceptField(qq, i, issues) : renderOptionsField(qq, i, issues, type),
     h('div', { class: 'inline-fields' },
       h('label', { class: 'field' }, h('span', null, 'Time limit'),
         h('select', { class: 'input', id: `q-${i}-time`, 'data-field': 'timeLimit', 'data-q': i },
           TIME_LIMITS.map((t) => h('option', { value: t, selected: qq.timeLimit === t || null }, `${t} seconds`)))),
       h('label', { class: 'field' }, h('span', null, 'Points'),
-        h('select', { class: 'input', id: `q-${i}-points`, 'data-field': 'points', 'data-q': i },
-          POINTS.map((p) => h('option', { value: p, selected: qq.points === p || null }, p === 0 ? '0 — survey, nobody scores' : String(p)))))));
+        type === 'poll'
+          ? h('select', { class: 'input', id: `q-${i}-points`, disabled: true }, h('option', null, '0 — a poll gives no points'))
+          : h('select', { class: 'input', id: `q-${i}-points`, 'data-field': 'points', 'data-q': i },
+            POINTS.map((p) => h('option', { value: p, selected: qq.points === p || null }, p === 0 ? '0 — practice, nobody scores' : String(p)))))),
+    h('label', { class: 'field' },
+      h('span', null, `Explanation (optional, up to ${LIMITS.explanation} characters) — shown after the answer is revealed`),
+      fieldInput('textarea', { class: 'input', id: `q-${i}-explain`, maxlength: LIMITS.explanation, rows: 2, 'data-field': 'explanation', 'data-q': i }, issues, qq.explanation || '')),
+    fieldError(`q-${i}-explain`, issues));
+}
+
+// Options with a tick (one right answer), ticks (several), or none (a poll).
+function renderOptionsField(qq, i, issues, type) {
+  const opts = Array.isArray(qq.options) ? qq.options : [];
+  const ticks = multiCorrect(qq);
+  const label = type === 'multi' ? `Options (2–4, each 1–${LIMITS.option} characters) — tick every right one`
+    : type === 'poll' ? `Options (2–4, each 1–${LIMITS.option} characters) — a poll has no right answer`
+      : `Options (2–4, each 1–${LIMITS.option} characters) — tick the correct one`;
+  return h('div', { class: 'field' },
+    h('span', { class: 'field-label', id: `q-${i}-opts-label` }, label),
+    h('div', { class: 'opt-list', id: `q-${i}-opts`, role: type === 'single' ? 'radiogroup' : 'group', 'aria-labelledby': `q-${i}-opts-label`, 'aria-describedby': `err-q-${i}-opts`, 'aria-invalid': issues.has(`q-${i}-opts`) ? 'true' : null },
+      opts.map((o, j) => [h('div', { class: 'opt-row' + (type === 'poll' ? ' no-tick' : '') },
+        swatch(j),
+        fieldInput('input', { class: 'input', id: `q-${i}-opt-${j}`, type: 'text', maxlength: LIMITS.option, value: o || '', 'data-field': 'opt', 'data-q': i, 'data-i': j, autocomplete: 'off', 'aria-label': `Option ${LETTERS[j]} (${SHAPES[j].name})` }, issues),
+        type === 'poll' ? null : h('span', { class: 'radio-wrap' },
+          type === 'multi'
+            ? h('input', { type: 'checkbox', id: `q-${i}-correct-${j}`, value: j, checked: ticks.includes(j) || null, 'data-field': 'correct-multi', 'data-q': i, 'aria-label': `Option ${LETTERS[j]} is a right answer` })
+            : h('input', { type: 'radio', id: `q-${i}-correct-${j}`, name: `correct-${i}`, value: j, checked: qq.correct === j || null, 'data-field': 'correct', 'data-q': i, 'aria-label': `Option ${LETTERS[j]} is the correct answer` })),
+        btn('×', 'remove-opt', { cls: 'small icon', disabled: opts.length <= 2, attrs: { id: `q-${i}-opt-${j}-remove`, 'data-q': i, 'data-i': j, 'aria-label': `Remove option ${LETTERS[j]}` } })),
+        fieldError(`q-${i}-opt-${j}`, issues)]),
+      opts.length < 4 && h('div', null, btn('+ Add option', 'add-opt', { cls: 'small', attrs: { id: `q-${i}-addopt`, 'data-q': i } }))),
+    fieldError(`q-${i}-opts`, issues),
+    type === 'multi' ? toggle(`partial-${i}`, qq.partial === true, 'Partial credit',
+      'A student who picks some of the right options gets part of the points; each wrong pick cancels a right one. Off: only exactly the right options score. In Accuracy scoring only a fully right answer counts.') : null);
+}
+
+// A typed answer: the answers that count as right. Capitals, accents (ā, é) and extra spaces do not matter.
+function renderAcceptField(qq, i, issues) {
+  const acc = Array.isArray(qq.accept) && qq.accept.length ? qq.accept : [''];
+  return h('div', { class: 'field' },
+    h('span', { class: 'field-label', id: `q-${i}-accs-label` }, `Answers that count as right (up to ${LIMITS.accept}) — capitals, accents and extra spaces do not matter`),
+    h('div', { class: 'opt-list', id: `q-${i}-accs`, role: 'group', 'aria-labelledby': `q-${i}-accs-label`, 'aria-describedby': `err-q-${i}-accs`, 'aria-invalid': issues.has(`q-${i}-accs`) ? 'true' : null },
+      acc.map((a, j) => [h('div', { class: 'opt-row acc-row' },
+        fieldInput('input', { class: 'input', id: `q-${i}-acc-${j}`, type: 'text', maxlength: LIMITS.acceptChars, value: a || '', 'data-field': 'accept', 'data-q': i, 'data-i': j, autocomplete: 'off', 'aria-label': `Accepted answer ${j + 1}` }, issues),
+        btn('×', 'remove-accept', { cls: 'small icon', disabled: acc.length <= 1, attrs: { id: `q-${i}-acc-${j}-remove`, 'data-q': i, 'data-i': j, 'aria-label': `Remove accepted answer ${j + 1}` } })),
+        fieldError(`q-${i}-acc-${j}`, issues)]),
+      acc.length < LIMITS.accept && h('div', null, btn('+ Add another accepted answer', 'add-accept', { cls: 'small', attrs: { id: `q-${i}-addacc`, 'data-q': i } }))),
+    fieldError(`q-${i}-accs`, issues),
+    h('p', { class: 'fine' }, 'Students type their answer on their phone. Add spellings you would accept, for example “Krishna” and “Kṛṣṇa”.'));
+}
+
+// A picture shown with the question (PROTOCOL §14). It is shrunk on this computer, then saved to your library.
+function renderPictureField(qq, i, issues) {
+  const pic = qq.image;
+  const busy = state.uploading === i;
+  if (!pic) {
+    const signedIn = state.auth.status === 'in';
+    return h('div', { class: 'field picture-field' },
+      h('div', { class: 'btn-row' },
+        btn(busy ? 'Adding picture…' : '+ Add a picture', 'pick-picture', { cls: 'small', disabled: busy || !signedIn, attrs: { id: `q-${i}-addpic`, 'data-q': i, 'aria-describedby': signedIn ? null : `q-${i}-pic-why` } }),
+        signedIn ? null : h('span', { class: 'why', id: `q-${i}-pic-why` }, 'Sign in to add pictures.')));
+  }
+  return h('div', { class: 'field picture-field' },
+    h('span', { class: 'field-label' }, 'Picture'),
+    h('div', { class: 'picture-row' },
+      pic.key ? h('img', { class: 'picture-thumb', src: '/api/images/' + pic.key, alt: '', width: pic.w || null, height: pic.h || null, loading: 'lazy' }) : h('span', { class: 'fine' }, 'Not saved yet'),
+      h('div', { class: 'picture-side' },
+        h('label', { class: 'field' },
+          h('span', null, `Describe the picture (1–${LIMITS.alt} characters) — read out to students who cannot see it`),
+          fieldInput('input', { class: 'input', id: `q-${i}-alt`, type: 'text', maxlength: LIMITS.alt, value: pic.alt || '', 'data-field': 'alt', 'data-q': i, autocomplete: 'off' }, issues)),
+        fieldError(`q-${i}-alt`, issues),
+        h('div', { class: 'btn-row' },
+          btn(busy ? 'Replacing…' : 'Replace', 'pick-picture', { cls: 'small', disabled: busy || state.auth.status !== 'in', attrs: { id: `q-${i}-replacepic`, 'data-q': i } }),
+          btn('Remove picture', 'remove-picture', { cls: 'small danger', attrs: { id: `q-${i}-removepic`, 'data-q': i } })))));
 }
 
 // Typing must not rebuild the form (it would steal the caret), so text edits only refresh the
@@ -1045,6 +1223,7 @@ function renderSetup() {
     h('section', { class: 'card' },
       h('h2', null, 'Room options'),
       toggle('s-showOnDevices', s.showOnDevices, 'Show question and options on phones', 'Off: phones show only the four shapes; the question lives on the projector. Can be changed during the game.'),
+      toggle('s-shuffle', !!s.shuffle, 'Shuffle the options on each phone', 'Works with “Show question and options on phones”: each student sees the options in a different order, so neighbours cannot copy by position or colour. The projector keeps A–D. Can be changed between questions.'),
       toggle('s-lateJoin', s.lateJoin, 'Allow late joiners', 'Students who join after the start score 0 for the questions they missed. Can be changed during the game.'),
       toggle('s-earlyClose', s.earlyClose, 'Close early when everyone has answered', 'Otherwise each question runs for its full time, or until you press “Close now”.'),
       h('div', { class: 'field' },
@@ -1178,6 +1357,7 @@ function renderStageMenu(g) {
       toggle('g-lock', !!g.locked, 'Lock room', 'No new players; reconnects still work.'),
       state.serverProto < 2 ? null : toggle('g-allowRename', s.allowRename !== false, 'Students can change their name', inLobby ? 'Switches off when you press Start.' : 'Lets students fix their name now.'),
       state.serverProto < 3 ? null : focusToggle(g),
+      state.serverProto < 4 ? null : shuffleToggle(g),
       inLobby ? [
         h('hr'),
         h('label', { class: 'field-label', for: 'g-mode' }, 'Scoring'),
@@ -1199,6 +1379,16 @@ function focusToggle(g) {
   const s = g.settings || DEFAULT_SETTINGS;
   const busy = g.phase === 'intro' || g.phase === 'open';
   const el = toggle('g-focusCheck', !!s.focusCheck, 'Focus check', busy ? 'Can be changed after this question.' : 'Phones report leaving the page during a question; students are told.');
+  if (busy) { const input = el.querySelector('input'); if (input) input.disabled = true; }
+  return el;
+}
+
+// Shuffling changes the tiles under a student's thumb, so it too changes only between questions.
+function shuffleToggle(g) {
+  const s = g.settings || DEFAULT_SETTINGS;
+  const busy = g.phase === 'intro' || g.phase === 'open';
+  const el = toggle('g-shuffle', !!s.shuffle, 'Shuffle options on phones',
+    busy ? 'Can be changed after this question.' : (s.showOnDevices ? 'Each phone shows its own order.' : 'Works when the question is shown on phones.'));
   if (busy) { const input = el.querySelector('input'); if (input) input.disabled = true; }
   return el;
 }
@@ -1388,7 +1578,7 @@ function qrNode(url, pin) {
 function renderCounter(q, g) {
   return h('p', { class: 'q-counter' },
     h('span', null, `Question ${(q.q | 0) + 1} of ${q.total || g.total || '?'}`),
-    h('span', null, q.points === 0 ? 'Survey — no points' : `${fmtInt(q.points)} points`),
+    h('span', null, q.type === 'poll' ? 'Poll — no points' : q.points === 0 ? 'Practice — no points' : `${fmtInt(q.points)} points`),
     h('span', null, `${q.timeLimit} s`));
 }
 
@@ -1424,12 +1614,16 @@ function renderQuestion(phase) {
   const tally = g.tally || emptyTally(q.optionCount, g.playerCount);
   const options = Array.isArray(q.options) ? q.options : [];
   const offline = hostOffline();
+  const hint = typeHint(q);
   return stageFrame(
     [
       renderCounter(q, g),
       // On a wide screen the clock sits beside the question, so long questions still fit (P0-62).
-      h('div', { class: 'q-top' },
-        h('h1', { class: 'q-text' }, q.text || ''),
+      h('div', { class: 'q-top' + (q.image ? ' has-pic' : '') },
+        h('div', { class: 'q-main' },
+          h('h1', { class: 'q-text' + textSizeClass(q.text) }, q.text || ''),
+          hint ? h('p', { class: 'q-hint' }, hint) : null),
+        stagePicture(q),
         h('div', { class: 'q-meta' },
           renderRing(),
           phase === 'intro'
@@ -1437,12 +1631,32 @@ function renderQuestion(phase) {
             : h('p', { class: 'answered', id: 'answered' }, answeredText(tally), h('small', null, 'answered')))),
       // The server keeps time while this laptop is offline; say so instead of a frozen "…" (P0-57).
       offline && phase === 'open' ? h('p', { class: 'offline-note', role: 'status', id: 'offline-note' }, 'This laptop is offline. The question closes on time on the server; the answers appear when the connection returns.') : null,
-      h('div', { class: 'options' }, options.map((o, i) => optionTile(i, o))),
+      q.type === 'typein'
+        ? h('div', { class: 'typein-panel' }, h('span', { 'aria-hidden': 'true' }, '✎'), ' Type your answer on your phone')
+        : h('div', { class: 'options' }, options.map((o, i) => optionTile(i, o))),
     ],
     phase === 'open'
       ? [offline ? btn('Close now', 'close', { cls: 'primary big', disabled: true, attrs: { title: 'Not available while offline' } }) : primaryBtn('Close now', 'close')]
       : [btn('Get ready…', 'noop', { cls: 'big', disabled: true })],
     phase === 'open' ? (offline ? 'Offline: waiting for the connection' : 'Space / Enter: close now') : null);
+}
+
+// What students must do, for the types that differ from "tap the right answer".
+function typeHint(q) {
+  if (q.type === 'multi') return 'Choose every right answer';
+  if (q.type === 'poll') return 'Poll: there is no right answer';
+  if (q.type === 'typein') return 'Type the answer';
+  return '';
+}
+// Long questions (schema 2 allows 400 characters) step the text size down so every screen still fits.
+function textSizeClass(text) {
+  const n = String(text || '').length;
+  return n > 300 ? ' q-long2' : n > 200 ? ' q-long' : '';
+}
+function stagePicture(q) {
+  if (!q.image || !q.image.url) return null;
+  return h('figure', { class: 'q-pic' },
+    h('img', { src: q.image.url, alt: q.image.alt || '', width: q.image.w || null, height: q.image.h || null }));
 }
 
 function hostOffline() { return isLive() && (navigator.onLine === false || (state.conn.status !== 'live' && state.conn.status !== 'connecting')); }
@@ -1482,19 +1696,39 @@ function renderReveal() {
       h('div', { class: 'reveal-row' },
         h('div', { class: 'stage-body' },
           renderCounter(q, g),
-          h('h1', { class: 'q-text q-small' }, q.text || ''),
-          h('div', { class: 'options reveal-options' }, options.map((o, i) => optionTile(i, o, { count: counts[i] | 0, max, correct: i === r.correct, dim: i !== r.correct }))),
+          h('h1', { class: 'q-text q-small' + textSizeClass(q.text) }, q.text || ''),
+          revealAnswers(q, r, options, counts, max),
           h('div', { class: 'reveal-facts' },
             h('p', { class: 'answered' }, answeredText(r), h('small', null, 'answered')),
-            h('p', { class: 'fastest' },
-              r.fastest && r.fastest.nick
-                ? ['Fastest correct: ', h('b', null, r.fastest.nick), ` (${fmtSec(r.fastest.ms)})`]
-                : (q.points === 0 ? 'Survey question — no points awarded.' : 'Nobody got this one right.'))),
+            h('p', { class: 'fastest' }, revealFact(q, r))),
+          r.explanation ? h('p', { class: 'explanation' }, h('b', null, 'Why: '), r.explanation) : null,
           focusRevealLine(g)),
         h('div', null, h('p', { class: 'board-title' }, 'Leaderboard'), renderBoard(lb, true))),
     ],
     [primaryBtn(isLast ? 'Show podium ▸' : 'Next question ▸', 'next')],
     'Space / Enter: next');
+}
+
+// The right answer(s) of the question just closed, by type (PROTOCOL §3).
+function revealAnswers(q, r, options, counts, max) {
+  const type = r.type || q.type || 'single';
+  if (type === 'typein') {
+    const acc = Array.isArray(r.correct) ? r.correct : [];
+    return h('div', { class: 'typein-panel reveal-typein' },
+      h('span', { class: 'fine' }, acc.length > 1 ? 'Accepted answers' : 'The answer'),
+      h('b', null, acc.join(' · ')));
+  }
+  const right = type === 'multi' ? (Array.isArray(r.correct) ? r.correct : []) : type === 'poll' ? [] : [r.correct];
+  const poll = type === 'poll';
+  return h('div', { class: 'options reveal-options' }, options.map((o, i) => optionTile(i, o, { count: counts[i] | 0, max, correct: right.includes(i), dim: !poll && !right.includes(i) })));
+}
+function revealFact(q, r) {
+  const type = r.type || q.type || 'single';
+  if (type === 'poll') return 'Poll — no right answer, no points.';
+  if (r.fastest && r.fastest.nick) return ['Fastest correct: ', h('b', null, r.fastest.nick), ` (${fmtSec(r.fastest.ms)})`];
+  const n = typeof r.right === 'number' ? r.right : null;
+  if (q.points === 0) return n ? `Practice question — ${n} right, no points awarded.` : 'Practice question — no points awarded.';
+  return n === 0 || n === null ? 'Nobody got this one right.' : `${plural(n, 'student')} right.`;
 }
 
 /* ---------- 4i. PODIUM ---------- */
@@ -1772,7 +2006,7 @@ const actions = {
     const i = +d.q;
     const qq = q.questions[i];
     if (q.questions.length <= 1 || !qq) return;
-    if ((qq.text || qq.options.some(Boolean)) && !(await confirmBox(`Remove question ${i + 1}?`, qq.text ? `“${qq.text}”` : 'It has options typed in.', 'Remove question', { danger: true }))) return;
+    if ((qq.text || (qq.options || []).some(Boolean) || (qq.accept || []).some(Boolean)) && !(await confirmBox(`Remove question ${i + 1}?`, qq.text ? `“${qq.text}”` : 'It has options typed in.', 'Remove question', { danger: true }))) return;
     editQuiz((q2) => { q2.questions.splice(i, 1); }, true);
     const next = Math.min(i, findQuiz(state.editorId).questions.length - 1);
     focusLater(`q-${next}-text`);
@@ -1789,6 +2023,24 @@ const actions = {
     focusLater(btnId);
     announce(`Question ${i + 1} moved to position ${j + 1}.`);
   },
+  'add-accept'(d) {
+    let n = -1;
+    editQuiz((q) => { const qq = q.questions[+d.q]; if (!qq) return; if (!Array.isArray(qq.accept)) qq.accept = ['']; if (qq.accept.length < LIMITS.accept) { qq.accept.push(''); n = qq.accept.length - 1; } }, true);
+    if (n >= 0) focusLater(`q-${d.q}-acc-${n}`);
+  },
+  'remove-accept'(d) {
+    const qi = +d.q, i = +d.i;
+    editQuiz((q) => { const qq = q.questions[qi]; if (qq && Array.isArray(qq.accept) && qq.accept.length > 1) qq.accept.splice(i, 1); }, true);
+    focusLater(`q-${qi}-acc-${Math.max(0, i - 1)}`);
+    announce(`Accepted answer ${i + 1} removed.`);
+  },
+  'pick-picture'(d) { pickPicture(+d.q); },
+  'remove-picture'(d) {
+    const qi = +d.q;
+    editQuiz((q) => { const qq = q.questions[qi]; if (qq) delete qq.image; }, true);
+    focusLater(`q-${qi}-addpic`);
+    announce('Picture removed.');
+  },
   'add-opt'(d) {
     let n = -1;
     editQuiz((q) => { const qq = q.questions[+d.q]; if (qq && qq.options.length < 4) { qq.options.push(''); n = qq.options.length - 1; } }, true);
@@ -1802,7 +2054,8 @@ const actions = {
       qq.options.splice(i, 1);
       // Removing the ticked option clears the tick (-1): validateQuiz then says "tick the correct
       // option" instead of the tick silently landing on whichever option slid into that slot.
-      if (qq.correct === i) qq.correct = -1;
+      if (Array.isArray(qq.correct)) qq.correct = qq.correct.filter((c) => c !== i).map((c) => (c > i ? c - 1 : c));
+      else if (qq.correct === i) qq.correct = -1;
       else if (qq.correct > i) qq.correct -= 1;
     }, true);
     focusLater(`q-${qi}-opt-${Math.max(0, i - 1)}`);
@@ -1933,6 +2186,9 @@ document.addEventListener('input', (e) => {
   if (f === 'title') editQuiz((q) => { q.title = el.value; });
   else if (f === 'q-text') editQuiz((q) => { const qq = q.questions[+el.dataset.q]; if (qq) qq.text = el.value; });
   else if (f === 'opt') editQuiz((q) => { const qq = q.questions[+el.dataset.q]; if (qq) qq.options[+el.dataset.i] = el.value; });
+  else if (f === 'accept') editQuiz((q) => { const qq = q.questions[+el.dataset.q]; if (qq && Array.isArray(qq.accept)) qq.accept[+el.dataset.i] = el.value; });
+  else if (f === 'explanation') editQuiz((q) => { const qq = q.questions[+el.dataset.q]; if (!qq) return; if (el.value === '') delete qq.explanation; else qq.explanation = el.value; });
+  else if (f === 'alt') editQuiz((q) => { const qq = q.questions[+el.dataset.q]; if (qq && qq.image) qq.image.alt = el.value; });
   else if (f === 'passcode') { passcodeDraft = el.value; }
   else if (f === 'rename-draft') { if (state.panel) state.panel.draft = el.value; }
   else if (f === 'players-search') {
@@ -1954,6 +2210,21 @@ document.addEventListener('change', (e) => {
   const qi = +el.dataset.q;
   switch (f) {
     case 'correct': editQuiz((q) => { const qq = q.questions[qi]; if (qq) qq.correct = +el.value; }); break;
+    case 'correct-multi': editQuiz((q) => {
+      const qq = q.questions[qi]; if (!qq) return;
+      const set = new Set(multiCorrect(qq));
+      if (el.checked) set.add(+el.value); else set.delete(+el.value);
+      qq.correct = [...set].sort((a, b) => a - b);
+    }); break;
+    case 'q-type': {
+      const type = QTYPES.some((t) => t.id === el.value) ? el.value : 'single';
+      editQuiz((q) => { const qq = q.questions[qi]; if (qq) setType(qq, type); }, true);
+      focusLater(`q-${qi}-type`);
+      announce(`Question ${qi + 1} is now: ${QTYPES.find((t) => t.id === type).label}.`);
+      break;
+    }
+    case 's-shuffle': state.prefs.settings.shuffle = !!el.checked; savePrefs(); break;
+    case 'g-shuffle': updateSettings({ shuffle: !!el.checked }); break;
     case 'timeLimit': editQuiz((q) => { const qq = q.questions[qi]; const t = +el.value; if (qq && TIME_LIMITS.includes(t)) qq.timeLimit = t; }); break;
     case 'points': editQuiz((q) => { const qq = q.questions[qi]; const p = +el.value; if (qq && POINTS.includes(p)) qq.points = p; }); break;
     case 'all-timers': { const t = +el.value; if (TIME_LIMITS.includes(t)) state.allTimers = t; break; }
@@ -1973,7 +2244,9 @@ document.addEventListener('change', (e) => {
     case 'g-nameMode': if (NAME_MODES.some((m) => m.id === el.value)) updateSettings({ nameMode: el.value, nicknameMode: legacyNick(el.value) }); break;
     case 'g-lock': setLock(!!el.checked); break;
     case 'signin-shared': sharedDraft = !!el.checked; break;
-    default: break;
+    default:
+      if (/^partial-\d+$/.test(f)) { const i = +f.slice(8); editQuiz((q) => { const qq = q.questions[i]; if (qq) qq.partial = !!el.checked; }); }
+      break;
   }
 });
 
@@ -1992,14 +2265,14 @@ $('import-file').addEventListener('change', async () => {
   }
   const items = Array.isArray(data) ? data : [data];
   const ready = [];
-  const dropped = { questions: 0, options: 0, timers: 0, points: 0 };
+  const dropped = { questions: 0, options: 0, timers: 0, points: 0, pollPoints: 0, answers: 0 };
   let foreign = 0;
   for (const item of items) {
     const n = normaliseQuiz(item);
     if (!n) continue;
     // Another app's file (for example {question, choices}) passes the shape check but carries no
     // text this page can read: refuse it instead of importing blank questions (P0-43).
-    if (!n.questions.some((q) => q.text.trim() || q.options.some((o) => o.trim()))) { foreign += 1; continue; }
+    if (!n.questions.some((q) => q.text.trim() || (q.options || []).some((o) => o.trim()) || (q.accept || []).some((a) => a.trim()))) { foreign += 1; continue; }
     for (const k of Object.keys(dropped)) dropped[k] += n.dropped[k];
     ready.push(n);
   }
@@ -2007,6 +2280,23 @@ $('import-file').addEventListener('change', async () => {
     return jsonImportProblem(foreign
       ? `“${name}” is not a HomPub Quiz file: its questions have no text this page can read. If it comes from another quiz app, copy the questions out and use “Paste questions”, or save them in Word and use “Import Word or text”.`
       : `No quiz found in “${name}”. A HomPub Quiz file has a title and a list of questions, as “Export .json” makes it.`);
+  }
+  // Pictures travel in the file as data: they need a signed-in page to be saved to the library.
+  const withData = ready.reduce((k, n) => k + n.questions.filter((qq) => qq.image && qq.image.data).length, 0);
+  if (withData && state.auth.status !== 'in') {
+    const go = await ask({
+      title: 'This file has pictures',
+      body: [`${plural(withData, 'picture')} can be added only while you are signed in. Sign in first and open the file again, or open it now without the pictures that are not already in your library.`],
+      cancel: 'cancel', focus: 'cancel',
+      buttons: [{ id: 'cancel', label: 'Cancel', cls: 'ghost' }, { id: 'go', label: 'Open without them' }],
+    });
+    if (go !== 'go') return;
+  }
+  if (withData) toast('Adding the pictures…');
+  const pics = { kept: 0, uploaded: 0, left: 0 };
+  for (const n of ready) {
+    const r = await importPictures(n.questions);
+    pics.kept += r.kept; pics.uploaded += r.uploaded; pics.left += r.left;
   }
   const added = [];
   for (const n of ready) {
@@ -2021,6 +2311,9 @@ $('import-file').addEventListener('change', async () => {
   }
   if (dropped.timers) msg += ` ${plural(dropped.timers, 'timer was', 'timers were')} not an allowed value and became 20 seconds.`;
   if (dropped.points) msg += ` ${plural(dropped.points, 'points value was', 'points values were')} not 0, 1000 or 2000 and became 1000.`;
+  if (dropped.pollPoints) msg += ` ${plural(dropped.pollPoints, 'poll')} had points, which a poll never gives: now 0.`;
+  if (dropped.answers) msg += ` ${plural(dropped.answers, 'accepted answer')} over the limit of ${LIMITS.accept} per question ${dropped.answers === 1 ? 'was' : 'were'} dropped.`;
+  if (pics.left) msg += ` ${plural(pics.left, 'picture')} could not be added${state.auth.status !== 'in' ? ' (sign in, then open the file again)' : ''}.`;
   if (foreign) msg += ` ${plural(foreign, 'entry', 'entries')} without readable questions ${foreign === 1 ? 'was' : 'were'} left out.`;
   toast(msg, 12000);
   if (added.length === 1) openEditor(added[0].id); else { state.screen = 'home'; render(); }
@@ -2189,27 +2482,189 @@ function addImportedQuiz() {
 // A quiz with fields this page does not know (a newer version's) is exported exactly as stored.
 function exportBody(q) {
   const e = lib && lib.get(q.id);
-  return q.readOnly && e ? Object.assign({}, e.body) : cleanQuiz(q);
+  if (q.readOnly && e) return JSON.parse(JSON.stringify(e.body));
+  const body = cleanQuiz(q);
+  const schema = Math.max(neededSchema(body), e && Number.isInteger(e.body.schema) ? e.body.schema : 1);
+  return schema > 1 ? Object.assign({ schema }, body) : body;
 }
-function exportQuiz(id) {
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => { const fr = new FileReader(); fr.onload = () => resolve(fr.result); fr.onerror = () => reject(fr.error); fr.readAsDataURL(blob); });
+}
+// A file must work on another server, or after the library is gone, so each picture travels inside it
+// as data (beside its key). Returns how many pictures could not be read.
+async function embedPictures(body) {
+  let missing = 0;
+  for (const qq of body.questions || []) {
+    const img = qq && qq.image;
+    if (!img || !img.key || img.data) continue;
+    try {
+      const r = await fetch('/api/images/' + encodeURIComponent(img.key));
+      if (!r.ok) throw new Error(String(r.status));
+      img.data = await blobToDataUrl(await r.blob());
+    } catch (e) { missing += 1; }
+  }
+  return missing;
+}
+function pictureCount(body) { return (body.questions || []).filter((qq) => qq && qq.image && qq.image.key).length; }
+function missingPicturesNote(missing) {
+  return missing ? ` ${plural(missing, 'picture')} could not be read (check the connection) and ${missing === 1 ? 'is' : 'are'} in the file only as a link to this server.` : '';
+}
+async function exportQuiz(id) {
   const q = findQuiz(id); if (!q) return;
   const body = exportBody(q);
+  if (pictureCount(body)) toast('Adding the pictures to the file…');
+  const missing = await embedPictures(body);
   const slug = String(body.title || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'untitled';   // P0-41
   if (!downloadText(JSON.stringify(body, null, 2), `hompub-quiz-${slug}.json`, 'application/json')) return;
-  if (lib && !q.draft) lib.markExported(id);
+  if (lib && !q.draft && !missing) lib.markExported(id);
   render();
-  toast('Exported. Keep that file somewhere safe.');
+  toast('Exported. Keep that file somewhere safe.' + missingPicturesNote(missing), missing ? 10000 : undefined);
 }
 // Export all: a plain array of quizzes, which "Open a quiz file" (and the Phase 1 page) can read back.
-function exportAll() {
+// Built from one part per quiz, so a library with many pictures never becomes one huge string.
+async function exportAll() {
   const list = allQuizzes();
   if (!list.length) { toast('There are no quizzes to export yet.'); return; }
   const d = new Date();
   const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
-  if (!downloadText(JSON.stringify(list.map(exportBody), null, 2), `hompub-quiz-library-${ymd}.json`, 'application/json')) return;
-  for (const q of list) if (lib) lib.markExported(q.id);
+  const parts = ['['];
+  let missing = 0;
+  let pics = 0;
+  for (let i = 0; i < list.length; i++) {
+    const body = exportBody(list[i]);
+    const n = pictureCount(body);
+    if (n) { pics += n; toast(`Adding the pictures to the file… (quiz ${i + 1} of ${list.length})`); }
+    missing += await embedPictures(body);
+    parts.push((i ? ',\n' : '\n') + JSON.stringify(body, null, 2));
+  }
+  parts.push('\n]\n');
+  if (!downloadBlob(new Blob(parts, { type: 'application/json' }), `hompub-quiz-library-${ymd}.json`)) return;
+  if (!missing) for (const q of list) if (lib) lib.markExported(q.id);
   render();
-  toast(`Exported ${plural(list.length, 'quiz', 'quizzes')} in one file. “Open a quiz file” reads it back.`, 7000);
+  toast(`Exported ${plural(list.length, 'quiz', 'quizzes')}${pics ? ` and ${plural(pics, 'picture')}` : ''} in one file. “Open a quiz file” reads it back.` + missingPicturesNote(missing), 9000);
+}
+
+// Pictures in an opened file: data is uploaded (signed in only); a bare key is kept if this server has it.
+// Returns {kept, uploaded, left}: left = pictures that could not be added (the question keeps its text).
+async function importPictures(questions) {
+  const out = { kept: 0, uploaded: 0, left: 0 };
+  for (const qq of questions) {
+    const img = qq.image;
+    if (!img) continue;
+    let key = '';
+    if (img.key && /^[0-9a-f]{64}\.(webp|jpg|png|gif)$/.test(img.key)) {
+      try { if ((await fetch('/api/images/' + img.key, { method: 'HEAD' })).ok) key = img.key; } catch (e) { /* offline: try the data */ }
+    }
+    if (key) out.kept += 1;
+    else if (img.data && state.auth.status === 'in') {
+      try {
+        const blob = await (await fetch(img.data)).blob();
+        const up = await uploadPicture(blob);
+        key = up.key;
+        out.uploaded += 1;
+      } catch (e) { key = ''; }
+    }
+    if (key) qq.image = Object.assign({ key, alt: img.alt }, img.w && img.h ? { w: img.w, h: img.h } : {});
+    else { delete qq.image; out.left += 1; }
+  }
+  return out;
+}
+
+/* ---------- pictures (PROTOCOL §14) ---------- */
+
+function canvasBlob(canvas, type, quality) {
+  return new Promise((resolve) => { try { canvas.toBlob(resolve, type, quality); } catch (e) { resolve(null); } });
+}
+function loadPictureFile(file) {
+  if (typeof createImageBitmap === 'function') {
+    return createImageBitmap(file, { imageOrientation: 'from-image' }).catch(() => createImageBitmap(file));
+  }
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('unreadable')); };
+    img.src = url;
+  });
+}
+// At most 1600 px on the longer side and 1 MB: WebP keeps transparency; a browser that cannot
+// write WebP (Safari) gets JPEG on white. Larger results are scaled down again.
+async function shrinkPicture(file) {
+  let src;
+  try { src = await loadPictureFile(file); } catch (e) { throw new Error('This picture could not be read. Use a JPEG, PNG or WebP picture.'); }
+  const w0 = src.width || src.naturalWidth, h0 = src.height || src.naturalHeight;
+  if (!w0 || !h0) throw new Error('This picture could not be read. Use a JPEG, PNG or WebP picture.');
+  let scale = Math.min(1, LIMITS.picturePx / Math.max(w0, h0));
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const w = Math.max(1, Math.round(w0 * scale)), hgt = Math.max(1, Math.round(h0 * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = hgt;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(src, 0, 0, w, hgt);
+    let blob = await canvasBlob(canvas, 'image/webp', 0.85);
+    if (!blob || blob.type !== 'image/webp') {
+      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, hgt); ctx.drawImage(src, 0, 0, w, hgt);
+      blob = await canvasBlob(canvas, 'image/jpeg', 0.85);
+    }
+    if (blob && blob.size <= LIMITS.pictureBytes) { if (src.close) src.close(); return { blob, w, h: hgt }; }
+    scale *= 0.7;
+  }
+  throw new Error('This picture is too detailed to make small enough. Try a smaller one.');
+}
+async function uploadPicture(blob) {
+  let r;
+  try { r = await fetch('/api/images', { method: 'POST', headers: { 'content-type': blob.type || 'application/octet-stream' }, body: blob }); } catch (e) {
+    throw new Error('The picture could not be sent. Check the connection and try again.');
+  }
+  let body = null;
+  try { body = await r.json(); } catch (e) { body = null; }
+  if (r.status === 401) { state.auth.status = 'out'; throw new Error('Sign in again to add pictures.'); }
+  if (!r.ok || !body || !body.key) throw new Error((body && body.message) || `The picture could not be saved (the server said ${r.status}).`);
+  return body;
+}
+let pictureInput = null;
+let pictureTarget = null;   // {quizId, question}: the question object the chosen picture goes to
+function pickPicture(qi) {
+  const q = findQuiz(state.editorId);
+  if (!q || q.readOnly || !q.questions[qi]) return;
+  if (!pictureInput) {
+    pictureInput = h('input', { type: 'file', accept: 'image/jpeg,image/png,image/webp,image/gif,image/*', hidden: true, id: 'picture-file' });
+    document.body.appendChild(pictureInput);
+    pictureInput.addEventListener('change', () => {
+      const file = pictureInput.files && pictureInput.files[0];
+      pictureInput.value = '';
+      if (file && pictureTarget) addPicture(pictureTarget, file);
+    });
+  }
+  pictureTarget = { quizId: q.id, question: q.questions[qi], qi };
+  pictureInput.click();
+}
+async function addPicture(target, file) {
+  state.uploading = target.qi;
+  render();
+  let up, size;
+  try {
+    const small = await shrinkPicture(file);
+    size = small;
+    up = await uploadPicture(small.blob);
+  } catch (e) {
+    state.uploading = null;
+    render();
+    toast(e.message || 'The picture could not be added.', 8000);
+    announce(e.message || 'The picture could not be added.');
+    return;
+  }
+  state.uploading = null;
+  // The quiz may have changed meanwhile (moved questions, another device): find the same question again.
+  const q = findQuiz(target.quizId);
+  const qi = q ? q.questions.indexOf(target.question) : -1;
+  if (!q || qi < 0 || state.editorId !== target.quizId) { render(); toast('The quiz changed while the picture was being saved. Add it again.'); return; }
+  editQuiz((q2) => {
+    const qq = q2.questions[qi];
+    qq.image = { key: up.key, alt: qq.image && qq.image.alt ? qq.image.alt : '', w: size.w, h: size.h };
+  }, true);
+  focusLater(`q-${qi}-alt`);
+  announce('Picture added. Now describe it.');
 }
 
 /* ---------- network preflight: WebSocket echo ---------- */
@@ -3217,8 +3672,13 @@ const heldUrls = [];
 function releaseUrls() { while (heldUrls.length) { try { URL.revokeObjectURL(heldUrls.pop()); } catch (e) { /* ignore */ } } }
 // Returns true when the download was handed to the browser; whether it saved the file is invisible here.
 function downloadText(text, filename, type) {
+  let blob;
+  try { blob = new Blob([text], { type }); } catch (e) { toast('The download could not start. Use the download button.'); return false; }
+  return downloadBlob(blob, filename);
+}
+function downloadBlob(blob, filename) {
+  const type = blob.type || '';
   try {
-    const blob = new Blob([text], { type });
     const url = URL.createObjectURL(blob);
     const a = h('a', { href: url, download: filename, hidden: true });
     document.body.appendChild(a);

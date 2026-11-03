@@ -726,3 +726,43 @@ a.btn { display: inline-flex; align-items: center; text-decoration: none; }
 
   .center-card { margin: 2vh auto; }
 }
+
+/* ---------- Phase 3: question types, pictures, explanations, long text (PROTOCOL §2, §14) ---------- */
+.q-main { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.q-hint { font-size: clamp(1rem, 2vw, 1.6rem); color: #ffd27a; font-weight: 600; }
+.q-pic { margin: 0; display: flex; justify-content: center; min-width: 0; }
+.q-pic img { display: block; max-width: 100%; max-height: 40vh; width: auto; height: auto; object-fit: contain; border-radius: 12px; background: #ffffff; }
+.typein-panel {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: 24px;
+  border-radius: var(--tile-radius, 16px); border: 3px dashed var(--stage-rule); text-align: center;
+  font-size: clamp(1.3rem, 3vw, 2.6rem); font-weight: 600; color: var(--stage-ink);
+}
+.reveal-typein { border-style: solid; border-color: #ffffff; }
+.reveal-typein .fine { color: var(--stage-ink-soft); font-size: 0.55em; text-transform: uppercase; letter-spacing: 0.08em; }
+.reveal-typein b { color: #ffffff; overflow-wrap: anywhere; }
+.explanation { font-size: clamp(1rem, 2vw, 1.6rem); color: var(--stage-ink); border-left: 4px solid #9fe0b0; padding-left: 12px; overflow-wrap: anywhere; }
+.explanation b { color: #ffffff; }
+.q-text.q-long { font-size: clamp(1.2rem, 3.4vw, 2.8rem); }
+.q-text.q-long2 { font-size: clamp(1.1rem, 2.8vw, 2.3rem); }
+/* Editor */
+.opt-row.no-tick { grid-template-columns: 44px 1fr 44px; }
+.opt-row.acc-row { grid-template-columns: 1fr 44px; }
+.picture-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; }
+.picture-thumb { width: 160px; max-width: 100%; height: auto; max-height: 160px; object-fit: contain; border-radius: 8px; border: 1px solid var(--rule); background: #ffffff; }
+.picture-side { flex: 1 1 240px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+
+@media (min-width: 900px) and (min-height: 540px) {
+  .q-top.has-pic { grid-template-columns: 1fr auto auto; }
+  .q-pic img { max-height: 30vh; max-width: 30vw; }
+  .q-hint { font-size: clamp(0.95rem, 2.6vh, 1.8rem); }
+  .q-text.q-long { font-size: clamp(1.1rem, min(2.6vw, 3.9vh), 3rem); }
+  .q-text.q-long2 { font-size: clamp(1rem, min(2.1vw, 3.2vh), 2.5rem); }
+  .q-text.q-small.q-long { font-size: clamp(0.95rem, min(1.7vw, 2.8vh), 2.4rem); }
+  .q-text.q-small.q-long2 { font-size: clamp(0.9rem, min(1.45vw, 2.4vh), 2rem); }
+  .typein-panel { padding: 2vh; font-size: clamp(1.2rem, 4.4vh, 2.8rem); }
+  .explanation { font-size: clamp(0.9rem, 2.3vh, 1.8rem); }
+  /* A picture takes width from the text: long text beside it steps down once more. */
+  .q-top.has-pic .q-pic img { max-height: 26vh; max-width: 22vw; }
+  .q-top.has-pic .q-text.q-long { font-size: clamp(1rem, min(2.2vw, 3.3vh), 2.6rem); }
+  .q-top.has-pic .q-text.q-long2 { font-size: clamp(0.95rem, min(1.9vw, 2.8vh), 2.2rem); }
+}

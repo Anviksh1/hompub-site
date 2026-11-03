@@ -224,13 +224,15 @@ host.send({ t: 'close' });
 const rev3 = await host.wait((f) => f.t === 'reveal' && f.q === 3, 8000, 'reveal 3');
 const res3 = { A: await A.wait((f) => f.t === 'result' && f.q === 3), B: await B.wait((f) => f.t === 'result' && f.q === 3), C: await C.wait((f) => f.t === 'result' && f.q === 3) };
 assert.deepEqual(rev3.correct, ['Kṛṣṇa', 'Krishna']);
+assert.equal(rev3.explanation, 'He is.');
+assert.equal(res3.A.explanation, 'He is.');
 assert.deepEqual(rev3.counts, []);
 assert.equal(rev3.right, 2);
 assert.equal(res3.A.right, true);
 assert.equal(res3.B.right, true);
 assert.equal(res3.C.right, false);
 assert.equal(res3.C.typed, '=SUM(A1:A9)');
-ok('a typed answer: case, accents and IAST ignored; the accepted answers only at the reveal');
+ok('a typed answer: case, accents and IAST ignored; the accepted answers and the explanation only at the reveal');
 
 const streakBefore = res3.A.streak;
 g = await play(4, async (view) => {

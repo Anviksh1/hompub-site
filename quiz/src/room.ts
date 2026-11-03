@@ -1339,6 +1339,7 @@ export class Room extends DurableObject<Env> {
     return {
       q, type: questionType(question), correct: rightAnswer(question), right: ans ? answerRight(question, ans) : null,
       choice: ans ? ans.c : null, ...(ans?.x !== undefined ? { typed: ans.x } : {}), points: ans ? ans.p : 0,
+      ...(question.explanation ? { explanation: question.explanation } : {}),
       score: p.score, rank: r?.rank ?? playerCount, tied: r?.tied ?? false, streak: p.streak, playerCount,
       ...(q === s.q && s.closedAt !== null ? { closedAt: s.closedAt } : {}),
     };
@@ -1406,6 +1407,7 @@ export class Room extends DurableObject<Env> {
     const sorted = this.sortedPlayers();
     return {
       q: s.q, type: questionType(question), correct: rightAnswer(question), counts, answered, right,
+      ...(question.explanation ? { explanation: question.explanation } : {}),
       expected: this.eligible ? this.eligible.size : this.connectedPids().size,
       fastest, leaderboard: this.leaderboard(sorted, this.rankMap(sorted)), playerCount: active.length,
     };
