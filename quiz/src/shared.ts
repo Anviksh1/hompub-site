@@ -143,6 +143,32 @@ export const LIMITS = {
   awayWrites: 3,                // Focus check rows saved per player per question while it is open
 } as const;
 
+/**
+ * Cut text to at most `max` (counted by `count`: UTF-16 units by default) at a
+ * grapheme boundary, so a vowel sign or virama never loses its letter. A last
+ * cluster ending in a virama or a zero-width joiner (half of a conjunct, where
+ * the runtime's Unicode data splits conjuncts) is dropped too.
+ */
+export function cutText(raw: string, max: number, count: (s: string) => number = (s) => s.length): string {
+  const s = String(raw);
+  if (count(s) <= max) return s;
+  let out = '';
+  const Seg = (Intl as unknown as { Segmenter?: new (l?: string, o?: { granularity: string }) => { segment(t: string): Iterable<{ segment: string }> } }).Segmenter;
+  if (Seg) {
+    for (const { segment } of new Seg(undefined, { granularity: 'grapheme' }).segment(s)) {
+      if (count(out + segment) > max) break;
+      out += segment;
+    }
+  } else {
+    for (const ch of s) { if (count(out + ch) > max) break; out += ch; }
+    out = out.replace(/\p{M}+$/u, '');
+  }
+  return out.replace(/[\u0915-\u0939\u0958-\u095f\u0978-\u097f]?\u094d[\u200c\u200d]?$/u, '').replace(/[\u200c\u200d]+$/u, '');
+}
+
+/** Code points, as names are counted. */
+export const codePoints = (s: string): number => Array.from(s).length;
+
 // ---------------------------------------------------------------- validation
 
 type Ok<T> = { ok: true; value: T };
@@ -412,7 +438,7 @@ export function sanitizeNick(raw: unknown): string {
     .replace(/\s+/g, ' ')
     .replace(/^[=+\-@]+/, '') // a name may not start with a spreadsheet formula trigger
     .trim();
-  return Array.from(cleaned).slice(0, LIMITS.nickChars).join('').trim();
+  return cutText(cleaned, LIMITS.nickChars, codePoints).trim();
 }
 
 // A short, deliberately conservative deny-list. Hits are never shown to anyone:

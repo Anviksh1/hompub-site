@@ -142,13 +142,14 @@ test('every marker form on the option line', () => {
   assert.equal(q(r).correct, 1);
 });
 
-test('"* A." on every option is a bullet, not a marker; two marked options warn', () => {
+test('"* A." on every option is a bullet, not a marker; two marked options make a several-answers question', () => {
   const r = parse('Q?\n* A. one\n* B. two\n* C. three');
   assert.equal(q(r).correct, -1);
   assert.match(messages(r)[0], /no correct answer marked/);
   const r2 = parse('Q?\nA. one *\nB. two *\nC. three');
-  assert.equal(q(r2).correct, 0);
-  assert.match(messages(r2)[0], /more than one option is marked correct \(A, B\); using A/);
+  assert.equal(q(r2).type, 'multi');                 // Phase 3: no longer "using A"
+  assert.deepEqual(q(r2).correct, [0, 1]);
+  assert.match(messages(r2)[0], /A, B are marked right, so it is a question with several right answers/);
 });
 
 test('answer lines: letter, lower-case, Correct:, Key:, text, number, "B) London"', () => {
@@ -173,9 +174,9 @@ test('answer lines that do not resolve, name several answers, or conflict', () =
   r = parse(body + 'Answer: D');
   assert.match(messages(r)[0], /says D but there are only 2 options/);
   r = parse(body + 'Answer: A, B');
-  assert.equal(q(r).correct, -1);
-  assert.match(messages(r)[0], /several answers/);
-  assert.match(messages(r)[1], /no correct answer marked/);
+  assert.equal(q(r).type, 'multi');                  // Phase 3: several right answers
+  assert.deepEqual(q(r).correct, [0, 1]);
+  assert.match(messages(r)[0], /several right answers/);
   r = parse(body + 'Answer: A\nAnswer: B');
   assert.equal(q(r).correct, 1);
   assert.match(messages(r)[0], /several answer lines; using the last/);
@@ -248,7 +249,11 @@ test('points: lines, words, inline tags, snapping', () => {
   assert.equal(q(r).text, 'Q?');
   r = parse('Q? (survey)\nA. a\nB. b');
   assert.equal(q(r).points, 0);
-  assert.equal(q(r).correct, -1); // a survey still reports the missing answer; the editor decides
+  assert.equal(q(r).type, 'poll');                   // Phase 3: nothing marked, so a poll
+  assert.deepEqual(r.warnings, []);
+  r = parse('Q? (survey)\nA. a *\nB. b');
+  assert.equal(q(r).type, undefined);                // marked anyway: a 0-point question with a right answer
+  assert.equal(q(r).correct, 0);
   r = parse('Q? (30s, double points)\nA. a *\nB. b');
   assert.equal(q(r).timeLimit, 30);
   assert.equal(q(r).points, 2000);
@@ -258,12 +263,12 @@ test('points: lines, words, inline tags, snapping', () => {
 
 test('truncation warnings for title, question text and options', () => {
   const long = (n) => 'x'.repeat(n);
-  const r = parse(`${long(90)}\n\n${long(250)}?\nA. ${long(100)} *\nB. b`);
+  const r = parse(`${long(90)}\n\n${long(450)}?\nA. ${long(100)} *\nB. b`);
   assert.equal(r.quiz.title.length, 80);
-  assert.equal(q(r).text.length, 200);
+  assert.equal(q(r).text.length, 400);               // quiz schema 2 allows 400 (Phase 3)
   assert.equal(q(r).options[0].length, 80);
   assert.deepEqual(messages(r), [
-    'Question 1: question text shortened to 200 characters',
+    'Question 1: question text shortened to 400 characters',
     'Question 1: option A shortened to 80 characters',
     'Title shortened to 80 characters.',
   ]);
@@ -525,8 +530,13 @@ test('"Answer: b." with a trailing period, "Answer B" with no colon, "Answer: (b
   }
 });
 
-test('"Answer: B and D" is ambiguous: correct stays -1 with a warning', () => {
-  for (const line of ['Answer: B and D', 'Answer: B & D', 'Key: b, d', 'Answer: A/B', 'Answer: both A and B']) {
+test('"Answer: B and D" names several right answers; "A/B" and "both A and B" stay ambiguous', () => {
+  for (const line of ['Answer: B and D', 'Answer: B & D', 'Key: b, d']) {
+    const r = parse(`Q?\nA. a\nB. b\nC. c\nD. d\n${line}`);
+    assert.equal(q(r).type, 'multi', line);
+    assert.deepEqual(q(r).correct, [1, 3], line);
+  }
+  for (const line of ['Answer: A/B', 'Answer: both A and B']) {
     const r = parse(`Q?\nA. a\nB. b\nC. c\nD. d\n${line}`);
     assert.equal(q(r).correct, -1, line);
     assert.match(messages(r)[0], /names several answers/, line);
@@ -596,7 +606,7 @@ test('trailing whitespace, Windows line endings and tabs between letter and text
 test('very long lines and 250 questions stay fast and bounded', () => {
   const t0 = performance.now();
   let r = parse('Q? ' + 'word '.repeat(5000) + '\nA. ' + 'y'.repeat(20000) + ' *\nB. b');
-  assert.equal(q(r).text.length, 200);
+  assert.equal(q(r).text.length, 400);
   assert.equal(q(r).options[0].length, 80);
   assert.equal(q(r).correct, 0);
   for (const nasty of ['('.repeat(20000), '[x '.repeat(5000), '- '.repeat(20000), 'and '.repeat(20000)]) parse(`Q? ${nasty}\nA. a *\nB. b\nAnswer: ${nasty}`);
@@ -728,4 +738,126 @@ test('docxToText: data descriptors (sizes only in the central directory), ZIP64 
   const cfb = new Uint8Array(1024);
   cfb.set([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
   await assert.rejects(docxToText(cfb.buffer), /old \.doc file or a password-protected/);
+});
+
+// ------------------------------------------------------------------ Phase 3 (PROTOCOL §2, quiz schema 2)
+
+test('Devanagari "(क) (ख)" and Hindi "अ. ब. स. द." option labels', () => {
+  let r = parse('1. भारत की राजधानी क्या है?\n(क) मुंबई\n(ख) नई दिल्ली *\n(ग) कोलकाता\n(घ) चेन्नई');
+  assert.deepEqual(q(r), { text: 'भारत की राजधानी क्या है?', options: ['मुंबई', 'नई दिल्ली', 'कोलकाता', 'चेन्नई'], correct: 1, timeLimit: 20, points: 1000 });
+  r = parse('2. सबसे बड़ा ग्रह?\nअ. पृथ्वी\nब) बृहस्पति\n(स) मंगल\nद: शुक्र\nउत्तर: ब');
+  assert.deepEqual(q(r).options, ['पृथ्वी', 'बृहस्पति', 'मंगल', 'शुक्र']);
+  assert.equal(q(r).correct, 1);
+  assert.deepEqual(r.warnings, []);
+  // A word that merely starts with one of these letters is not a label.
+  r = parse('सब कुछ ठीक है?\nअ. हाँ *\nब. नहीं');
+  assert.equal(q(r).text, 'सब कुछ ठीक है?');
+});
+
+test('"a)text" with no space, "A - text", and roman "I." to "IV."', () => {
+  let r = parse('Q?\na)Paris *\nb)London\nc)Rome');
+  assert.deepEqual(q(r).options, ['Paris', 'London', 'Rome']);
+  assert.equal(q(r).correct, 0);
+  r = parse('Q?\nA - Paris\nB – London *\nC — Rome');
+  assert.deepEqual(q(r).options, ['Paris', 'London', 'Rome']);
+  assert.equal(q(r).correct, 1);
+  r = parse('Which is right?\nI. first\nII. second *\nIII. third\nIV. fourth');
+  assert.deepEqual(q(r).options, ['first', 'second', 'third', 'fourth']);
+  assert.equal(q(r).correct, 1);
+  // "e.g." and "a.m." stay text: lower-case with "." still needs a space.
+  r = parse('e.g. this is a question?\nA. a *\nB. b');
+  assert.equal(q(r).text, 'e.g. this is a question?');
+});
+
+test('a blank line inside a question: before the options, and between them', () => {
+  let r = parse('1. Which is a mammal?\n\nA. Shark\n\nB. Whale *\n\nC. Trout\n\n2. Next?\nA. x *\nB. y');
+  assert.equal(r.quiz.questions.length, 2);
+  assert.deepEqual(q(r).options, ['Shark', 'Whale', 'Trout']);
+  assert.equal(q(r).correct, 1);
+  assert.deepEqual(r.warnings, []);
+  // Letters that start again ("A." after "C.") are a new block, as before.
+  r = parse('1. One?\nA. a *\nB. b\n\nA. c\nB. d');
+  assert.equal(r.skipped, 0);
+  assert.equal(r.quiz.questions.length, 2);
+});
+
+test('Zero-width joiners stay in Devanagari text; IAST passes through', () => {
+  const zwj = 'क्‍ष';            // a half form chosen with a joiner
+  const zwnj = 'श्‌च';
+  const r = parse(`${zwj} या ${zwnj}?\nA. Kṛṣṇa *\nB. Śiva`);
+  assert.equal(q(r).text, `${zwj} या ${zwnj}?`);
+  assert.deepEqual(q(r).options, ['Kṛṣṇa', 'Śiva']);
+  // Zero-width spaces and byte-order marks are still removed.
+  assert.equal(q(parse('Wo​rd﻿?\nA. a *\nB. b')).text, 'Word?');
+});
+
+test('cutting long Devanagari text never leaves half a letter', () => {
+  const long = 'नमस्ते '.repeat(80);   // 7 units each
+  const r = parse(`${long}?\nA. a *\nB. b`);
+  const text = q(r).text;
+  assert.ok(text.length <= 400);
+  assert.doesNotMatch(text, /[्ा-ौँ-ः]$/u, 'no lone sign at the end');
+  assert.match(messages(r)[0], /shortened to 400 characters/);
+});
+
+test('several marked options, a typed answer, and a poll become the Phase 3 types', () => {
+  const r = parse([
+    '1. Which are prime?', 'A. 2 *', 'B. 4', 'C. 5 *', '',
+    '2. Capital of France?', 'Answer: Paris / Paree', '',
+    '3. Did you enjoy it? (poll)', 'A. Yes', 'B. No', '',
+    '4. Practice question (survey)', 'A. a *', 'B. b',
+  ].join('\n'));
+  assert.equal(r.quiz.questions.length, 4);
+  assert.deepEqual(q(r, 0), { type: 'multi', text: 'Which are prime?', options: ['2', '4', '5'], correct: [0, 2], partial: false, timeLimit: 20, points: 1000 });
+  assert.deepEqual(q(r, 1), { type: 'typein', text: 'Capital of France?', accept: ['Paris', 'Paree'], timeLimit: 20, points: 1000 });
+  assert.deepEqual(q(r, 2), { type: 'poll', text: 'Did you enjoy it?', options: ['Yes', 'No'], timeLimit: 20, points: 0 });
+  assert.deepEqual(q(r, 3), { text: 'Practice question', options: ['a', 'b'], correct: 0, timeLimit: 20, points: 0 });
+  assert.match(messages(r).join(' | '), /Question 2: no options, so it is a typed-answer question/);
+});
+
+function docxOf(body) {
+  return makeZip([
+    { name: '[Content_Types].xml', data: CONTENT_TYPES, deflate: false },
+    { name: 'word/document.xml', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document ${W} xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><w:body>${body}<w:sectPr/></w:body></w:document>`, deflate: true },
+  ]);
+}
+const cell = (s) => `<w:tc><w:p>${s ? t(s) : ''}</w:p></w:tc>`;
+
+test('Word tables: "label | text | mark" rows read as one line each', async () => {
+  const doc = docxOf(
+    `<w:tbl><w:tr>${cell('1')}${cell('Which organelle makes ATP?')}${cell('')}</w:tr>`
+    + `<w:tr>${cell('A')}${cell('Ribosome')}${cell('')}</w:tr>`
+    + `<w:tr>${cell('B')}${cell('Mitochondrion')}${cell('✓')}</w:tr>`
+    + `<w:tr>${cell('(c)')}${cell('Golgi body')}${cell('')}</w:tr></w:tbl>`
+    + `<w:p/><w:tbl><w:tr>${cell('2. Which gas do plants take in?')}</w:tr>`
+    + `<w:tr>${cell('a)')}${cell('Oxygen')}${cell('')}</w:tr><w:tr>${cell('b)')}${cell('Carbon dioxide')}${cell('*')}</w:tr></w:tbl>`
+    + `<w:tbl><w:tr>${cell('Paris')}${cell('✓')}</w:tr><w:tr>${cell('A. True')}${cell('B. False')}</w:tr></w:tbl>`,
+  );
+  const text = await docxToText(doc);
+  assert.deepEqual(text.split('\n').filter(Boolean), [
+    '1. Which organelle makes ATP?', 'A. Ribosome', 'B. Mitochondrion ✓', '(c) Golgi body',
+    '2. Which gas do plants take in?', 'a) Oxygen', 'b) Carbon dioxide *',
+    'Paris ✓', 'A. True', 'B. False',          // a mark column joins; whole lines in cells stay apart
+  ]);
+  const r = parse(text.split('\n').slice(0, 9).join('\n'));
+  assert.equal(r.quiz.questions.length, 2);
+  assert.deepEqual(q(r, 0).options, ['Ribosome', 'Mitochondrion', 'Golgi body']);
+  assert.equal(q(r, 0).correct, 1);
+  assert.equal(q(r, 1).correct, 1);
+});
+
+test('Word: an equation or a picture that cannot be imported is reported on its question', async () => {
+  const math = '<m:oMath><m:r><m:t>x²+1</m:t></m:r></m:oMath>';
+  const pic = '<w:r><w:drawing><a:graphic><a:graphicData><a:blip r:embed="rId5"/></a:graphicData></a:graphic></w:drawing></w:r>';
+  const doc = docxOf(
+    `<w:p>${t('1. Solve ')}${math}${t(' for x?')}</w:p><w:p>${t('A. 1 *')}</w:p><w:p>${t('B. 2')}</w:p><w:p/>`
+    + `<w:p>${t('2. What does this show?')}</w:p><w:p>${pic}</w:p><w:p>${t('A. A cell *')}</w:p><w:p>${t('B. A star')}</w:p>`,
+  );
+  const r = parse(await docxToText(doc));
+  assert.equal(r.quiz.questions.length, 2);
+  assert.equal(q(r, 0).text, 'Solve for x?');
+  const m = messages(r).join(' | ');
+  assert.match(m, /Question 1: an equation was left out/);
+  assert.match(m, /Question 2: a picture, chart or embedded object was left out/);
+  assert.doesNotMatch(m, /Question 1: a picture/);
 });

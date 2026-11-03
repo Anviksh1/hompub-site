@@ -35,9 +35,10 @@
   --opt-2-edge: #b07f00;     /* the yellow tile's edge, 3.4:1 against the page (P0-31) */
   --opt-border: transparent;
 
-  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
-  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  /* Noto Devanagari first: it covers only Devanagari (fonts.css unicode-range), so other text keeps the system font. */
+  --font-ui: "Noto Sans Devanagari", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-display: "Noto Serif Devanagari", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", "Noto Sans Devanagari", monospace;
   --radius: 16px;
   --gutter-l: max(16px, env(safe-area-inset-left));    /* notched phones in landscape (P0-29) */
   --gutter-r: max(16px, env(safe-area-inset-right));

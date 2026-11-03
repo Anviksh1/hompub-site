@@ -23,6 +23,8 @@ import {
   normalizeAnswer,
   typedRight,
   cleanTyped,
+  cutText,
+  codePoints,
   quizSchema,
   questionType,
   validateQuiz,
@@ -396,4 +398,20 @@ test('shuffle is off by default and kept through settings', () => {
   assert.equal(DEFAULT_SETTINGS.shuffle, false);
   assert.equal(normalizeSettings({ shuffle: true }).shuffle, true);
   assert.equal(mergeSettings(DEFAULT_SETTINGS, { shuffle: true }, false).shuffle, true);
+});
+
+test('cutText cuts between letters: no lone vowel sign, virama or half conjunct', () => {
+  assert.equal(cutText('Hello', 10), 'Hello');
+  assert.equal(cutText('नमस्ते दुनिया', 4), 'नम');            // never "नमस्" (half of स्त)
+  assert.equal(cutText('कि', 1), '');                        // the vowel sign never stands alone
+  assert.equal(cutText('क्षमा', 2), '');
+  assert.equal(cutText('क्षमा', 3), 'क्ष');
+  assert.equal(cutText('Kṛṣṇa', 3), 'Kṛ');   // IAST written with combining dots
+  assert.equal(cutText('a😀b', 2), 'a');                      // never half a surrogate pair
+  assert.equal(cutText('क्‍ष', 3), '');
+  // Names count code points: 20 at most, cut between letters.
+  const name = 'कृष्णकृष्णकृष्णकृष्ण';                         // 4 × 5 = 20 code points
+  assert.ok(codePoints(cutText(name + 'क', 20, codePoints)) <= 20);
+  assert.equal(sanitizeNick('अर्जुन कृष्ण मुरारी गोपाल'), cutText('अर्जुन कृष्ण मुरारी गोपाल', 20, codePoints).trim());
+  assert.doesNotMatch(sanitizeNick('अर्जुन कृष्ण मुरारी गोपाल'), /[्ा-ौ]$/u.source === '' ? /^$/ : /्$/u);
 });

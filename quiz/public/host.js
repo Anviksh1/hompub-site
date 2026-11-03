@@ -875,7 +875,8 @@ function renderPasteForm(imp) {
         h('span', null, 'Format example'),
         h('pre', { class: 'format-example' }, IMPORT_EXAMPLE),
         h('p', { class: 'fine' },
-          'Numbers and letters are optional. Timer: “(30s)” at the end of a question. Points: a line “Points: 2000” for double points or “Points: 0” for a survey question. ',
+          'Numbers and letters are optional (A., a), (क), अ., I.). Timer: “(30s)” at the end of a question. Points: a line “Points: 2000” for double points or “Points: 0” for no points. ',
+          'Mark two or more options for a question with several right answers; write only an “Answer: Paris” line, with no options, for a typed answer; add “(poll)” for a poll. ',
           h('a', { href: 'template-questions.docx', download: true }, 'Download the Word template'), ' to see it laid out in Word.'))),
     imp.error && h('div', { class: 'notice bad', role: 'alert' }, imp.error),
     h('div', { class: 'btn-row end importer-actions' },
@@ -955,22 +956,28 @@ function renderImportWarnings(warnings) {
 
 function renderPreviewQuestion(qq, i, warnings) {
   const notes = warnings.filter((w) => w.question === i + 1).map((w) => bareWarning(w.message));
-  const unmarked = qq.correct < 0;
+  const type = qType(qq);
+  const right = type === 'multi' ? multiCorrect(qq) : type === 'single' ? [qq.correct] : [];
+  const unmarked = (type === 'single' && qq.correct < 0) || (type === 'multi' && !right.length);
   if (unmarked && !notes.some((m) => /correct/i.test(m))) notes.push('No correct answer marked — tick it in the editor.');
+  const kind = type === 'multi' ? 'several right answers' : type === 'typein' ? 'typed answer' : type === 'poll' ? 'poll' : '';
   return h('section', { class: 'card q-card preview-q' + (unmarked ? ' needs-answer' : ''), 'aria-label': `Question ${i + 1}` },
     h('div', { class: 'q-head' },
       h('h3', null, `Question ${i + 1}`),
       h('div', { class: 'tags' },
+        kind ? h('span', { class: 'tag mono' }, kind) : null,
         h('span', { class: 'tag mono' }, `${qq.timeLimit} s`),
-        h('span', { class: 'tag mono' }, qq.points === 0 ? 'survey · 0 pts' : `${fmtInt(qq.points)} pts`))),
+        h('span', { class: 'tag mono' }, type === 'poll' ? '0 pts' : qq.points === 0 ? 'practice · 0 pts' : `${fmtInt(qq.points)} pts`))),
     h('p', { class: 'preview-text' }, qq.text),
-    h('ol', { class: 'preview-opts' }, qq.options.map((o, j) => {
-      const correct = j === qq.correct;
-      return h('li', { class: 'preview-opt' + (correct ? ' is-correct' : '') },
-        swatch(j),
-        h('span', { class: 'text' }, o),
-        correct ? checkIcon() : null);
-    })),
+    type === 'typein'
+      ? h('p', { class: 'fine' }, 'Accepted: ', h('b', null, (qq.accept || []).filter(Boolean).join(' · ') || '—'))
+      : h('ol', { class: 'preview-opts' }, (qq.options || []).map((o, j) => {
+        const correct = right.includes(j);
+        return h('li', { class: 'preview-opt' + (correct ? ' is-correct' : '') },
+          swatch(j),
+          h('span', { class: 'text' }, o),
+          correct ? checkIcon() : null);
+      })),
     notes.length ? h('ul', { class: 'problems' }, notes.map((m) => h('li', null, m))) : null);
 }
 

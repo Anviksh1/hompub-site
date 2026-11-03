@@ -618,7 +618,19 @@ function randomId() {
   return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
 }
 // Cut by characters (code points), as the server does, not UTF-16 units.
-const cutName = (text) => Array.from(String(text || '').trim()).slice(0, NAME_MAX).join('').trim();
+// At most NAME_MAX code points, cut between letters (Intl.Segmenter): a vowel sign or virama keeps its letter.
+const cutName = (text) => cutText(String(text || '').trim(), NAME_MAX, (s) => Array.from(s).length).trim();
+function cutText(s, max, count) {
+  if (count(s) <= max) return s;
+  let out = '';
+  if (typeof Intl !== 'undefined' && Intl.Segmenter) {
+    for (const { segment } of new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(s)) { if (count(out + segment) > max) break; out += segment; }
+  } else {
+    for (const ch of s) { if (count(out + ch) > max) break; out += ch; }
+    out = out.replace(/\p{M}+$/u, '');
+  }
+  return out.replace(/[\u0915-\u0939\u0958-\u095f\u0978-\u097f]?\u094d[\u200c\u200d]?$/u, '').replace(/[\u200c\u200d]+$/u, '');
+}
 
 function openSocket() {
   if (sock) { sock.reconnectNow(); return; }

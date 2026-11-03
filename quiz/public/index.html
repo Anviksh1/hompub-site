@@ -9,19 +9,21 @@
 <meta name="robots" content="noindex">
 <!--
   HomPub Quiz join page. MIT licence.
-  Self-contained on purpose: system fonts only, no web fonts, no external
-  scripts, so a classroom of phones makes exactly one connection (to this host).
+  Self-contained on purpose: system fonts only, no external scripts or fonts, so a
+  classroom of phones makes connections only to this host. The one web font, Noto
+  Devanagari (from this site), loads only when the page shows Devanagari.
   Contract: quiz/PROTOCOL.md §1 (GET /api/room/:pin, /play?pin=).
 -->
+<link rel="stylesheet" href="/fonts/fonts.css">
 <style>
   :root {
     --paper: #fbf9fe; --paper-raised: #f3eef9; --ink: #241e33; --ink-soft: #5c5470;
     --accent: #6650a4; --accent-strong: #4a3580; --on-accent: #ffffff; --rule: #e1d9ec;
     --hero-bg-1: #1c1730; --hero-bg-2: #4a3580; --hero-glow: rgba(180,150,255,0.30);
     --hero-ink: #f4f0fb; --hero-ink-soft: #beb2dd; --bad: #b3261e;
-    --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-    --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
-    --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --font-ui: "Noto Sans Devanagari", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-display: "Noto Serif Devanagari", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+    --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", "Noto Sans Devanagari", monospace;
     color-scheme: light dark;
   }
   @media (prefers-color-scheme: dark) {
