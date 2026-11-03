@@ -1282,7 +1282,10 @@ function recapText(r) {
   const label = `Question ${r.q + 1}`;
   const answered = r.choice != null || typeof r.typed === 'string';
   if (!answered) return `${label}: Not answered`;
-  if (r.survey === true || ui.qPoints[r.q] === 0 || typeof r.right !== 'boolean') return `${label}: Answer recorded`;   // a poll or survey question
+  // A poll has no right answer. Protocol 4 says the type, and a 0-point question with a right answer then
+  // says whether it was right, as its result screen does; an older server only says `survey`.
+  const poll = r.type === 'poll' || (r.type === undefined && (r.survey === true || ui.qPoints[r.q] === 0));
+  if (poll || typeof r.right !== 'boolean') return `${label}: Answer recorded`;
   if (!r.right) return r.points > 0 ? `${label}: Partly right, +${fmt(r.points)}` : `${label}: Not correct`;
   return `${label}: Correct, ` + (r.points > 0 ? `+${fmt(r.points)}` : 'no points');
 }
