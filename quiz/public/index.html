@@ -195,11 +195,14 @@
   }
 
   // Pasted text such as "123 456", "123-456", " 123456" or "PIN: 123456" lands as the six digits
-  // (P0-01): separators between digits are dropped, then a 6-digit PIN is picked out of the text.
+  // (P0-01). A clean 6-digit PIN in the text as it is wins ("Room 12 482913" gives 482913); otherwise
+  // separators between digits are dropped, and every digit is kept, so only exactly six digits can be
+  // sent: a seventh typed digit or a longer number gets a message, never a guess.
   function pinFrom(text) {
-    var joined = String(text).replace(/(\d)[\s.\u2010-\u2015-]+(?=\d)/g, '$1');
-    var m = joined.match(/(?:^|\D)([1-9]\d{5})(?!\d)/);
-    return m ? m[1] : joined.replace(/\D/g, '').slice(0, 6);
+    var raw = String(text);
+    var m = raw.match(/(?:^|\D)([1-9]\d{5})(?!\d)/);
+    if (m) return m[1];
+    return raw.replace(/(\d)[\s.\u2010-\u2015-]+(?=\d)/g, '$1').replace(/\D/g, '');
   }
 
   // Player entries this phone holds, newest first; stale ones are removed (P0-13).
@@ -258,7 +261,7 @@
   async function go(pin) {
     if (busy) return;
     if (!PIN_RE.test(pin)) {
-      say(pin.length < 6 ? 'Enter all 6 digits of the PIN.' : 'No game with that PIN.');
+      say(pin.length < 6 ? 'Enter all 6 digits of the PIN.' : pin.length > 6 ? 'A game PIN has exactly 6 digits. Check it and try again.' : 'No game with that PIN.');
       input.focus();
       return;
     }

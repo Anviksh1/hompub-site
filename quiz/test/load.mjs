@@ -634,8 +634,10 @@ class Player {
       if (me.score !== 0) violate(`${this.tag}: score ${me.score} while still in the lobby`);
       this.runningScore = 0; this.runningQ = -1;
     } else if (s.phase === 'intro' || s.phase === 'open') {
-      // me.score already includes the current question once me.answered is true.
-      this.runningScore = me.score; this.runningQ = me.answered === true ? s.q : s.q - 1;
+      // While a question is starting or open, me.score is the score before it, answered or not, and the
+      // streak is withheld once answered: nothing may tell a player whether the answer was right (§4.3).
+      if (me.answered === true && me.streak !== null) violate(`${this.tag}: sync during question ${s.q + 1} shows streak ${me.streak} after answering`);
+      this.runningScore = me.score; this.runningQ = s.q - 1;
     } else if (s.phase === 'podium' || s.phase === 'ended') {
       this.runningScore = me.score; this.runningQ = game.N - 1;
     }

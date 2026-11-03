@@ -430,8 +430,12 @@ function render() {
   const active = document.activeElement;
   const hadFocus = !!(active && active !== document.body && app.contains(active));
   const focusedId = hadFocus ? active.id : '';
+  // The caret in a text field, so a rebuild in the middle of typing does not move it.
+  let caret = null;
+  try { if (hadFocus && typeof active.selectionStart === 'number') caret = [active.selectionStart, active.selectionEnd]; } catch (e) { caret = null; }
   const menu = $('stage-menu');
   const menuOpen = !!(menu && menu.open);
+  const openDetails = Array.from(app.querySelectorAll('details[id]')).filter((d) => d.open && d.id !== 'stage-menu').map((d) => d.id);
 
   let view;
   switch (phase) {
@@ -459,6 +463,7 @@ function render() {
   // Re-open the Options menu BEFORE focus goes back: focus inside a closed <details> is lost (P0-63).
   const menu2 = $('stage-menu');
   if (menu2 && menuOpen) menu2.open = true;
+  for (const id of openDetails) { const d = $(id); if (d) d.open = true; }   // the Trash, "What it cannot do"
 
   let restored = false;
   if (focusedId) {
@@ -466,6 +471,7 @@ function render() {
     if (el) {
       try { el.focus({ preventScroll: true }); } catch (e) { /* ignore */ }
       restored = document.activeElement === el;
+      if (restored && caret) { try { el.setSelectionRange(caret[0], caret[1]); } catch (e) { /* not a text field */ } }
     }
   }
   // Focus that could not be handed back falls to <body>; mute the Space/Enter shortcut briefly so a
@@ -874,6 +880,7 @@ function renderPreviewQuestion(qq, i, warnings) {
 function renderEditor() {
   const q = findQuiz(state.editorId);
   if (!q) { state.screen = 'home'; return renderHome(); }
+  state.editorBody = editorBodyOf(state.editorId);
   const total = q.questions.length;
   const allTimers = TIME_LIMITS.includes(state.allTimers) ? state.allTimers : ((q.questions[0] && q.questions[0].timeLimit) || 20);
   const issues = q.readOnly ? new Map() : fieldIssues(q);
@@ -1071,7 +1078,7 @@ function renderFocusSetting(s) {
     toggle('s-focusCheck', !!s.focusCheck, 'Show me who leaves the quiz page during a question',
       'Phones report when a student switches app or tab, minimises, or locks the screen while a question is open, and for how long. When questions are shown on phones, copying the question is blocked too. You see it in “All players” and in the results file; after each question the screen shows only how many left, never names.'),
     h('p', { class: 'fine' }, 'Students see this on their phones whenever it is on: “', FOCUS_NOTICE, '”'),
-    h('details', { class: 'fine' },
+    h('details', { class: 'fine', id: 'focus-limits' },
       h('summary', null, 'What it cannot do'),
       h('ul', { class: 'problems' },
         h('li', null, 'It cannot see a second phone, a photo of the projector, or a friend helping.'),
@@ -1329,7 +1336,8 @@ function playerRows() {
   const g = state.game;
   const q = (state.panel && state.panel.q || '').trim().toLowerCase();
   let roster = (Array.isArray(g.roster) ? g.roster : []).filter((p) => !q || String(p.nick).toLowerCase().includes(q));
-  if (state.focusFilter) roster = roster.filter((p) => { const f = focusSummary(p.pid); return f.n > 0 || f.copies > 0; });
+  // The filter applies only while its button is shown (Focus check on, or records to show).
+  if (state.focusFilter && (focusRecords().size || focusOn(g))) roster = roster.filter((p) => { const f = focusSummary(p.pid); return f.n > 0 || f.copies > 0; });
   if (!roster.length) return [h('li', { class: 'empty', id: 'row-empty' }, q ? 'No player matches that search.' : state.focusFilter ? 'Nobody has left the page.' : 'No players yet.')];
   // After End only names can still change (the results file follows); an older server cannot rename or lock.
   const ended = g.phase === 'ended';
@@ -1665,12 +1673,21 @@ function openEditor(id, focusId) {
 }
 
 // Mutate the quiz being edited, store it, then either rebuild (structural change) or just refresh the status line.
+// A new quiz's first edit makes it a real quiz: rebuilt once, so the heading, Host and Export follow (P0-35).
 function editQuiz(mutate, structural) {
   const q = findQuiz(state.editorId);
   if (!q || q.readOnly) return;
   mutate(q);
+  const wasDraft = q.draft;
   const saved = saveQuiz(q);
-  if (structural) render(); else refreshEditorStatus(q, saved);
+  if (structural || wasDraft) render(); else refreshEditorStatus(findQuiz(state.editorId), saved);
+}
+// The body object the editor's form was built from: when the library replaces it (another device's
+// edit, another tab, a restore from backup), the form must be rebuilt before the next keystroke lands.
+function editorBodyOf(id) {
+  if (state.draft && state.draft.id === id) return state.draft.body;
+  const e = lib && lib.get(id);
+  return e ? e.body : null;
 }
 
 // "Title (copy)", then "Title (copy 2)", "(copy 3)"… — never "(copy) (copy)" (P0-41).
@@ -1743,6 +1760,7 @@ const actions = {
   },
   'sync-now'() { if (lib && state.auth.status === 'in') lib.sync(); else if (state.auth.status !== 'in') { state.auth.status = 'out'; render(); focusLater('passcode'); } },
   'notice-dismiss'(d) { if (!lib) return; const n = lib.notices()[+d.i]; if (n) lib.dismissNotice(n); render(); },
+  'conflict-open'() { conflictSnoozed.clear(); lastTypedAt = 0; maybeAskConflict(); },
   'backup-download'(d) { downloadBackup(d.key); },
   'add-question'() {
     let at = -1;
@@ -1911,6 +1929,7 @@ document.addEventListener('input', (e) => {
   const el = e.target;
   const f = el && el.dataset ? el.dataset.field : null;
   if (!f) return;
+  lastTypedAt = Date.now();
   if (f === 'title') editQuiz((q) => { q.title = el.value; });
   else if (f === 'q-text') editQuiz((q) => { const qq = q.questions[+el.dataset.q]; if (qq) qq.text = el.value; });
   else if (f === 'opt') editQuiz((q) => { const qq = q.questions[+el.dataset.q]; if (qq) qq.options[+el.dataset.i] = el.value; });
@@ -2296,7 +2315,8 @@ async function signOut() {
   const r = heldResults(g);
   if (r && !r.downloaded && !gameWasCancelled(g) && !(await confirmBox('Sign out without the results?', 'The results file has not been downloaded, and this page holds the only copy.', 'Sign out anyway', { danger: true }))) return;
   if (lib && lib.pendingCount()) {
-    await lib.sync(false);                                   // one last try before the cookie goes
+    // One last try before the cookie goes, but never more than 10 s.
+    await Promise.race([lib.sync(false), new Promise((r) => setTimeout(r, 10000))]);
     if (lib.pendingCount() && !(await confirmBox('Some changes are not in your library yet', `${plural(lib.pendingCount(), 'quiz', 'quizzes')} changed on this device could not be saved to your library just now. They stay in this browser and are saved when you sign in here again.`, 'Sign out anyway'))) return;
   }
   // The cookie is HttpOnly: only the server can clear it, so a failed request means still signed in.
@@ -2311,6 +2331,10 @@ async function signOut() {
   state.liveRooms = [];
   // The quizzes are in the library; leave no copy on this computer unless a change is still waiting.
   const cleared = lib ? lib.clearCache() : true;
+  // Copies set aside earlier (before a restore, or data that could not be read) hold quizzes too.
+  if (cleared && lib && lib.backupKeys().length && await confirmBox('Delete the copies set aside on this computer?',
+    `This browser also keeps ${plural(lib.backupKeys().length, 'copy', 'copies')} set aside earlier (before a restore from backup, or saved data that could not be read). They hold quiz questions and answers.`,
+    'Delete them', { cancelLabel: 'Keep them' })) lib.removeBackups();
   if (lib) lib.setStatus('signin');
   toast(cleared ? 'Signed out on this device. Your quizzes stay in your library.' : 'Signed out. Changes not yet saved stay in this browser until you sign in here again.', 6000);
   render();
@@ -2432,6 +2456,8 @@ function createErrorMessage(status, body) {
 // session is also checked by the Worker, so a device without the token (resume elsewhere) gets in too.
 function connectHost(key) {
   if (socket) { socket.close(); socket = null; }
+  if (conflictAsking && askOpen) askOpen('__replaced');       // a library question never stays over the stage
+  state.focusFilter = false;
   state.game = { pin: key.pin, title: key.title || '', hostToken: key.hostToken };   // minimal until the first sync
   state.closeInfo = null; state.wiped = false; state.busy = false; state.error = null; state.reauth = false;
   state.pending = null; state.storageError = ''; state.panel = null; state.limitedUntil = 0;
@@ -2700,6 +2726,7 @@ function finishWipe() {
 function leaveGame() {
   if (socket) { socket.close(); socket = null; }
   releaseUrls();
+  state.focusFilter = false;
   state.game = null; state.closeInfo = null; state.wiped = false; state.results = null;
   state.reauth = false; state.panel = null; state.pending = null; state.autoResume = false; state.storageError = '';
   state.limitedUntil = 0;
@@ -3042,19 +3069,36 @@ function libChanged() {
   if (isLive() || state.game) return;                         // the projector shows the game, not the library
   const phase = currentPhase();
   if (phase === 'editor') {
-    // Never rebuild the form under the teacher's fingers: only the status lines change, unless the quiz went away.
+    // Only the status lines change, unless the quiz went away or its content was replaced (then
+    // the form shows the new version at once, so no keystroke is applied to an old copy).
     if (!findQuiz(state.editorId)) { state.screen = 'home'; scheduleRender(); }
-    else refreshEditorStatus(findQuiz(state.editorId));
+    else if (editorBodyOf(state.editorId) !== state.editorBody) {
+      render();
+      toast('This quiz was changed on another device or tab; the editor now shows that version.', 6000);
+    } else refreshEditorStatus(findQuiz(state.editorId));
   } else if (!state.importer) scheduleRender();
   maybeAskConflict();
 }
 
-// One choice at a time, never over a live game, never over the import dialog.
+// One choice at a time, never over a live game or the import dialog, and never in the middle of typing:
+// it waits for a 3-second pause. Focus starts on the choice that loses nothing. Escape puts it off for
+// two minutes; the banner on the quiz list ("needs your choice") opens it again at once.
 let conflictAsking = false;
+let conflictTimer = null;
+let lastTypedAt = 0;
+const conflictSnoozed = new Map();   // id -> when the teacher put it off
+const CONFLICT_SNOOZE_MS = 2 * 60 * 1000;
+const SAFE_CHOICE = { conflict: 'copy', deleted: 'copy', newer: 'copy', migrate: 'copy', gone: 'mine', edited: 'theirs' };
 async function maybeAskConflict() {
   if (!lib || conflictAsking || state.game || state.importer) return;
-  const c = lib.conflicts()[0];
+  const now = Date.now();
+  const c = lib.conflicts().find((x) => !(now - (conflictSnoozed.get(x.id) || 0) < CONFLICT_SNOOZE_MS));
   if (!c) return;
+  if (now - lastTypedAt < 3000) {
+    clearTimeout(conflictTimer);
+    conflictTimer = setTimeout(maybeAskConflict, 3000 - (now - lastTypedAt) + 50);
+    return;
+  }
   conflictAsking = true;
   const mineTitle = (c.mine && c.mine.title) || 'Untitled quiz';
   const theirTitle = c.server && c.server.body ? c.server.body.title || 'Untitled quiz' : '';
@@ -3077,8 +3121,10 @@ async function maybeAskConflict() {
     default: o = { title: 'This quiz was changed on another device', body: ['Both this browser and another device changed it. Nothing is overwritten until you choose.', copies('This browser', 'Other device')],
       buttons: [{ id: 'theirs', label: 'Use theirs', cls: 'ghost' }, { id: 'copy', label: 'Save mine as a copy' }, { id: 'mine', label: 'Keep mine', cls: 'primary' }] };
   }
-  const choice = await ask(Object.assign(o, { cancel: null }));
+  const choice = await ask(Object.assign(o, { cancel: null, focus: SAFE_CHOICE[c.kind] || 'copy' }));
   conflictAsking = false;
+  if (!choice) { conflictSnoozed.set(c.id, Date.now()); render(); return; }
+  conflictSnoozed.delete(c.id);
   if (choice) {
     const copy = lib.resolve(c.id, choice);
     if (copy) toast(`Saved as “${copy.body.title}”.`);
@@ -3092,6 +3138,13 @@ async function maybeAskConflict() {
 function renderLibNotices() {
   if (!lib) return h('div', { class: 'notice bad', role: 'alert' }, 'The quiz library (library.js) did not load. Reload the page; nothing can be saved until then.');
   const out = [];
+  const waiting = lib.conflicts().length;
+  if (waiting && !state.game) {
+    out.push(h('div', { class: 'notice', role: 'status' },
+      h('b', null, `${plural(waiting, 'quiz needs', 'quizzes need')} your choice`),
+      h('p', { class: 'fine' }, 'It was changed in two places. Nothing is overwritten until you choose which version to keep.'),
+      h('div', { class: 'btn-row' }, btn('Choose now', 'conflict-open', { cls: 'primary' }))));
+  }
   lib.notices().forEach((n, i) => {
     const dismiss = h('button', { type: 'button', class: 'link-btn', 'data-action': 'notice-dismiss', 'data-i': i }, 'Dismiss');
     if (n.kind === 'restored') {
@@ -3104,6 +3157,11 @@ function renderLibNotices() {
         h('b', null, 'Some saved data in this browser could not be read'),
         h('p', { class: 'fine' }, 'It was set aside, not deleted, and the rest loaded normally. Download it if you are missing a quiz; it may need fixing by hand.'),
         h('div', { class: 'btn-row' }, btn('Download what could not be read', 'backup-download', { attrs: { 'data-key': n.key } }), dismiss)));
+    } else if (n.kind === 'kept') {
+      out.push(h('div', { class: 'notice', role: 'status' },
+        h('b', null, `“${n.title || 'Untitled quiz'}” was not deleted`),
+        h('p', { class: 'fine' }, 'It was taken out of the Trash on another device, so it is back in your quizzes.'),
+        h('div', { class: 'btn-row' }, dismiss)));
     } else if (n.kind === 'migrated') {
       out.push(h('div', { class: 'notice', role: 'status' },
         h('b', null, `${plural(n.added, 'quiz', 'quizzes')} from this browser added to your library`),
@@ -3124,13 +3182,16 @@ function renderLibNotices() {
   return out.length ? out : null;
 }
 
+// A restore's copies come out as quizzes "Open a quiz file" reads; damaged data comes out exactly as it was kept.
 function downloadBackup(key) {
   if (!lib || typeof key !== 'string') return;
-  const v = lib.readBackup(key);
-  let text;
-  if (v && Array.isArray(v.entries)) text = JSON.stringify(v.entries.map((e) => Object.assign({ title: '', questions: [] }, e.body)), null, 2);
-  else text = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
-  downloadText(text || '', 'hompub-quiz-backup-' + key.replace(/[^0-9a-z-]+/gi, '-').replace(/^-+|-+$/g, '').slice(-40) + '.json', 'application/json');
+  const raw = lib.readBackup(key);
+  if (raw == null) { toast('That copy is no longer in this browser.'); return; }
+  let v = null;
+  try { v = JSON.parse(raw); } catch (e) { v = null; }
+  const name = 'hompub-quiz-backup-' + key.replace(/[^0-9a-z-]+/gi, '-').replace(/^-+|-+$/g, '').slice(-40);
+  if (v && Array.isArray(v.entries)) downloadText(JSON.stringify(v.entries.map((e) => Object.assign({ title: '', questions: [] }, e.body)), null, 2), name + '.json', 'application/json');
+  else downloadText(String(raw), name + '.txt', 'text/plain');
 }
 
 /* ---------- results: copy and share where downloads do not work (P0-71) ---------- */
@@ -3163,8 +3224,9 @@ function downloadText(text, filename, type) {
     document.body.appendChild(a);
     a.click();
     a.remove();
-    // Kept until the page leaves the game: some phone browsers read the file long after the click (P0-71).
-    heldUrls.push(url);
+    // A results file's link is kept until the page leaves the game: some phone browsers read the file
+    // long after the click (P0-71). Other downloads (exports, backups) are let go after 30 s.
+    if (/^text\/csv/.test(type)) heldUrls.push(url); else setTimeout(() => URL.revokeObjectURL(url), 30000);
     return true;
   } catch (e) { toast('The download could not start. Use the download button.'); return false; }
 }
@@ -3228,11 +3290,7 @@ document.addEventListener('webkitfullscreenchange', onFullscreenChange);
 window.addEventListener('storage', (e) => {
   if (!lib || (e.key && !e.key.startsWith('hompub-quiz:lib:'))) return;
   if (!lib.onStorage(e.key)) return;
-  const editing = currentPhase() === 'editor' && e.key === 'hompub-quiz:lib:q:' + state.editorId;
-  if (editing && document.activeElement && document.activeElement.closest && document.activeElement.closest('#app')) {
-    render();                                                  // render() hands focus back to the same field
-    toast('This quiz was changed in another tab; the editor shows that version.');
-  } else libChanged();
+  libChanged();                                                // rebuilds the editor if its quiz's content changed
 });
 
 function syncLibrary() { if (lib && state.auth.status === 'in' && document.visibilityState === 'visible') lib.sync(); }
@@ -3247,9 +3305,9 @@ function sessionReady() {
   const key = loadHostKey();
   if (state.auth.status === 'out' && lib) lib.setStatus('signin');
   if (state.auth.status === 'in') {
-    syncLibrary();
     loadLiveRooms();
-    if (key && !state.game) { state.autoResume = true; connectHost(key); return; }
+    if (key && !state.game) { state.autoResume = true; connectHost(key); syncLibrary(); return; }
+    syncLibrary();
   }
   render();
 }

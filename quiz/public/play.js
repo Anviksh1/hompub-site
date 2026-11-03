@@ -451,7 +451,9 @@ const focus = {
   totals: {},           // q → {n, ms, copies}: what has been counted for that question
   copyTimer: 0,
   noteSaid: false,      // the notice has been read out since it last appeared
+  holdUntil: 0,         // after a long absence: wait for the frames that say when questions closed
 };
+const INTRO_GAP_MS = 3000;   // a question's intro: the previous question had closed before it began (§2)
 const focusOn = () => !!(state.settings && state.settings.focusCheck === true);
 const checkedOpen = () => state.phase === 'open' && focusOn() && focus.checked.has(state.q);
 const blockCopies = () => checkedOpen() && !!state.settings.showOnDevices;
@@ -468,12 +470,17 @@ function noteQuestion(q, opensAt, deadline) {
   }
   w.from = opensAt - clockOffset;
   w.to = deadline - clockOffset;
+  // An earlier question had closed before this one's intro began: the same seconds never count twice.
+  focus.wins.forEach((x) => { if (x.q < q) x.to = Math.min(x.to, w.from - INTRO_GAP_MS); });
   countAbsences();
 }
-// The page saw the question close (result, next intro, podium): later absences do not count for it.
-function shutQuestion(q) {
+// The question closed: later absences do not count for it. `serverAt` is the server's close time
+// (result.closedAt, recap.closedAt); without it, the moment this page saw the close.
+function shutQuestion(q, serverAt) {
   const w = focus.wins.find((x) => x.q === q);
-  if (w && !w.shut) w.shut = Date.now();
+  if (!w) return;
+  if (typeof serverAt === 'number') w.shut = w.shut ? Math.min(w.shut, serverAt - clockOffset) : serverAt - clockOffset;
+  else if (!w.shut) w.shut = Date.now();
 }
 function leavePage() {
   if (focus.awayAt || !ui.saved) return;
@@ -481,17 +488,22 @@ function leavePage() {
 }
 // Back means visible and focused (or touched). An absence also counts for a question this page
 // learns about only afterwards (a sync after waking), so absences are kept for a while.
+// After a long absence a frozen page has not yet seen when questions closed; it waits up to 2 s for
+// the frames (result, sync) that say so before counting, so time after an early close is not counted.
 function backOnPage() {
   if (!focus.awayAt) return;
   const now = Date.now();
+  const long = now - focus.awayAt > WAKE_FRESH_MS;
   focus.absences.push({ id: focus.nextId, from: focus.awayAt, to: now });
   focus.nextId += 1;
   focus.awayAt = 0;
   focus.absences = focus.absences.filter((a) => now - a.to < 10 * 60 * 1000).slice(-6);
+  if (long) { focus.holdUntil = now + 2000; setTimeout(countAbsences, 2050); return; }
   countAbsences();
 }
 // Each absence is matched once against each window: its overlap with the open question, if 1 s or more.
 function countAbsences() {
+  if (Date.now() < focus.holdUntil) return;
   const changed = [];
   focus.wins.forEach((w) => {
     const end = w.shut ? Math.min(w.to, w.shut) : w.to;
@@ -546,15 +558,19 @@ function loadAway() {
 }
 function clearAway() {
   focus.totals = {};
+  focus.wins = [];
+  focus.absences = [];
+  focus.awayAt = 0;
   clearTimeout(focus.copyTimer);
   try { sessionStorage.removeItem(AWAY_KEY); } catch (err) { /* ignore */ }
 }
-// §11: only while the host has Focus check on, and only for a checked question. A server without
-// Focus check (protocol 2) never sends focusCheck: true, so it never gets this frame. A report
-// that cannot go now stays in sessionStorage and goes after the next sync.
+// §11: only for a question the room checked (from sync.focusQs, or Focus check on as it started),
+// even if the host has switched Focus check off since. A server without Focus check (protocol 2)
+// gives neither, so it never gets this frame. A report that cannot go now stays in sessionStorage
+// and goes after the next sync.
 function sendAway(q) {
   const t = focus.totals[q];
-  if (!t || (!t.n && !t.copies) || !focusOn() || !focus.checked.has(q)) return;
+  if (!t || (!t.n && !t.copies) || !focus.checked.has(q)) return;
   if (sock) sock.send({ t: 'away', q, n: t.n, ms: t.ms, copies: t.copies });
 }
 function resendAway() {
@@ -758,7 +774,8 @@ function handleFrame(f) {
       break;
 
     case 'result':
-      shutQuestion(f.q);
+      shutQuestion(f.q, f.closedAt);
+      countAbsences();
       state.phase = 'closed';
       state.q = f.q;
       state.result = f;
@@ -865,8 +882,10 @@ function applySync(f) {
   focus.checked = new Set(Array.isArray(f.focusQs) ? f.focusQs.filter(Number.isInteger) : []);
   const inQuestion = state.phase === 'intro' || state.phase === 'open' || state.phase === 'closed';
   if (q && inQuestion && focus.checked.has(q.q)) noteQuestion(q.q, q.opensAt, q.deadline);
-  if (q && state.phase === 'closed') shutQuestion(q.q);
+  if (q && state.phase === 'closed') shutQuestion(q.q, f.result && f.result.closedAt);
+  if (f.recap && Number.isInteger(f.recap.q)) shutQuestion(f.recap.q, f.recap.closedAt);
   if (state.phase === 'podium' || state.phase === 'ended') shutQuestion(state.q);
+  countAbsences();
   resendAway();
   // P0-18: back for the next question after missing a reveal: say how the last one went. Not for a
   // question this page already showed the result of, nor for one the student joined after.
@@ -1201,7 +1220,7 @@ function questionLabel() {
 function recapText(r) {
   const label = `Question ${r.q + 1}`;
   if (r.right === null || (r.right === undefined && r.choice == null)) return `${label}: Not answered`;
-  if (ui.qPoints[r.q] === 0 || typeof r.right !== 'boolean') return `${label}: Answer recorded`;   // survey question
+  if (r.survey === true || ui.qPoints[r.q] === 0 || typeof r.right !== 'boolean') return `${label}: Answer recorded`;   // survey question
   if (!r.right) return `${label}: Not correct`;
   return `${label}: Correct, ` + (r.points > 0 ? `+${fmt(r.points)}` : 'no points');
 }

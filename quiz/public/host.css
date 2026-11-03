@@ -528,7 +528,7 @@ body[data-mode="stage"] .site-footer { display: none; }
 
 /* ---------- phones: the options menu becomes a bottom sheet so it cannot overflow the viewport ---------- */
 @media (max-width: 639px) {
-  .stage-menu .menu-body { position: fixed; left: 16px; right: 16px; top: auto; bottom: 16px; min-width: 0; max-width: none; }
+  .stage-menu .menu-body { position: fixed; left: 16px; right: 16px; top: auto; bottom: 16px; min-width: 0; max-width: none; max-height: calc(100dvh - 32px); overflow: auto; }
 }
 
 /* ---------- wider screens ---------- */
@@ -607,7 +607,6 @@ dialog.ask[open]:not(:modal) { position: fixed; top: 16px; left: 50%; transform:
 
 .toast { display: flex; align-items: center; gap: 12px; }
 .toast .btn { pointer-events: auto; background: var(--paper); color: var(--ink); border-color: var(--paper); }
-.toast.show { pointer-events: auto; }
 
 .sync-status { font-size: 0.86rem; color: var(--ink-soft); padding-left: 18px; position: relative; }
 .sync-status::before { content: ''; position: absolute; left: 0; top: 0.5em; width: 10px; height: 10px; border-radius: 50%; background: var(--ink-soft); }
@@ -667,6 +666,10 @@ a.btn { display: inline-flex; align-items: center; text-decoration: none; }
   body[data-mode="stage"] .stage { flex: 1; min-height: 0; padding-top: 6px; padding-bottom: 10px; gap: 1.4vh; }
   body[data-mode="stage"] .stage > .stage-body { min-height: 0; overflow: auto; gap: 1.6vh; }
   body[data-mode="stage"] .stage > .controls { padding-top: 1vh; }
+  /* The Options menu and the players panel scroll inside the screen instead of running off it. */
+  body[data-mode="stage"] .stage-menu .menu-body { max-height: calc(100dvh - 140px); overflow: auto; }
+  body[data-mode="stage"] .stage > .players-panel { flex: 0 1 auto; min-height: 0; max-height: 72%; overflow: hidden; }
+  body[data-mode="stage"] .players-panel .players-list { flex: 1 1 auto; min-height: 0; max-height: none; }
   .stage-head { font-size: clamp(0.95rem, 2.4vh, 1.5rem); padding-bottom: 0.8vh; }
   .stage-head .pin b { font-size: clamp(1.6rem, 5vh, 3rem); }
 

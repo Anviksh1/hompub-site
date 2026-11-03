@@ -34,6 +34,8 @@ const LOCAL_FIELDS = ['id', 'updatedAt', 'exportedAt', 'version', 'hash'];
 const FLUSH_DELAY_MS = 2500;   // after the last edit
 const FLUSH_MAX_MS = 15000;    // ...but at least this often while typing
 const PUSHED_KEEP = 5;         // hashes this browser saved per quiz, to recognise its own versions
+const REQUEST_MS = 15000;      // a library request that takes longer is given up (and tried on the next sync)
+const FULL_MESSAGE = 'Your library is full (500 quizzes). Delete some quizzes, or empty the Trash, and it is saved.';
 
 /* ===================================================================== pure helpers */
 
@@ -85,7 +87,8 @@ function createLibrary(deps) {
   let generation = null;
   let syncedAt = 0;
   const conflicts = new Map();         // id -> {kind, server, mine}
-  const errors = new Map();            // id -> message (a change the server refused)
+  const errors = new Map();            // id -> {message, kind: 'refused' | 'full'}: a change the server would not take
+  let migrateDone = false;             // migrateOld() has run on this page (only then may the old list count as moved)
   const notices = [];                  // {kind, ...} for banners
   let status = 'local';                // see statusText()
   let flushTimer = null;
@@ -172,7 +175,13 @@ function createLibrary(deps) {
     const id = key.slice(KEYS.quiz.length);
     const r = readJSON(key);
     if (r.ok && r.value === null) entries.delete(id);
-    else if (r.ok && validEntry(r.value)) entries.set(id, r.value);
+    else if (r.ok && validEntry(r.value)) {
+      // Same content (another tab only saved it, or noted a new version): keep this tab's body object,
+      // so an editor showing it is not rebuilt under the teacher's fingers.
+      const cur = entries.get(id);
+      if (cur && JSON.stringify(cur.body) === JSON.stringify(r.value.body)) r.value.body = cur.body;
+      entries.set(id, r.value);
+    }
     return true;
   }
 
@@ -181,7 +190,8 @@ function createLibrary(deps) {
   function needsSync(e) {
     if (e.purge) return true;
     if (e.version === 0) return !e.deletedAt;                     // never on the server: only a live quiz goes up
-    return !!e.dirty || (e.deletedAt || null) !== (e.serverDeletedAt || null);
+    // In the Trash here but not on the server, or the other way round (the times come from two clocks: compare presence).
+    return !!e.dirty || !!e.deletedAt !== !!e.serverDeletedAt;
   }
   function readOnly(e) { return schemaOf(e.body) > KNOWN_SCHEMA; }
   function list() { return [...entries.values()].filter((e) => !e.deletedAt && !e.purge).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)); }
@@ -241,12 +251,13 @@ function createLibrary(deps) {
     const e = entries.get(id);
     if (!e || !e.deletedAt) return;
     e.deletedAt = null;
+    e.purge = false;
     queue(e);
   }
-  /** Delete for good, from the Trash. */
+  /** Delete for good, from the Trash (only a quiz that is still in it). */
   function purge(id) {
     const e = entries.get(id);
-    if (!e) return;
+    if (!e || !e.deletedAt) return;
     if (e.version === 0) { forget(id); return; }
     e.purge = true;
     queue(e);
@@ -270,6 +281,8 @@ function createLibrary(deps) {
         method, cache: 'no-store',
         headers: body === undefined ? undefined : { 'content-type': 'application/json' },
         body: body === undefined ? undefined : JSON.stringify(body),
+        // A request that hangs must not hold the sync (and other tabs' lock) for ever.
+        signal: typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(REQUEST_MS) : undefined,
       });
     } catch (e) { return { status: 0, body: null }; }
     let json = null;
@@ -320,7 +333,8 @@ function createLibrary(deps) {
     e.hash = meta.hash;
     e.serverDeletedAt = meta.deletedAt || null;
     if (body !== undefined) {
-      e.body = isObject(body) ? body : e.body;
+      // Same text: keep the object, so an editor showing it stays as it is.
+      if (isObject(body) && JSON.stringify(body) !== JSON.stringify(e.body)) e.body = body;
       e.updatedAt = meta.updatedAt || e.updatedAt;
       e.deletedAt = meta.deletedAt || null;
       e.dirty = false;
@@ -330,40 +344,60 @@ function createLibrary(deps) {
     e.pushed = [hash].concat((e.pushed || []).filter((h) => h !== hash)).slice(0, PUSHED_KEEP);
   }
 
-  /** Send one entry's changes. Returns 'ok', 'stop' (try later) or 'conflict'. */
-  async function sendOne(e) {
+  /**
+   * Send one entry's changes. Returns 'ok', 'stop' (try later: offline, signed out, server trouble) or
+   * 'conflict'. A quiz the server will not take is that quiz's problem only ('ok' with an error noted),
+   * so it never holds up the others. After every request the entry is read again: another tab may have
+   * replaced it meanwhile (its storage event), and its newer edits must not be written over.
+   */
+  async function sendOne(start) {
+    const id = start.id;
+    let e = start;
+    const cur = () => { e = entries.get(id) || e; return e; };
+    const path = `/api/library/quizzes/${encodeURIComponent(id)}`;
     if (e.purge) {
       // Only a quiz in the server's Trash can be deleted for good: move it there first if that was not sent yet.
       if (!e.serverDeletedAt) {
-        const t = await api('DELETE', `/api/library/quizzes/${encodeURIComponent(e.id)}?baseVersion=${e.version}${genParam()}`);
+        const t = await api('DELETE', `${path}?baseVersion=${e.version}${genParam()}`);
         if (!(await checkGeneration(t))) return 'stop';
+        cur();
         if (t.status === 409 && t.body && t.body.server) {
           e.purge = false;
-          conflicts.set(e.id, { kind: 'edited', server: t.body.server, mine: e.body });
+          conflicts.set(id, { kind: 'edited', server: t.body.server, mine: e.body });
           saveEntry(e);
           return 'conflict';
         }
         if (t.status !== 200) { fail(t); return 'stop'; }
-        if (t.body && t.body.quiz) adoptServer(e, t.body.quiz);
-        else e.serverDeletedAt = e.deletedAt || now();
+        if (t.body && t.body.quiz) adoptServer(e, t.body.quiz); else e.serverDeletedAt = e.deletedAt || now();
       }
-      const r = await api('DELETE', `/api/library/quizzes/${encodeURIComponent(e.id)}?forever=1${genParam()}`);
+      const r = await api('DELETE', `${path}?forever=1${genParam()}`);
       if (!(await checkGeneration(r))) return 'stop';
+      cur();
+      if (r.status === 409 && r.body && r.body.error === 'not_in_trash') {
+        // Taken out of the Trash on another device meanwhile: it stays, and the teacher is told.
+        e.purge = false;
+        e.deletedAt = null;
+        if (r.body.server) adoptServer(e, r.body.server);
+        e.serverDeletedAt = null;
+        notices.push({ kind: 'kept', title: e.body.title || '' });
+        saveEntry(e);
+        return 'ok';
+      }
       if (r.status !== 200) { fail(r); return 'stop'; }
-      forget(e.id);
+      forget(id);
       return 'ok';
     }
-    const wantDeleted = !!e.deletedAt;
     // A live quiz with changes (or one taken out of the Trash with changes): PUT.
-    if (e.dirty || (e.version === 0 && !wantDeleted)) {
+    if (e.dirty || (e.version === 0 && !e.deletedAt)) {
       const text = JSON.stringify(e.body);
-      const r = await api('PUT', `/api/library/quizzes/${encodeURIComponent(e.id)}`, { baseVersion: e.version, generation, quiz: e.body });
+      const r = await api('PUT', path, { baseVersion: e.version, generation, quiz: e.body });
       if (!(await checkGeneration(r))) return 'stop';
+      cur();
       if (r.status === 200 && r.body && r.body.quiz) {
         adoptServer(e, r.body.quiz);
         rememberPushed(e, r.body.quiz.hash);
         if (JSON.stringify(e.body) === text) e.dirty = false;    // edits made while it was in flight go next time
-        if (wantDeleted) e.serverDeletedAt = null;                 // PUT takes it out of the Trash; the delete follows
+        if (e.deletedAt) e.serverDeletedAt = null;                 // PUT takes it out of the Trash; the delete follows
       } else if (r.status === 409 && r.body) {
         const server = r.body.server || null;
         // The server's copy is one this browser saved (another tab sent it first): ours follows from it.
@@ -371,38 +405,43 @@ function createLibrary(deps) {
           adoptServer(e, server);
           return sendOne(e);
         }
-        // The same content was saved elsewhere: nothing to choose.
+        // The same content was saved elsewhere: nothing to choose (a delete made here still goes ahead).
         if (server && r.body.error === 'conflict' && server.hash === await quizHash(e.body)) {
+          cur();
+          const keep = e.deletedAt;
           adoptServer(e, server, server.body);
-          e.deletedAt = wantDeleted ? e.deletedAt : null;
+          e.deletedAt = keep;
         } else {
-          conflicts.set(e.id, { kind: r.body.error === 'gone' ? 'gone' : r.body.error === 'newer_schema' ? 'newer' : 'conflict', server, mine: e.body });
+          conflicts.set(id, { kind: r.body.error === 'gone' ? 'gone' : r.body.error === 'newer_schema' ? 'newer' : 'conflict', server, mine: e.body });
           saveEntry(e);
           return 'conflict';
         }
       } else if (r.status === 422) {
-        status = 'full';                                           // tried again on the next sync
-        return 'stop';
+        errors.set(id, { message: (r.body && r.body.message) || FULL_MESSAGE, kind: 'full' });   // tried again on the next sync
+        saveEntry(e);
+        return 'ok';
       } else if (r.status === 400 || r.status === 413) {
-        errors.set(e.id, (r.body && r.body.message) || (r.status === 413 ? 'This quiz is larger than 200 KB. Shorten some text.' : 'The server refused this quiz.'));
+        errors.set(id, { message: (r.body && r.body.message) || (r.status === 413 ? 'This quiz is larger than 200 KB. Shorten some text.' : 'The server refused this quiz.'), kind: 'refused' });
         saveEntry(e);
         return 'ok';
       } else { fail(r); return 'stop'; }
     }
-    if (e.version > 0 && wantDeleted && !e.serverDeletedAt) {
-      const r = await api('DELETE', `/api/library/quizzes/${encodeURIComponent(e.id)}?baseVersion=${e.version}${genParam()}`);
+    if (e.version > 0 && e.deletedAt && !e.serverDeletedAt) {
+      const r = await api('DELETE', `${path}?baseVersion=${e.version}${genParam()}`);
       if (!(await checkGeneration(r))) return 'stop';
+      cur();
       if (r.status === 200) { if (r.body && r.body.quiz) adoptServer(e, r.body.quiz); else e.serverDeletedAt = e.deletedAt; }
       else if (r.status === 409 && r.body && r.body.server) {
-        conflicts.set(e.id, { kind: 'edited', server: r.body.server, mine: e.body });   // changed elsewhere after it was deleted here
+        conflicts.set(id, { kind: 'edited', server: r.body.server, mine: e.body });   // changed elsewhere after it was deleted here
         return 'conflict';
       } else { fail(r); return 'stop'; }
-    } else if (e.version > 0 && !wantDeleted && e.serverDeletedAt) {
-      const r = await api('POST', `/api/library/quizzes/${encodeURIComponent(e.id)}/restore${genParam('?')}`);
+    } else if (e.version > 0 && !e.deletedAt && e.serverDeletedAt) {
+      const r = await api('POST', `${path}/restore${genParam('?')}`);
       if (!(await checkGeneration(r))) return 'stop';
+      cur();
       if (r.status === 200 && r.body && r.body.quiz) adoptServer(e, r.body.quiz);
       else if (r.status === 404) { e.version = 0; e.dirty = true; return sendOne(e); }   // gone for good: send it again
-      else if (r.status === 422) { status = 'full'; return 'stop'; }
+      else if (r.status === 422) { errors.set(id, { message: (r.body && r.body.message) || FULL_MESSAGE, kind: 'full' }); saveEntry(e); return 'ok'; }
       else { fail(r); return 'stop'; }
     }
     saveEntry(e);
@@ -410,14 +449,19 @@ function createLibrary(deps) {
   }
 
   async function flush() {
+    // The queue is rebuilt from the entries: another tab's write of the outbox may have left one out.
+    for (const e of entries.values()) if (needsSync(e) && !outbox[e.id]) outbox[e.id] = now();
+    for (const [id, er] of [...errors]) if (er.kind === 'full') errors.delete(id);   // the library may have room now
     const ids = Object.keys(outbox).sort((a, b) => outbox[a] - outbox[b]);
     for (const id of ids) {
-      const e = entries.get(id);
+      let e = entries.get(id);
       if (!e) { delete outbox[id]; continue; }
       if (conflicts.has(id) || errors.has(id)) continue;
-      if (readOnly(e)) { delete outbox[id]; continue; }
-      const result = await sendOne(e);
-      if (entries.has(id)) { if (needsSync(e) && result !== 'ok') outbox[id] = outbox[id] || now(); else if (!needsSync(e)) delete outbox[id]; }
+      // A quiz saved by a newer version of the page is never sent; it can still be moved to the Trash or deleted.
+      if (readOnly(e)) { e.dirty = false; if (e.version === 0) { delete outbox[id]; continue; } }
+      const result = needsSync(e) ? await sendOne(e) : 'ok';
+      e = entries.get(id);
+      if (e && needsSync(e)) outbox[id] = outbox[id] || now(); else delete outbox[id];
       saveOutbox();
       if (result === 'stop') return false;
     }
@@ -514,6 +558,7 @@ function createLibrary(deps) {
     }).catch(() => { status = 'offline'; }).finally(() => {
       syncing = null;
       if (status === 'synced' && conflicts.size) status = 'conflict';
+      else if (status === 'synced' && [...errors.values()].some((x) => x.kind === 'full')) status = 'full';
       // Another tab held the lock, or edits arrived meanwhile: go again shortly.
       if ((status === 'saving' || status === 'synced') && sendable()) { status = 'saving'; scheduleFlush(); }
       else if (status === 'saving') status = 'synced';
@@ -619,10 +664,12 @@ function createLibrary(deps) {
       if ((id && moved.has(id)) || handled.has(hash)) { report.same += 1; continue; }
       const have = id ? entries.get(id) : null;
       if (have || hashes.has(hash)) {
-        if (have && hashes.get(hash) !== id) { conflicts.set(id, { kind: 'migrate', server: null, mine: body }); report.conflicts += 1; }
-        else report.same += 1;
+        // A different version under the same id waits for the teacher's choice; until then it is not
+        // counted as moved, so a reload asks again (resolve() marks its content handled).
+        if (have && hashes.get(hash) !== id) { conflicts.set(id, { kind: 'migrate', server: null, mine: body }); report.conflicts += 1; continue; }
+        report.same += 1;
         if (id) moved.add(id);
-        if (!have || hashes.get(hash) === id) handled.add(hash);
+        handled.add(hash);
         continue;
       }
       const e = create(body, { id: id || undefined, updatedAt: Number(item.updatedAt) || undefined, exportedAt: Number(item.exportedAt) || null });
@@ -633,13 +680,14 @@ function createLibrary(deps) {
     }
     sSet(KEYS.migrating, JSON.stringify({ ids: [...moved], handled: [...handled] }));
     if (report.added || report.conflicts) notices.push(Object.assign({ kind: 'migrated' }, report));
+    migrateDone = true;
     checkMigrated();
     return report;
   }
 
   /** The old list counts as moved once the server has every quiz it gave and no choice is waiting. */
   function checkMigrated() {
-    if (sGet(KEYS.migrated)) return;
+    if (!migrateDone || sGet(KEYS.migrated)) return;
     const r = readJSON(KEYS.migrating);
     if (!r.ok || !isObject(r.value)) return;
     const ids = migrating().ids;
@@ -672,14 +720,16 @@ function createLibrary(deps) {
     // reading
     list, trash, get, readOnly, needsSync, pendingCount, sendable,
     conflicts: () => [...conflicts.entries()].map(([id, c]) => Object.assign({ id }, c)),
-    error: (id) => errors.get(id) || '',
+    error: (id) => (errors.get(id) || {}).message || '',
     notices: () => notices.slice(),
     dismissNotice: (n) => { const i = notices.indexOf(n); if (i >= 0) notices.splice(i, 1); },
     status: () => status,
     setStatus: (s) => { status = s; },
     storageBlocked: () => storageBlocked,
     syncedAt: () => syncedAt,
-    readBackup: (key) => readJSON(key).value,
+    readBackup: (key) => sGet(key),                  // the text as it was kept, which may not be valid JSON
+    backupKeys: () => sKeys().filter((k) => k.startsWith(KEYS.backup)),
+    removeBackups: () => { for (const k of sKeys()) if (k.startsWith(KEYS.backup)) sRemove(k); },
     // changing
     create, touch, markExported, remove, restore, purge, resolve,
     // server

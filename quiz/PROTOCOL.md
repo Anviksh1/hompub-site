@@ -241,7 +241,7 @@ Every frame has `t`. Frames with times carry `serverNow` (ms since epoch, server
           "spins": 1,                          // name spins used so far (max 3)
           "renamesLeft": 3 },                  // student renames still allowed (max 3)
   "result": { ...same fields as the result frame, without t... },   // only in phase closed
-  "recap": { "q": 2, "right": true, "choice": 1, "points": 912, "score": 2310, "rank": 12, "tied": false, "playerCount": 97 },
+  "recap": { "q": 2, "right": true, "choice": 1, "points": 912, "survey": false, "closedAt": 1760000041000, "score": 2310, "rank": 12, "tied": false, "playerCount": 97 },
                                              // intro / open of question 2 onwards: the result of question q-1, for a phone away at its reveal.
                                              // `right`: true / false / null (no answer). No `correct` index: players never get one before `closed`.
   "podium": { "top": [{"nick":"...","score":1234,"rank":1,"tied":false}, ...], "you": {"score": 2310, "rank": 12, "tied": false} }, // podium / ended
@@ -271,7 +271,7 @@ Every frame has `t`. Frames with times carry `serverNow` (ms since epoch, server
 | `intro` | `question` (same object as in `sync`), `serverNow` |
 | `open` | `q, deadline, serverNow` |
 | `ack` | `q, accepted:boolean, reason?: "late" \| "duplicate" \| "closed" \| "invalid" \| "unavailable"` (`unavailable`: the answer could not be saved, see `storage_full`) |
-| `result` | `q, correct:int, choice:int\|null, points:int, score:int, rank:int, tied:boolean, streak:int, playerCount:int` (sent to every player at close, including those who did not answer) |
+| `result` | `q, correct:int, choice:int\|null, points:int, score:int, rank:int, tied:boolean, streak:int, playerCount:int, closedAt` (sent to every player at close, including those who did not answer; `closedAt` is when the question closed, server time) |
 | `podium` | `top:[{nick,score,rank,tied}] (≤3), you:{score,rank,tied}, playerCount` |
 | `ended` | `played:boolean` — clear the localStorage entry. `played: false`: the host ended the game before any answer. |
 | `kicked` | — (then close 4003) |
@@ -428,8 +428,9 @@ puts `proto: 3` in every `sync`.
 - **The host token is no longer accepted in the URL.** A host socket is ready
   when the Worker vouches for its session, or after an `auth` frame.
 - **A version-3 page meeting an older server** (a rolled-back deployment):
-  pages send `away` only when the room's settings carry `focusCheck: true`,
-  which a protocol-2 server never sends, so it never receives the frame. The
+  pages send `away` only for a question the room checked (listed in
+  `focusQs`, or opened while `settings.focusCheck` was true), which a
+  protocol-2 server never reports, so it never receives the frame. The
   host page sees `proto: 2` and hides Focus check. A 404 from `/api/library`
   means the library is not there: the host page keeps its local copy, saves
   nothing, and says the server is older (Export all still works).
@@ -512,14 +513,15 @@ not proof: nothing is automatic and scores never change.
 - **Phones (version 3):** while it is on, every screen says "Your teacher can
   see if you leave this page during a question." During an open checked
   question the page counts the times it was hidden (`visibilitychange`) or lost
-  focus (`blur`) for 1 s or more and the time away, stopping at the deadline,
+  focus (`blur`) for 1 s or more and the time away, stopping when the question
+  closed (`closedAt` in `result` and `recap`; never past the next question's intro),
   and, when questions are shown on phones, blocks selecting, copying and the
   long-press menu on the question and options, counting blocked copies. On
   return (or when it reconnects) it sends `away` with the running totals for
   that question; an unsent report is kept in sessionStorage.
 - **Server:** accepts `away` only from a joined player, for a checked question
-  that is open or just closed (or the previous one during the next `intro` or
-  `open`). Totals only go up and are clamped (§9). A player whose page is
+  that is open or just closed (or the previous one during the next `intro`,
+  `open` or `closed`). Totals only go up and are clamped (§9). A player whose page is
   older than version 3 gets `old: true` for each checked question. Hosts get
   `focus` frames, the full list in `sync`, and the CSV columns (§8). The
   records live in the Room's `away` table and are deleted with the game.

@@ -58,6 +58,7 @@ type RoomRow = {
   last_activity: number;
   phase_at: number;
   focus_qs?: string | null;
+  closed_at?: number | null;
 };
 
 type AwayRow = { pid: string; q: number; n: number; ms: number; copies: number; old: number; writes: number };
@@ -110,6 +111,8 @@ interface RoomState {
   phaseAt: number;
   /** Questions opened while Focus check was on (only these are checked). */
   focusQs: number[];
+  /** When the latest question closed (server time): phones end its Focus check window there. */
+  closedAt: number | null;
 }
 
 /** A Focus check record in memory: `old` = the player's page could not report; `dirty` = not saved yet. */
@@ -246,6 +249,7 @@ export class Room extends DurableObject<Env> {
     // Added in protocol 3 (Focus check). The default keeps the previous version's INSERT working.
     const roomCols = this.sql.exec<{ name: string }>('PRAGMA table_info(room)').toArray().map(r => r.name);
     if (!roomCols.includes('focus_qs')) this.sql.exec("ALTER TABLE room ADD COLUMN focus_qs TEXT NOT NULL DEFAULT '[]'");
+    if (!roomCols.includes('closed_at')) this.sql.exec('ALTER TABLE room ADD COLUMN closed_at INTEGER');
     if (devOn(env)) {
       const scale = Number(env.DEV_TTL_SCALE);
       const fail = Number(env.DEV_FAIL_WRITES_AFTER);
@@ -275,7 +279,7 @@ export class Room extends DurableObject<Env> {
     );
     this.state = {
       pin, hostToken, phase: 'lobby', q: -1, opensAt: null, deadline: null,
-      settings: clean, quiz, locked: false, createdAt: now, lastActivity: now, phaseAt: now, focusQs: [],
+      settings: clean, quiz, locked: false, createdAt: now, lastActivity: now, phaseAt: now, focusQs: [], closedAt: null,
     };
     this.lastPersistedActivity = now;
     this.rosterBaseline = new Map(); // a new room: every host starts from an empty player list
@@ -708,8 +712,10 @@ export class Room extends DurableObject<Env> {
     if (!p || p.kicked) return;
     const q = frame.q;
     if (typeof q !== 'number' || !Number.isInteger(q) || !s.focusQs.includes(q)) return;
+    // The previous one too while the next is starting, open or showing its answers: a student may
+    // come back only after the next question has closed.
     const current = q === s.q && (s.phase === 'open' || s.phase === 'closed' || s.phase === 'podium');
-    const previous = q === s.q - 1 && (s.phase === 'intro' || s.phase === 'open');
+    const previous = q === s.q - 1 && (s.phase === 'intro' || s.phase === 'open' || s.phase === 'closed');
     if (!current && !previous) return;
     const key = `${pid}|${q}`;
     const prev = this.away.get(key) ?? null;
@@ -1000,6 +1006,7 @@ export class Room extends DurableObject<Env> {
     s.phase = 'closed';
     s.phaseAt = now;
     s.lastActivity = now;
+    s.closedAt = now;
     try { this.persistRoom(); } catch (e) { restore(); throw e; }
     this.flushAway();
 
@@ -1252,6 +1259,7 @@ export class Room extends DurableObject<Env> {
     return {
       q, correct: question.correct, choice: ans ? ans.c : null, points: ans ? ans.p : 0,
       score: p.score, rank: r?.rank ?? playerCount, tied: r?.tied ?? false, streak: p.streak, playerCount,
+      ...(q === s.q && s.closedAt !== null ? { closedAt: s.closedAt } : {}),
     };
   }
 
@@ -1260,11 +1268,14 @@ export class Room extends DurableObject<Env> {
    * (`right`) but carries no `correct` index: no frame a player gets before `closed` has one.
    */
   private recapFor(p: Player, q: number, score: number, ranks: Ranks, playerCount: number): object {
+    const s = this.state!;
     const ans = p.answers[String(q)];
     const r = ranks.get(p.pid);
+    const question = s.quiz.questions[q];
     return {
-      q, right: ans ? ans.c === this.state!.quiz.questions[q].correct : null, choice: ans ? ans.c : null, points: ans ? ans.p : 0,
-      score, rank: r?.rank ?? playerCount, tied: r?.tied ?? false, playerCount,
+      q, right: ans ? ans.c === question.correct : null, choice: ans ? ans.c : null, points: ans ? ans.p : 0,
+      survey: question.points === 0, score, rank: r?.rank ?? playerCount, tied: r?.tied ?? false, playerCount,
+      ...(q === s.q - 1 && s.closedAt !== null ? { closedAt: s.closedAt } : {}),
     };
   }
 
@@ -1683,8 +1694,8 @@ export class Room extends DurableObject<Env> {
   private persistRoom(): void {
     const s = this.state!;
     this.write(
-      'UPDATE room SET phase = ?, q = ?, opens_at = ?, deadline = ?, settings = ?, locked = ?, last_activity = ?, phase_at = ?, focus_qs = ? WHERE id = 1',
-      s.phase, s.q, s.opensAt, s.deadline, JSON.stringify(s.settings), s.locked ? 1 : 0, s.lastActivity, s.phaseAt, JSON.stringify(s.focusQs),
+      'UPDATE room SET phase = ?, q = ?, opens_at = ?, deadline = ?, settings = ?, locked = ?, last_activity = ?, phase_at = ?, focus_qs = ?, closed_at = ? WHERE id = 1',
+      s.phase, s.q, s.opensAt, s.deadline, JSON.stringify(s.settings), s.locked ? 1 : 0, s.lastActivity, s.phaseAt, JSON.stringify(s.focusQs), s.closedAt,
     );
     this.lastPersistedActivity = s.lastActivity;
   }
@@ -1731,6 +1742,7 @@ export class Room extends DurableObject<Env> {
       pin: r.pin, hostToken: r.host_token, phase: r.phase, q: r.q, opensAt: r.opens_at, deadline: r.deadline,
       settings: normalizeSettings(JSON.parse(r.settings), r.phase), quiz: JSON.parse(r.quiz) as Quiz, locked: r.locked === 1,
       createdAt: r.created_at, lastActivity: r.last_activity, phaseAt: r.phase_at, focusQs: parseFocusQs(r.focus_qs),
+      closedAt: typeof r.closed_at === 'number' ? r.closed_at : null,
     };
     this.lastPersistedActivity = r.last_activity;
     this.players.clear();

@@ -103,7 +103,7 @@ function fakeServer() {
 
 let tick = 5_000_000;
 function browser(srv, storage, extra = {}) {
-  return Lib.createLibrary({ storage, fetch: srv.fetch, now: () => ++tick, locks: null, tabId: extra.tabId || 'tab-' + tick, onChange: () => {} });
+  return Lib.createLibrary({ storage, fetch: (u, i) => srv.fetch(u, i), now: () => ++tick, locks: null, tabId: extra.tabId || 'tab-' + tick, onChange: () => {} });
 }
 const quiz = (title, extra = {}) => ({ title, questions: [{ text: 'Q?', options: ['a', 'b'], correct: 0, timeLimit: 20, points: 1000 }], ...extra });
 
@@ -227,7 +227,7 @@ test('a restore from backup (new generation) sets the cache aside and reloads', 
   await a.sync();
   const n = a.notices().find((x) => x.kind === 'restored');
   assert.ok(n, 'a notice says so');
-  const saved = a.readBackup(n.key);
+  const saved = JSON.parse(a.readBackup(n.key));
   assert.equal(saved.entries[0].body.title, 'Unsent edit', 'the unsent edit is kept in the backup');
   assert.equal(a.get(e.id).body.title, 'Restored copy');
   assert.equal(a.pendingCount(), 0, 'nothing from before the restore is sent');
@@ -334,4 +334,118 @@ test('a quiz with a newer schema is read-only and never sent', async () => {
   const e = a.create(quiz('Future', { schema: 2 }));
   assert.equal(a.readOnly(a.get(e.id)), true);
   assert.equal(a.touch(e.id), false);
+});
+
+test('a quiz moved to the Trash is done once the server has it (nothing left pending)', async () => {
+  const srv = fakeServer();
+  const a = browser(srv, new FakeStorage());
+  const e = a.create(quiz('Bin'));
+  await a.sync();
+  a.remove(e.id);
+  await a.sync();
+  assert.equal(a.pendingCount(), 0);
+  assert.equal(a.status(), 'synced');
+  assert.equal(a.clearCache(), true, 'sign-out can clear this computer');
+});
+
+test('one quiz the server refuses does not hold up the others', async () => {
+  const srv = fakeServer();
+  const a = browser(srv, new FakeStorage());
+  const big = a.create(quiz('Refused'));
+  const ok = a.create(quiz('Fine'));
+  const realFetch = srv.fetch;
+  srv.fetch = async (url, init) => (init && init.method === 'PUT' && url.includes(big.id) ? { status: 422, json: async () => ({ generation: srv.generation, error: 'library_full', message: 'full' }) } : realFetch(url, init));
+  await a.sync();
+  assert.ok(srv.rows.has(ok.id), 'the other quiz went');
+  assert.equal(a.status(), 'full');
+  srv.fetch = realFetch;
+  await a.sync();
+  assert.ok(srv.rows.has(big.id), 'tried again on the next sync');
+});
+
+test('"Delete for good" of a quiz restored on another device keeps it and says so', async () => {
+  const srv = fakeServer();
+  const a = browser(srv, new FakeStorage());
+  const e = a.create(quiz('Back again'));
+  await a.sync();
+  a.remove(e.id);
+  await a.sync();
+  const b = browser(srv, new FakeStorage());
+  await b.sync();
+  b.restore(e.id);
+  await b.sync();
+  a.purge(e.id);
+  a.create(quiz('Later edit'));
+  await a.sync();
+  assert.ok(srv.rows.has(e.id), 'not deleted');
+  assert.ok(a.get(e.id) && !a.get(e.id).deletedAt, 'shown again here');
+  assert.ok(a.notices().some((n) => n.kind === 'kept'));
+  assert.ok([...srv.rows.values()].some((r) => r.body.title === 'Later edit'), 'later changes still go');
+});
+
+test('an in-flight sync never writes over a newer edit another tab made meanwhile', async () => {
+  const srv = fakeServer();
+  const st = new FakeStorage();
+  const t1 = browser(srv, st, { tabId: 'a' });
+  const e = t1.create(quiz('typed 1'));
+  await t1.sync();
+  const t2 = browser(srv, st, { tabId: 'b' });
+  t1.get(e.id).body.title = 'typed 1 and 2';
+  t1.touch(e.id);
+  // While tab 1's PUT is out, tab 2 types more (and tab 1 hears of it through a storage event).
+  const realFetch = srv.fetch;
+  srv.fetch = async (url, init) => {
+    if (init && init.method === 'PUT') {
+      t2.onStorage('hompub-quiz:lib:q:' + e.id);
+      t2.get(e.id).body.title = 'typed 1 and 2 and 3';
+      t2.touch(e.id);
+      t1.onStorage('hompub-quiz:lib:q:' + e.id);
+    }
+    return realFetch(url, init);
+  };
+  await t1.sync();
+  srv.fetch = realFetch;
+  assert.equal(JSON.parse(st.getItem('hompub-quiz:lib:q:' + e.id)).body.title, 'typed 1 and 2 and 3');
+  await t1.sync();
+  assert.equal(srv.rows.get(e.id).body.title, 'typed 1 and 2 and 3');
+});
+
+test('a delete made here survives the same edit saved on another device', async () => {
+  const srv = fakeServer();
+  const a = browser(srv, new FakeStorage());
+  const e = a.create(quiz('Twin'));
+  await a.sync();
+  const b = browser(srv, new FakeStorage());
+  await b.sync();
+  a.get(e.id).body.title = 'Same edit'; a.touch(e.id); a.remove(e.id);
+  b.get(e.id).body.title = 'Same edit'; b.touch(e.id); await b.sync();
+  await a.sync();
+  assert.ok(srv.rows.get(e.id).deletedAt, 'still deleted on the server');
+  assert.ok(a.get(e.id).deletedAt);
+});
+
+test('moving the Phase 1 list: an unanswered clash is asked again after a reload', async () => {
+  const srv = fakeServer();
+  const other = browser(srv, new FakeStorage());
+  other.create(quiz('Library version'), { id: 'q-clash' });
+  await other.sync();
+  const st = new FakeStorage();
+  st.setItem('hompub-quiz:quizzes', JSON.stringify([{ id: 'q-clash', title: 'Old version', questions: quiz('x').questions }]));
+  const lib = browser(srv, st);
+  await lib.sync();
+  await lib.migrateOld();
+  assert.equal(lib.conflicts().length, 1);
+  const again = browser(srv, st);          // reload before choosing
+  await again.sync();
+  assert.equal(st.getItem('hompub-quiz:lib:migrated'), null, 'not marked as moved');
+  await again.migrateOld();
+  assert.equal(again.conflicts().length, 1, 'asked again');
+});
+
+test('a damaged entry can be downloaded as it was', () => {
+  const st = new FakeStorage();
+  st.setItem('hompub-quiz:lib:q:cut', '{"id":"cut","version":3,"body":{"title":"Half a qu');
+  const lib = browser(fakeServer(), st);
+  const n = lib.notices().find((x) => x.kind === 'damaged');
+  assert.equal(lib.readBackup(n.key), '{"id":"cut","version":3,"body":{"title":"Half a qu');
 });
